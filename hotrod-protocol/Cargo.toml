@@ -6,3 +6,5 @@ description = "Pure Rust client for the Infinispan/Red Hat Data Grid Hot Rod bin
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
+thiserror = "2"

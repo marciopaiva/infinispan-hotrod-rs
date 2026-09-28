@@ -1,0 +1,114 @@
+//! vInt and vLong encoding: unsigned LEB128, matching the Java client's
+//! `ByteBufUtil.writeVInt`/`writeVLong` byte for byte.
+//!
+//! A negative `i32` (such as the default topology id, -1) is written by
+//! reinterpreting its bits as `u32` and encoding that. The Java client does
+//! the same: it passes negative ints through `writeVInt(int)`, which treats
+//! them as unsigned during the shift. `read_vint` reconstructs the same bit
+//! pattern, so casting the result back to `i32` recovers the original value.
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::error::Result;
+
+pub(crate) fn write_vint(buf: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            buf.push(byte | 0x80);
+        } else {
+            buf.push(byte);
+            break;
+        }
+    }
+}
+
+pub(crate) fn write_vlong(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            buf.push(byte | 0x80);
+        } else {
+            buf.push(byte);
+            break;
+        }
+    }
+}
+
+pub(crate) async fn read_vint<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u32> {
+    let mut result: u32 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = reader.read_u8().await?;
+        result |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+}
+
+pub(crate) async fn read_vlong<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = reader.read_u8().await?;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_vint_matches_single_byte_range() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, 0x7F);
+        assert_eq!(buf, vec![0x7F]);
+    }
+
+    #[test]
+    fn write_vint_matches_multi_byte_range() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, 300);
+        assert_eq!(buf, vec![0xAC, 0x02]);
+    }
+
+    #[test]
+    fn write_vint_of_negative_one_as_u32_takes_five_bytes() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, (-1i32) as u32);
+        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_vint() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, 123_456);
+        let value = read_vint(&mut buf.as_slice()).await.expect("read_vint");
+        assert_eq!(value, 123_456);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_vint_negative_topology_id() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, (-1i32) as u32);
+        let value = read_vint(&mut buf.as_slice()).await.expect("read_vint");
+        assert_eq!(value as i32, -1);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_vlong() {
+        let mut buf = Vec::new();
+        write_vlong(&mut buf, u64::MAX);
+        let value = read_vlong(&mut buf.as_slice()).await.expect("read_vlong");
+        assert_eq!(value, u64::MAX);
+    }
+}
