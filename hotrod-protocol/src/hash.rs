@@ -25,10 +25,6 @@
 //! from this exact class (see `docs/adr/0003-hash-aware-routing-scope.md`),
 //! not derived from memory or from the canonical MurmurHash3 reference.
 
-// Not wired up yet: `segment` starts being called once `cluster.rs` lands
-// later in this phase (see docs/adr/0003-hash-aware-routing-scope.md).
-#![allow(dead_code)]
-
 use crate::error::{Error, Result};
 
 const H1_SEED_XOR: u64 = 0x9368e53c2f6af274;
