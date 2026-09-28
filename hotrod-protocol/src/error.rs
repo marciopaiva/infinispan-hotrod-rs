@@ -61,6 +61,19 @@ pub enum Error {
     )]
     InvalidTopologyOwnerIndex { index: u32, num_servers: usize },
 
+    // A corrupted or hostile length prefix could otherwise ask for an
+    // allocation large enough to abort the process (Rust's allocator calls
+    // `handle_alloc_error` on failure, which is not a catchable panic),
+    // which would take down the whole embedding process, not just this
+    // call. Rejecting the declared length before allocating turns that into
+    // an ordinary typed error.
+    #[error("server declared {declared} {what}, which exceeds this client's limit of {max}")]
+    DeclaredLengthTooLarge {
+        what: &'static str,
+        declared: u32,
+        max: u32,
+    },
+
     /// Fires when a connect, or an operation's full write-then-read cycle,
     /// does not finish within the configured timeout. The connection this
     /// happened on may have an unwritten or unread partial protocol frame
