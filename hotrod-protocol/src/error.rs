@@ -33,8 +33,14 @@ pub enum Error {
     #[error("SASL mechanism {0} is not offered by the server")]
     UnsupportedSaslMechanism(String),
 
-    #[error("authentication failed: {0}")]
-    AuthenticationFailed(String),
+    #[error("malformed SASL challenge: {0}")]
+    MalformedChallenge(String),
+
+    #[error("SCRAM server verification failed: the server's final signature did not match")]
+    ScramServerVerificationFailed,
+
+    #[error("DIGEST-SHA-256 server verification failed: the server's rspauth did not match")]
+    DigestServerVerificationFailed,
 
     // The server only sends a topology update when the client advertises
     // TOPOLOGY_AWARE or HASH_DISTRIBUTION_AWARE intelligence. This client

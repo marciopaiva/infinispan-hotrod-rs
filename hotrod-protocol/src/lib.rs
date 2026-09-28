@@ -9,9 +9,11 @@
 #![forbid(unsafe_code)]
 
 mod connection;
+mod digest;
 mod error;
 mod header;
 mod sasl;
+mod scram;
 mod status;
 mod varint;
 mod wire;

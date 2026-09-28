@@ -28,6 +28,30 @@ async fn connect() -> HotRodConnection {
     conn
 }
 
+async fn connect_with_scram() -> HotRodConnection {
+    let addr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let mut conn = HotRodConnection::connect(&addr, "").await.expect("connect");
+    conn.authenticate_scram(&user, &pass)
+        .await
+        .expect("authenticate with SCRAM-SHA-512");
+    conn
+}
+
+async fn connect_with_digest() -> HotRodConnection {
+    let addr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let mut conn = HotRodConnection::connect(&addr, "").await.expect("connect");
+    conn.authenticate_digest(&user, &pass)
+        .await
+        .expect("authenticate with DIGEST-SHA-256");
+    conn
+}
+
 #[tokio::test]
 #[ignore]
 async fn put_get_remove_roundtrip() {
@@ -50,6 +74,48 @@ async fn put_get_remove_roundtrip() {
 
     let value = conn.get(b"ci-key").await.expect("get after remove");
     assert_eq!(value, None);
+}
+
+#[tokio::test]
+#[ignore]
+async fn scram_authenticated_connection_can_put_get_remove() {
+    let mut conn = connect_with_scram().await;
+
+    conn.put(
+        b"ci-scram-key",
+        b"ci-scram-value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+
+    let value = conn.get(b"ci-scram-key").await.expect("get");
+    assert_eq!(value, Some(b"ci-scram-value".to_vec()));
+
+    let removed = conn.remove(b"ci-scram-key").await.expect("remove");
+    assert!(removed);
+}
+
+#[tokio::test]
+#[ignore]
+async fn digest_authenticated_connection_can_put_get_remove() {
+    let mut conn = connect_with_digest().await;
+
+    conn.put(
+        b"ci-digest-key",
+        b"ci-digest-value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+
+    let value = conn.get(b"ci-digest-key").await.expect("get");
+    assert_eq!(value, Some(b"ci-digest-value".to_vec()));
+
+    let removed = conn.remove(b"ci-digest-key").await.expect("remove");
+    assert!(removed);
 }
 
 #[tokio::test]
