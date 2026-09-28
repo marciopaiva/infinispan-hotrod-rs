@@ -1,12 +1,58 @@
-//! SASL PLAIN mechanism support (phase 1 of ADR 0001; broader mechanisms
-//! are phase 2, issue #2).
-//!
-//! PLAIN is single-shot: the client sends one response and the server
-//! either completes or fails, there is no challenge round-trip.
+//! SASL mechanism support and the generic multi-round driver that runs
+//! any of them against the server's `AuthMechList`/`Auth` operations.
+
+use crate::error::Result;
+
+/// One SASL mechanism's client-side state machine. `HotRodConnection`
+/// drives this through zero or more challenge/response rounds via
+/// `run_sasl`; the mechanism itself knows nothing about the wire framing.
+pub(crate) trait SaslMechanism {
+    /// The IANA SASL mechanism name, as advertised by `AuthMechList` and
+    /// sent on every `Auth` request.
+    fn name(&self) -> &'static str;
+
+    /// Produces the response bytes for the next round. `challenge` is
+    /// `None` only for the very first call.
+    fn respond(&mut self, challenge: Option<&[u8]>) -> Result<Vec<u8>>;
+
+    /// Called once, after the server marks the exchange complete, with
+    /// whatever bytes came back on that final response (often empty).
+    /// Mechanisms that verify a server-side proof override this; others
+    /// accept the default no-op.
+    fn finish(&mut self, final_bytes: &[u8]) -> Result<()> {
+        let _ = final_bytes;
+        Ok(())
+    }
+}
+
+/// PLAIN is single-shot: the client sends one response built from the
+/// credentials and the server either completes or fails, there is no
+/// challenge round-trip (RFC 4616).
+pub(crate) struct PlainMechanism {
+    response: Vec<u8>,
+}
+
+impl PlainMechanism {
+    pub(crate) fn new(authzid: &str, authcid: &str, password: &str) -> Self {
+        Self {
+            response: plain_response(authzid, authcid, password),
+        }
+    }
+}
+
+impl SaslMechanism for PlainMechanism {
+    fn name(&self) -> &'static str {
+        "PLAIN"
+    }
+
+    fn respond(&mut self, _challenge: Option<&[u8]>) -> Result<Vec<u8>> {
+        Ok(self.response.clone())
+    }
+}
 
 /// Builds the PLAIN mechanism response: `authzid\0authcid\0password`,
 /// per RFC 4616.
-pub(crate) fn plain_response(authzid: &str, authcid: &str, password: &str) -> Vec<u8> {
+fn plain_response(authzid: &str, authcid: &str, password: &str) -> Vec<u8> {
     let mut response = Vec::with_capacity(authzid.len() + authcid.len() + password.len() + 2);
     response.extend_from_slice(authzid.as_bytes());
     response.push(0);

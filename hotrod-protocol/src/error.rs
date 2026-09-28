@@ -33,9 +33,6 @@ pub enum Error {
     #[error("SASL mechanism {0} is not offered by the server")]
     UnsupportedSaslMechanism(String),
 
-    #[error("authentication failed: {0}")]
-    AuthenticationFailed(String),
-
     // The server only sends a topology update when the client advertises
     // TOPOLOGY_AWARE or HASH_DISTRIBUTION_AWARE intelligence. This client
     // always advertises BASIC (phase 1 has no topology support, see ADR
