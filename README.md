@@ -11,10 +11,15 @@ and the core operations (`get`, `put`, `remove`, `put_if_absent`,
 `replace`, `replace_if_unmodified`, `remove_if_unmodified`).
 
 Phase 2 complete: SCRAM-SHA-512, DIGEST-SHA-256 and OAUTHBEARER
-authentication (GSSAPI deferred to its own issue). See
+authentication (GSSAPI deferred to its own issue).
+
+Phase 3 complete: `HotRodCluster` tracks cluster topology and routes
+each request to the segment's primary owner, using Infinispan's own
+`MurmurHash3`, instead of relying on server-side redirects. See
 `docs/adr/0001-mirror-java-client-scope.md` for the full roadmap,
-`docs/adr/0002-phase-2-sasl-scope.md` for how phase 2 was scoped, and
-`hotrod-protocol/CHANGELOG.md` for release notes.
+`docs/adr/0002-phase-2-sasl-scope.md` for how phase 2 was scoped,
+`docs/adr/0003-hash-aware-routing-scope.md` for how phase 3 was scoped,
+and `hotrod-protocol/CHANGELOG.md` for release notes.
 
 The PHP extension has not started yet.
 
