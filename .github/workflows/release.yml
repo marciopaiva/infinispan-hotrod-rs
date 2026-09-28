@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      - name: Start Infinispan
+        run: |
+          docker run -d --name infinispan \
+            -p 11222:11222 \
+            -e USER=unused \
+            -e PASS=unused-but-required \
+            -v "$PWD/ci/infinispan/infinispan.xml:/opt/infinispan/server/conf/infinispan.xml:ro" \
+            -v "$PWD/ci/infinispan/users.properties:/opt/infinispan/server/conf/users.properties:ro" \
+            -v "$PWD/ci/infinispan/groups.properties:/opt/infinispan/server/conf/groups.properties:ro" \
+            infinispan/server:15.1
+
+      - name: Wait for Infinispan
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/11222) 2>/dev/null; then
+              echo "Infinispan is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Infinispan did not come up in time"
+          docker logs infinispan
+          exit 1
+
+      - name: Integration test
+        run: cargo test --test live_server -- --ignored
+        env:
+          INFINISPAN_ADDR: 127.0.0.1:11222
+          INFINISPAN_USER: testuser
+          INFINISPAN_PASS: testpass
+
+      - name: Stop Infinispan
+        if: always()
+        run: docker rm -f infinispan
