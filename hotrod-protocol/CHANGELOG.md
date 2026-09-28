@@ -4,6 +4,37 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Phase 3 of the roadmap, scoped down in
+`docs/adr/0003-hash-aware-routing-scope.md`: cluster topology tracking
+and hash-aware routing to the segment's primary owner, instead of
+relying on server-side redirects.
+
+### Added
+
+- `HotRodCluster`: a new, additive entry point bound to one cache across
+  a multi-node cluster. Exposes the same operations as
+  `HotRodConnection` (`get`, `put`, `remove`, `put_if_absent`,
+  `replace`, `replace_if_unmodified`, `remove_if_unmodified`,
+  `get_with_version`), plus the matching `authenticate_*` methods,
+  replayed automatically on every pooled connection it opens.
+- Infinispan's own `MurmurHash3` variant and Hot Rod segment computation
+  (`(hash & 0x7FFFFFFF) % num_segments`), cross-validated against real
+  Java output. Only hash function version 3 (the current default) is
+  implemented; an unrecognized version is reported as
+  `Error::UnsupportedHashFunctionVersion` rather than silently guessed.
+- Parsing of Hot Rod topology-aware responses (server list, hash
+  function version, per-segment owners), received when a connection
+  advertises `HASH_DISTRIBUTION_AWARE` client intelligence.
+
+### Changed
+
+- `HotRodConnection`'s request/response header handling now threads an
+  explicit client intelligence and topology id through internally. Its
+  public behavior is unchanged: it still advertises `BASIC` intelligence
+  and topology id `-1`, exactly as before.
+
 ## [0.2.0] - 2026-09-28
 
 Phase 2 of the roadmap, scoped down in
