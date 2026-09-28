@@ -399,6 +399,34 @@ mod tests {
         );
     }
 
+    /// Captured from a real WildFly Elytron 2.6.0.Final `SaslServer` and
+    /// `SaslClient` (the exact library Infinispan uses) driven in-process
+    /// with username "testuser", password "testpass", digest-uri
+    /// "hotrod/infinispan". The cnonce this client would normally generate
+    /// at random is overridden with the one Java's client used for that
+    /// run, so this crate's digest and rspauth can be checked byte for
+    /// byte against Java's own values instead of only against each other.
+    #[test]
+    fn matches_a_real_elytron_digest_sha_256_exchange() {
+        let server_challenge = br#"realm="infinispan",nonce="oH/Kf7I8TkigEdBpZZTOg/D173d+TmtYlUtDLuKSyW3B2VPt",qop="auth",charset=utf-8,algorithm=md5-sess"#;
+        let server_rspauth =
+            br#"rspauth=9d29c7f114fb611a7219c0d0e385cb5d8e68a64e93cfc71fed8a4f346ed95468"#;
+
+        let mut mechanism = DigestSha256Mechanism::new("testuser", "testpass");
+        mechanism.cnonce = "k0CiTzgO7CcsLoWQ1vnEvZwAEAI8Nl/ALtrjORZ7GOWYjtq7".to_string();
+
+        mechanism.respond(None).unwrap();
+        let response = mechanism.respond(Some(server_challenge)).unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let directives = parse_directives(&response).unwrap();
+        assert_eq!(
+            directive(&directives, "response").unwrap(),
+            "80dd936add1807e9727ca17b87d88c3e38369811f00b5d767d00ac9f95f92800"
+        );
+
+        assert!(mechanism.respond(Some(server_rspauth)).unwrap().is_none());
+    }
+
     #[test]
     fn rejects_forged_rspauth() {
         let mut mechanism = DigestSha256Mechanism::new("alice", "s3cr3t");

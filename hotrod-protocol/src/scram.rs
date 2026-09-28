@@ -238,6 +238,36 @@ mod tests {
         assert!(matches!(err, Error::MalformedChallenge(_)));
     }
 
+    /// Captured from a real WildFly Elytron 2.6.0.Final `SaslServer` and
+    /// `SaslClient` (the exact library Infinispan uses) driven in-process
+    /// with username "testuser", password "testpass". The client nonce
+    /// this client would normally generate at random is overridden with
+    /// the one Java's client used for that run, so this crate's proof and
+    /// server-signature verification can be checked byte for byte against
+    /// Java's own values instead of only against each other.
+    #[test]
+    fn matches_a_real_elytron_scram_sha_512_exchange() {
+        let client_nonce = "u{KSK:?h^0_Fv!+0&a8QZz=r9mam<S(&F5*Q~qr^R|aNN~P>";
+        let server_first_message: &[u8] = br#"r=u{KSK:?h^0_Fv!+0&a8QZz=r9mam<S(&F5*Q~qr^R|aNN~P>5HXB1V`L3yPAj)CbipC'<T_v}HQ-,s=OumLQqvE8v01nG3E,i=20000"#;
+        let expected_client_final: &[u8] = br#"c=biws,r=u{KSK:?h^0_Fv!+0&a8QZz=r9mam<S(&F5*Q~qr^R|aNN~P>5HXB1V`L3yPAj)CbipC'<T_v}HQ-,p=0qmuMd9EM5rhtcjaQ0xXw6Dkf72dyg5OYfQiZn8c55SZ0GYD0EaHDJNzvE7w9wYklTOzb9eiHcBiWzBJxYQ59Q=="#;
+        let server_final_message: &[u8] = br#"v=cYD+i7GYtue7LfEgLHSWdvlMJq15c5p0kHb4n9lmgMNObhS51YN0bjPJitAnH+dbWWVIT8kJG5Hn10jewNMMYQ=="#;
+
+        let mut mechanism = ScramSha512Mechanism::new("testuser", "testpass");
+        mechanism.client_nonce = client_nonce.to_string();
+        mechanism.client_first_message_bare = format!("n=testuser,r={client_nonce}");
+
+        let client_final = mechanism
+            .respond(Some(server_first_message))
+            .unwrap()
+            .unwrap();
+        assert_eq!(client_final, expected_client_final);
+
+        assert!(mechanism
+            .respond(Some(server_final_message))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn detects_forged_server_signature() {
         let mut mechanism = ScramSha512Mechanism::new("alice", "s3cr3t");
