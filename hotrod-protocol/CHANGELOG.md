@@ -27,6 +27,15 @@ relying on server-side redirects.
 - Parsing of Hot Rod topology-aware responses (server list, hash
   function version, per-segment owners), received when a connection
   advertises `HASH_DISTRIBUTION_AWARE` client intelligence.
+- A configurable timeout on `HotRodConnection` and `HotRodCluster`.
+  `DEFAULT_TIMEOUT` (30 seconds) bounds the initial connect and the full
+  write-then-read body of every operation and SASL round unless
+  overridden with the new `connect_with_timeout` constructors. Timing
+  out returns `Error::Timeout` instead of hanging forever; the
+  connection may have a partial frame in flight afterward and must not
+  be reused, the same hazard `Error::Io` already carries.
+  `HotRodCluster` treats `Error::Timeout` the same as `Error::Io` in its
+  pooled-connection retry logic.
 
 ### Changed
 
@@ -34,6 +43,14 @@ relying on server-side redirects.
   explicit client intelligence and topology id through internally. Its
   public behavior is unchanged: it still advertises `BASIC` intelligence
   and topology id `-1`, exactly as before.
+
+### Fixed
+
+- `HotRodCluster` no longer panics when a topology update references an
+  owner index that is out of range for the server list it came with.
+  `read_topology_update` now rejects such a payload with the new
+  `Error::InvalidTopologyOwnerIndex` as soon as it is decoded, instead of
+  letting it reach the indexing that used it.
 
 ## [0.2.0] - 2026-09-28
 
