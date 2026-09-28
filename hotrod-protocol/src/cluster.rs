@@ -75,6 +75,11 @@ struct ClusterTopology {
     /// Index `n` is segment `n`'s owners, as indices into `servers`, primary
     /// owner first.
     segment_owners: Vec<Vec<u32>>,
+    /// Addresses already resolved for this topology, keyed by index into
+    /// `servers`. A new topology update replaces this whole struct, so the
+    /// cache is invalidated for free whenever the servers it was built from
+    /// change.
+    resolved_addrs: HashMap<u32, SocketAddr>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation to
@@ -426,10 +431,17 @@ impl HotRodCluster {
         let Some(&primary) = topology.segment_owners[segment as usize].first() else {
             return Ok(self.active_seed_addr);
         };
+        if let Some(&addr) = topology.resolved_addrs.get(&primary) {
+            return Ok(addr);
+        }
         // Safe: `topology::read_topology_update` rejects any owner index
         // that is out of range for `servers` before this type is built.
         let server = topology.servers[primary as usize].clone();
-        resolve_server_addr(&server).await
+        let addr = resolve_server_addr(&server).await?;
+        if let Some(topology) = self.topology.as_mut() {
+            topology.resolved_addrs.insert(primary, addr);
+        }
+        Ok(addr)
     }
 
     /// Opens and authenticates a pooled connection to `addr` if one is not
@@ -466,6 +478,7 @@ impl HotRodCluster {
             servers: update.servers,
             hash_function_version: update.hash_function_version,
             segment_owners: update.segment_owners,
+            resolved_addrs: HashMap::new(),
         });
     }
 }
@@ -526,6 +539,7 @@ mod tests {
             }],
             hash_function_version: 3,
             segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
         });
 
         let result = cluster.get(b"key").await;
@@ -533,5 +547,41 @@ mod tests {
         assert!(matches!(result, Err(Error::Timeout(_))));
         assert!(!cluster.connections.contains_key(&owner_addr));
         assert!(!cluster.connections.contains_key(&seed_addr));
+    }
+
+    #[tokio::test]
+    async fn owner_addr_reuses_a_cached_resolution_instead_of_resolving_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut cluster = HotRodCluster::connect(&[addr], "my-cache")
+            .await
+            .expect("connect to seed");
+
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        let first = cluster.owner_addr(b"key").await.expect("first resolution");
+        assert_eq!(first, addr);
+
+        // Break the hostname on the topology directly: if `owner_addr`
+        // resolved it again instead of using the cache populated above,
+        // this call would fail.
+        cluster.topology.as_mut().unwrap().servers[0].host =
+            "this-hostname-does-not-resolve.invalid".to_string();
+
+        let second = cluster.owner_addr(b"key").await.expect("cached resolution");
+        assert_eq!(second, addr);
     }
 }
