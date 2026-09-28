@@ -11,6 +11,7 @@
 mod connection;
 mod digest;
 mod error;
+mod hash;
 mod header;
 mod sasl;
 mod scram;
