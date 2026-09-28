@@ -65,6 +65,17 @@ relying on server-side redirects.
   every call. The resolved address is now cached per topology and only
   redone once a new topology update replaces it.
 
+### Documented
+
+- The module docs on `HotRodConnection` and `HotRodCluster` now state
+  explicitly that dropping an operation's future before it resolves, for
+  any reason, is the same hazard `Error::Timeout` already carries: the
+  connection may have a partial frame in flight and must be reconnected,
+  not reused. For `HotRodCluster` specifically, a pooled connection left
+  in that state is not evicted, since `call` only does so on an
+  `Error::Io` or `Error::Timeout` return value, which a dropped future
+  never produces.
+
 ## [0.2.0] - 2026-09-28
 
 Phase 2 of the roadmap, scoped down in

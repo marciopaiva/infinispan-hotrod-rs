@@ -9,6 +9,15 @@
 //! unless overridden via `connect_with_timeout`), so a hung server or a
 //! partitioned network cannot block a call forever. See `Error::Timeout`
 //! for what a caller must do with the connection after one fires.
+//!
+//! That hazard is not specific to the internal timeout: Hot Rod's
+//! protocol needs one full write-then-read cycle per request to stay in
+//! sync, so dropping an operation's future before it resolves, for any
+//! reason, can leave the connection with a partial frame in flight. A
+//! caller's own `tokio::time::timeout` racing this client's, a `select!`
+//! that resolves another branch first, or an aborted task all have the
+//! same effect as `Error::Timeout`: the connection must be reconnected,
+//! never reused.
 
 use std::future::Future;
 use std::time::Duration;

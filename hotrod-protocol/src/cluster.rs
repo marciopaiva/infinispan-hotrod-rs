@@ -8,6 +8,14 @@
 //! tracks the topology the server reports, and routes each operation to the
 //! segment's primary owner, computed locally with the same `MurmurHash3`
 //! variant the server uses.
+//!
+//! The same cancellation hazard documented on `connection`'s module docs
+//! applies to each pooled connection here, and is sharper: `call` only
+//! evicts a pooled connection from `self.connections` when the operation
+//! itself returns `Error::Io` or `Error::Timeout`. A future dropped
+//! externally before it resolves never returns anything, so the poisoned
+//! connection stays in the pool and is handed to the next call routed to
+//! the same owner instead of being reconnected.
 
 use std::collections::HashMap;
 use std::io;

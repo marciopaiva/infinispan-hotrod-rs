@@ -79,6 +79,12 @@ pub enum Error {
     /// happened on may have an unwritten or unread partial protocol frame
     /// left on the wire and must not be reused: treat it the same as an
     /// `Io` error and reconnect.
+    ///
+    /// This is one way a connection ends up with a partial frame in
+    /// flight, not the only one: see the module docs on `HotRodConnection`
+    /// and `HotRodCluster` for the general rule, which also covers a
+    /// caller dropping the operation's future before it resolves for a
+    /// reason of its own.
     #[error("operation timed out after {0:?}")]
     Timeout(Duration),
 }
