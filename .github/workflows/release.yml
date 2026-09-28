@@ -39,8 +39,11 @@ jobs:
 
       - name: Wait for Infinispan
         run: |
+          # The port accepts connections before the server has finished
+          # starting, so a raw TCP check is not enough: wait for the
+          # startup-complete log line instead (ISPN080001).
           for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/11222) 2>/dev/null; then
+            if docker logs infinispan 2>&1 | grep -q "ISPN080001"; then
               echo "Infinispan is up"
               exit 0
             fi
