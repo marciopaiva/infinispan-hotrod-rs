@@ -506,7 +506,11 @@ async fn resolve_server_addr(server: &TopologyServer) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::varint::{read_vint, read_vlong, write_vint, write_vlong};
+    use crate::wire::{read_array, write_array};
 
     #[tokio::test]
     async fn connect_fails_with_no_seed_addresses() {
@@ -591,5 +595,143 @@ mod tests {
 
         let second = cluster.owner_addr(b"key").await.expect("cached resolution");
         assert_eq!(second, addr);
+    }
+
+    #[tokio::test]
+    async fn owner_addr_returns_a_typed_error_when_the_owner_host_does_not_resolve() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: "this-hostname-does-not-resolve.invalid".to_string(),
+                port: 7000,
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        let result = cluster.owner_addr(b"key").await;
+        assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    /// Reads one request's fixed header fields far enough to identify the
+    /// opcode and message id. The fields in between (flags, intelligence,
+    /// topology id, media types, additional params) are already covered by
+    /// `header.rs`'s own tests, so they are just consumed here, not checked.
+    async fn read_request_opcode(stream: &mut TcpStream) -> (u64, u8) {
+        assert_eq!(
+            stream.read_u8().await.unwrap(),
+            0xA0,
+            "expected a request magic byte"
+        );
+        let message_id = read_vlong(stream).await.unwrap();
+        let _version = stream.read_u8().await.unwrap();
+        let opcode = stream.read_u8().await.unwrap();
+        let _cache_name = read_array(stream).await.unwrap();
+        let _flags = read_vint(stream).await.unwrap();
+        let _intelligence = stream.read_u8().await.unwrap();
+        let _topology_id = read_vint(stream).await.unwrap();
+        let _key_media_type = stream.read_u8().await.unwrap();
+        let _value_media_type = stream.read_u8().await.unwrap();
+        let _additional_params = read_vint(stream).await.unwrap();
+        (message_id, opcode)
+    }
+
+    fn response_header(message_id: u64, opcode: u8, status: u8) -> Vec<u8> {
+        let mut buf = vec![0xA1];
+        write_vlong(&mut buf, message_id);
+        buf.push(opcode);
+        buf.push(status);
+        buf.push(0); // no topology update
+        buf
+    }
+
+    /// Serves one `AuthMechList`/`Auth` exchange for SASL PLAIN, asserting
+    /// the credentials sent are exactly `expected_plain_response`. Used to
+    /// check that a pooled connection opened after the seed replays the
+    /// same credentials, not just that it authenticates somehow.
+    async fn serve_plain_auth(stream: &mut TcpStream, expected_plain_response: &[u8]) {
+        let (id, opcode) = read_request_opcode(stream).await;
+        assert_eq!(opcode, 0x21, "expected an AuthMechList request");
+        let mut resp = response_header(id, 0x22, 0x00);
+        write_vint(&mut resp, 1); // one mechanism offered
+        write_array(&mut resp, b"PLAIN");
+        stream.write_all(&resp).await.unwrap();
+
+        let (id, opcode) = read_request_opcode(stream).await;
+        assert_eq!(opcode, 0x23, "expected an Auth request");
+        let mech_name = read_array(stream).await.unwrap();
+        assert_eq!(mech_name, b"PLAIN");
+        let response = read_array(stream).await.unwrap();
+        assert_eq!(
+            response, expected_plain_response,
+            "pooled connection must replay the same credentials as the seed"
+        );
+        let mut resp = response_header(id, 0x24, 0x00);
+        resp.push(1); // exchange complete
+        write_array(&mut resp, &[]); // no final server message
+        stream.write_all(&resp).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_connection_replays_seed_auth_onto_a_newly_opened_pooled_connection() {
+        // RFC 4616 PLAIN response for authzid "", authcid "user", password "pass".
+        let expected_plain_response = b"\0user\0pass".to_vec();
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let expected_for_seed = expected_plain_response.clone();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut stream, &expected_for_seed).await;
+        });
+
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = owner_listener.local_addr().unwrap();
+        let expected_for_owner = expected_plain_response.clone();
+        let owner_task = tokio::spawn(async move {
+            let (mut stream, _) = owner_listener.accept().await.unwrap();
+            serve_plain_auth(&mut stream, &expected_for_owner).await;
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+        cluster
+            .authenticate_plain("", "user", "pass")
+            .await
+            .expect("authenticate seed connection");
+
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: owner_addr.ip().to_string(),
+                port: owner_addr.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        let result = cluster.get(b"key").await.expect("get against owner");
+        assert_eq!(result, None);
+
+        seed_task.await.unwrap();
+        owner_task.await.unwrap();
     }
 }
