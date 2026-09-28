@@ -455,12 +455,12 @@ impl HotRodConnection {
         self.stream.write_all(&request).await?;
         self.stream.flush().await?;
 
-        let header =
+        let mut header =
             read_response_header(&mut self.stream, message_id, opcode, self.intelligence).await?;
         if let Some(update) = &header.topology_update {
             self.topology_id = update.topology_id as i32;
         }
-        self.pending_topology_update = header.topology_update.clone();
+        self.pending_topology_update = std::mem::take(&mut header.topology_update);
         Ok((message_id, header))
     }
 }
