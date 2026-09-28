@@ -4,7 +4,7 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-28
 
 Phase 2 of the roadmap, scoped down in
 `docs/adr/0002-phase-2-sasl-scope.md`: SCRAM-SHA-512, DIGEST-SHA-256

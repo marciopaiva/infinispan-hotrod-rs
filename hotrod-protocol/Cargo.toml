@@ -1,6 +1,6 @@
 [package]
 name = "hotrod-protocol"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Pure Rust client for the Infinispan/Red Hat Data Grid Hot Rod binary protocol"
 license = "MIT OR Apache-2.0"
