@@ -11,6 +11,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use crate::error::{Error, Result};
 use crate::header::{read_response_header, write_request_header, OpCode};
 use crate::sasl::{PlainMechanism, SaslMechanism};
+use crate::scram::ScramSha512Mechanism;
 use crate::varint::read_vint;
 use crate::wire::{read_array, read_string, write_array, write_expiration_params, Expiration};
 
@@ -69,6 +70,12 @@ impl HotRodConnection {
             .await
     }
 
+    /// Authenticates the connection using SASL SCRAM-SHA-512 (RFC 5802).
+    pub async fn authenticate_scram(&mut self, authcid: &str, password: &str) -> Result<()> {
+        self.run_sasl(ScramSha512Mechanism::new(authcid, password))
+            .await
+    }
+
     /// Drives a `SaslMechanism` through the server's `AuthMechList`/`Auth`
     /// exchange: confirms the mechanism is offered, then loops sending
     /// responses and feeding back challenges until the server marks the
@@ -91,7 +98,9 @@ impl HotRodConnection {
 
         let mut challenge: Option<Vec<u8>> = None;
         loop {
-            let response = mechanism.respond(challenge.as_deref())?;
+            let Some(response) = mechanism.respond(challenge.as_deref())? else {
+                return Ok(());
+            };
             let mut body = Vec::new();
             write_array(&mut body, mechanism.name().as_bytes());
             write_array(&mut body, &response);

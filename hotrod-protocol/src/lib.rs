@@ -12,6 +12,7 @@ mod connection;
 mod error;
 mod header;
 mod sasl;
+mod scram;
 mod status;
 mod varint;
 mod wire;

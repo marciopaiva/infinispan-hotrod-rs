@@ -10,3 +10,8 @@ readme = "README.md"
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
 thiserror = "2"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rand = "0.8"
+base64 = "0.22"

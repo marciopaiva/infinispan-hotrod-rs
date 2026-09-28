@@ -39,7 +39,7 @@
          <endpoint socket-binding="default" security-realm="default">
             <hotrod-connector>
                <authentication>
-                  <sasl mechanisms="PLAIN DIGEST-MD5" server-name="infinispan" qop="auth"/>
+                  <sasl mechanisms="PLAIN SCRAM-SHA-512" server-name="infinispan" qop="auth"/>
                </authentication>
             </hotrod-connector>
             <rest-connector/>

@@ -11,9 +11,17 @@ pub(crate) trait SaslMechanism {
     /// sent on every `Auth` request.
     fn name(&self) -> &'static str;
 
-    /// Produces the response bytes for the next round. `challenge` is
-    /// `None` only for the very first call.
-    fn respond(&mut self, challenge: Option<&[u8]>) -> Result<Vec<u8>>;
+    /// Produces the response bytes for the next round, or `None` when the
+    /// mechanism has nothing left to send and considers the exchange over.
+    /// `challenge` is `None` only for the very first call.
+    ///
+    /// `None` must be honored regardless of what the server's wire-level
+    /// "complete" flag says: Infinispan sets that flag from whether a
+    /// challenge payload is attached to its response, not from whether the
+    /// SASL layer underneath has actually finished, so a mechanism that
+    /// verifies a final server message (SCRAM) can find itself done before
+    /// the server admits it on the wire.
+    fn respond(&mut self, challenge: Option<&[u8]>) -> Result<Option<Vec<u8>>>;
 
     /// Called once, after the server marks the exchange complete, with
     /// whatever bytes came back on that final response (often empty).
@@ -45,8 +53,8 @@ impl SaslMechanism for PlainMechanism {
         "PLAIN"
     }
 
-    fn respond(&mut self, _challenge: Option<&[u8]>) -> Result<Vec<u8>> {
-        Ok(self.response.clone())
+    fn respond(&mut self, _challenge: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        Ok(Some(self.response.clone()))
     }
 }
 
