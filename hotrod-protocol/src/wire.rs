@@ -5,8 +5,15 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::varint::{read_vint, write_vint, write_vlong};
+
+/// Safety ceiling on a declared array length, checked before allocating for
+/// it. This is not a protocol limit, just generous enough that no real
+/// cache key or value ever approaches it: it exists so a corrupted or
+/// hostile length prefix gets a typed error instead of an allocation big
+/// enough to abort the process.
+const MAX_ARRAY_LEN: u32 = 64 * 1024 * 1024;
 
 pub(crate) fn write_array(buf: &mut Vec<u8>, bytes: &[u8]) {
     write_vint(buf, bytes.len() as u32);
@@ -14,8 +21,15 @@ pub(crate) fn write_array(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 pub(crate) async fn read_array<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
-    let len = read_vint(reader).await? as usize;
-    let mut bytes = vec![0u8; len];
+    let len = read_vint(reader).await?;
+    if len > MAX_ARRAY_LEN {
+        return Err(Error::DeclaredLengthTooLarge {
+            what: "an array length",
+            declared: len,
+            max: MAX_ARRAY_LEN,
+        });
+    }
+    let mut bytes = vec![0u8; len as usize];
     reader.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
@@ -94,6 +108,23 @@ mod tests {
         write_array(&mut buf, b"hello");
         let bytes = read_array(&mut buf.as_slice()).await.expect("read_array");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_array_rejects_a_declared_length_over_the_safety_limit() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, MAX_ARRAY_LEN + 1);
+
+        let result = read_array(&mut buf.as_slice()).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::DeclaredLengthTooLarge {
+                declared,
+                max: MAX_ARRAY_LEN,
+                ..
+            }) if declared == MAX_ARRAY_LEN + 1
+        ));
     }
 
     #[tokio::test]
