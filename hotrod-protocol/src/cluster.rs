@@ -12,10 +12,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::net::lookup_host;
 
-use crate::connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TOPOLOGY_ID};
+use crate::connection::{
+    HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT, DEFAULT_TOPOLOGY_ID,
+};
 use crate::error::{Error, Result};
 use crate::hash;
 use crate::topology::TopologyServer;
@@ -90,6 +93,7 @@ pub struct HotRodCluster {
     topology: Option<ClusterTopology>,
     connections: HashMap<SocketAddr, HotRodConnection>,
     auth: Option<AuthMethod>,
+    timeout: Duration,
 }
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -151,11 +155,29 @@ impl HotRodCluster {
     /// Connects to the first seed address that accepts a connection, in
     /// order, matching the Java client's failover-on-connect behavior. No
     /// topology is known yet at this point: every operation routes to this
-    /// seed until the server's first response carries one.
+    /// seed until the server's first response carries one. Uses
+    /// `DEFAULT_TIMEOUT`; call `connect_with_timeout` for a different bound.
     pub async fn connect(seed_addrs: &[SocketAddr], cache_name: &str) -> Result<Self> {
+        Self::connect_with_timeout(seed_addrs, cache_name, DEFAULT_TIMEOUT).await
+    }
+
+    /// Same as `connect`, but with a caller-supplied timeout in place of
+    /// `DEFAULT_TIMEOUT`, applied to every connection this instance opens,
+    /// now or later when routing discovers a new node.
+    pub async fn connect_with_timeout(
+        seed_addrs: &[SocketAddr],
+        cache_name: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut last_err: Option<Error> = None;
         for &addr in seed_addrs {
-            match HotRodConnection::connect_hash_aware(addr, cache_name, DEFAULT_TOPOLOGY_ID).await
+            match HotRodConnection::connect_hash_aware(
+                addr,
+                cache_name,
+                DEFAULT_TOPOLOGY_ID,
+                timeout,
+            )
+            .await
             {
                 Ok(conn) => {
                     let mut connections = HashMap::new();
@@ -167,6 +189,7 @@ impl HotRodCluster {
                         topology: None,
                         connections,
                         auth: None,
+                        timeout,
                     });
                 }
                 Err(err) => last_err = Some(err),
@@ -358,7 +381,7 @@ impl HotRodCluster {
             }
             Err(err) => err,
         };
-        if !matches!(err, Error::Io(_)) {
+        if !matches!(err, Error::Io(_) | Error::Timeout(_)) {
             return Err(err);
         }
         self.connections.remove(&addr);
@@ -378,7 +401,7 @@ impl HotRodCluster {
                 Ok(value)
             }
             Err(err) => {
-                if matches!(err, Error::Io(_)) {
+                if matches!(err, Error::Io(_) | Error::Timeout(_)) {
                     self.connections.remove(&seed);
                 }
                 Err(err)
@@ -415,8 +438,13 @@ impl HotRodCluster {
         if self.connections.contains_key(&addr) {
             return Ok(());
         }
-        let mut conn =
-            HotRodConnection::connect_hash_aware(addr, &self.cache_name, self.topology_id).await?;
+        let mut conn = HotRodConnection::connect_hash_aware(
+            addr,
+            &self.cache_name,
+            self.topology_id,
+            self.timeout,
+        )
+        .await?;
         if let Some(auth) = &self.auth {
             auth.authenticate(&mut conn).await?;
         }
@@ -457,10 +485,53 @@ async fn resolve_server_addr(server: &TopologyServer) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn connect_fails_with_no_seed_addresses() {
         let result = HotRodCluster::connect(&[], "my-cache").await;
         assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn timeout_evicts_pooled_connection_and_retries_against_seed() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = owner_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = owner_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut cluster = HotRodCluster::connect_with_timeout(
+            &[seed_addr],
+            "my-cache",
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("connect to seed");
+
+        // A single segment covering every key, owned by `owner_addr`, so
+        // `get` below routes there instead of the seed.
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: owner_addr.ip().to_string(),
+                port: owner_addr.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+        });
+
+        let result = cluster.get(b"key").await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert!(!cluster.connections.contains_key(&owner_addr));
+        assert!(!cluster.connections.contains_key(&seed_addr));
     }
 }
