@@ -39,6 +39,9 @@ pub enum Error {
     #[error("SCRAM server verification failed: the server's final signature did not match")]
     ScramServerVerificationFailed,
 
+    #[error("DIGEST-SHA-256 server verification failed: the server's rspauth did not match")]
+    DigestServerVerificationFailed,
+
     // The server only sends a topology update when the client advertises
     // TOPOLOGY_AWARE or HASH_DISTRIBUTION_AWARE intelligence. This client
     // always advertises BASIC (phase 1 has no topology support, see ADR

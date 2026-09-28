@@ -8,6 +8,7 @@
 use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
+use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
 use crate::header::{read_response_header, write_request_header, OpCode};
 use crate::sasl::{PlainMechanism, SaslMechanism};
@@ -73,6 +74,14 @@ impl HotRodConnection {
     /// Authenticates the connection using SASL SCRAM-SHA-512 (RFC 5802).
     pub async fn authenticate_scram(&mut self, authcid: &str, password: &str) -> Result<()> {
         self.run_sasl(ScramSha512Mechanism::new(authcid, password))
+            .await
+    }
+
+    /// Authenticates the connection using SASL DIGEST-SHA-256, Elytron's
+    /// generalization of RFC 2831 DIGEST-MD5. The digest-uri's server-name
+    /// half is fixed to `infinispan`; see `digest.rs` for why.
+    pub async fn authenticate_digest(&mut self, authcid: &str, password: &str) -> Result<()> {
+        self.run_sasl(DigestSha256Mechanism::new(authcid, password))
             .await
     }
 

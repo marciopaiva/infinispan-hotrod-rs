@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod connection;
+mod digest;
 mod error;
 mod header;
 mod sasl;
