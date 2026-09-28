@@ -51,6 +51,9 @@ pub enum Error {
         "received an unexpected topology update: topology-aware routing is not implemented yet"
     )]
     UnsupportedTopologyUpdate,
+
+    #[error("server's topology update uses hash function version {0}, which this client does not implement")]
+    UnsupportedHashFunctionVersion(u8),
 }
 
 /// Result alias for `hotrod_protocol::Error`.
