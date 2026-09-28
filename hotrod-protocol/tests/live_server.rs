@@ -10,7 +10,9 @@
 //! Connection details come from environment variables so the test can also
 //! be pointed at a local server, with defaults matching the CI fixture.
 
-use hotrod_protocol::{Expiration, HotRodConnection, VersionedResult};
+use std::net::SocketAddr;
+
+use hotrod_protocol::{Expiration, HotRodCluster, HotRodConnection, VersionedResult};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -50,6 +52,106 @@ async fn connect_with_digest() -> HotRodConnection {
         .await
         .expect("authenticate with DIGEST-SHA-256");
     conn
+}
+
+/// Seed addresses for a multi-node cluster, needed only by the
+/// `HotRodCluster` tests below: hash-aware routing has nothing to route to
+/// on the single-node fixture the other tests in this file use. Point this
+/// at a local cluster with a `<distributed-cache>` (see
+/// `docs/adr/0003-hash-aware-routing-scope.md`).
+fn cluster_seed_addrs() -> Vec<SocketAddr> {
+    env_or(
+        "INFINISPAN_CLUSTER_ADDRS",
+        "127.0.0.1:11222,127.0.0.1:11322",
+    )
+    .split(',')
+    .map(|addr| addr.trim().parse().expect("valid socket address"))
+    .collect()
+}
+
+fn cluster_cache_name() -> String {
+    env_or("INFINISPAN_CLUSTER_CACHE", "distributed")
+}
+
+async fn connect_cluster() -> HotRodCluster {
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let mut cluster = HotRodCluster::connect(&cluster_seed_addrs(), &cluster_cache_name())
+        .await
+        .expect("connect");
+    cluster
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+    cluster
+}
+
+#[tokio::test]
+#[ignore]
+async fn cluster_put_get_remove_roundtrip() {
+    let mut cluster = connect_cluster().await;
+
+    cluster
+        .put(
+            b"ci-cluster-key",
+            b"ci-cluster-value",
+            Expiration::Default,
+            Expiration::Default,
+        )
+        .await
+        .expect("put");
+
+    let value = cluster.get(b"ci-cluster-key").await.expect("get");
+    assert_eq!(value, Some(b"ci-cluster-value".to_vec()));
+
+    let removed = cluster.remove(b"ci-cluster-key").await.expect("remove");
+    assert!(removed);
+
+    let value = cluster
+        .get(b"ci-cluster-key")
+        .await
+        .expect("get after remove");
+    assert_eq!(value, None);
+}
+
+/// Distinct keys hash to different segments, so this exercises routing to
+/// more than one node's connection rather than always the seed. Whether
+/// each request actually lands on the computed primary owner (as opposed to
+/// landing correctly only via a server-side redirect) is confirmed manually
+/// by watching each node's stats while this test runs, per
+/// `docs/adr/0003-hash-aware-routing-scope.md`.
+#[tokio::test]
+#[ignore]
+async fn cluster_routes_many_keys_to_their_owners() {
+    let mut cluster = connect_cluster().await;
+
+    let keys: Vec<Vec<u8>> = (0..50)
+        .map(|i| format!("ci-cluster-routing-{i}").into_bytes())
+        .collect();
+
+    for key in &keys {
+        cluster
+            .put(key, b"value", Expiration::Default, Expiration::Default)
+            .await
+            .unwrap_or_else(|err| panic!("put {key:?}: {err}"));
+    }
+
+    for key in &keys {
+        let value = cluster
+            .get(key)
+            .await
+            .unwrap_or_else(|err| panic!("get {key:?}: {err}"));
+        assert_eq!(value, Some(b"value".to_vec()));
+    }
+
+    for key in &keys {
+        let removed = cluster
+            .remove(key)
+            .await
+            .unwrap_or_else(|err| panic!("remove {key:?}: {err}"));
+        assert!(removed);
+    }
 }
 
 #[tokio::test]
