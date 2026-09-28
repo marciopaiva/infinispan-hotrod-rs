@@ -11,7 +11,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
 use crate::header::{read_response_header, write_request_header, OpCode};
-use crate::sasl::{PlainMechanism, SaslMechanism};
+use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::varint::read_vint;
 use crate::wire::{read_array, read_string, write_array, write_expiration_params, Expiration};
@@ -82,6 +82,17 @@ impl HotRodConnection {
     /// half is fixed to `infinispan`; see `digest.rs` for why.
     pub async fn authenticate_digest(&mut self, authcid: &str, password: &str) -> Result<()> {
         self.run_sasl(DigestSha256Mechanism::new(authcid, password))
+            .await
+    }
+
+    /// Authenticates the connection using SASL OAUTHBEARER (RFC 7628) with
+    /// a bearer token obtained elsewhere, typically from an OIDC provider.
+    ///
+    /// This mechanism has unit test coverage only: live-server coverage
+    /// needs a token-backed realm the CI fixture does not provide yet, see
+    /// `sasl.rs`.
+    pub async fn authenticate_oauthbearer(&mut self, authzid: &str, token: &str) -> Result<()> {
+        self.run_sasl(OAuthBearerMechanism::new(authzid, token))
             .await
     }
 
