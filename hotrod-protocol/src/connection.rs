@@ -13,8 +13,16 @@ use crate::error::{Error, Result};
 use crate::header::{read_response_header, write_request_header, OpCode};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
+use crate::topology::ClientIntelligence;
 use crate::varint::read_vint;
 use crate::wire::{read_array, read_string, write_array, write_expiration_params, Expiration};
+
+/// Sent on every request: phase 1 does not track cluster topology yet
+/// (see ADR 0001 and issue #3), so `HotRodConnection` always advertises
+/// BASIC intelligence and this placeholder id. Encoded as `u32::from_ne_bytes`
+/// would not do here: it must go through the same unsigned-vint path as any
+/// other topology id (see `varint` module docs).
+const DEFAULT_TOPOLOGY_ID: i32 = -1;
 
 /// The outcome of a versioned write (`replace_if_unmodified`,
 /// `remove_if_unmodified`): whether the server's copy still had the version
@@ -299,13 +307,26 @@ impl HotRodConnection {
         self.next_message_id += 1;
 
         let mut request = Vec::with_capacity(32 + body.len());
-        write_request_header(&mut request, message_id, cache_name, opcode);
+        write_request_header(
+            &mut request,
+            message_id,
+            cache_name,
+            opcode,
+            ClientIntelligence::Basic,
+            DEFAULT_TOPOLOGY_ID,
+        );
         request.extend_from_slice(body);
 
         self.stream.write_all(&request).await?;
         self.stream.flush().await?;
 
-        let header = read_response_header(&mut self.stream, message_id, opcode).await?;
+        let header = read_response_header(
+            &mut self.stream,
+            message_id,
+            opcode,
+            ClientIntelligence::Basic,
+        )
+        .await?;
         Ok((message_id, header))
     }
 }
