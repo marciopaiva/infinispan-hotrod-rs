@@ -51,6 +51,14 @@ relying on server-side redirects.
   `read_topology_update` now rejects such a payload with the new
   `Error::InvalidTopologyOwnerIndex` as soon as it is decoded, instead of
   letting it reach the indexing that used it.
+- A declared array length (`wire::read_array`) or a declared server or
+  segment count (`topology::read_topology_update`) is now rejected with
+  the new `Error::DeclaredLengthTooLarge` before it is used to size an
+  allocation. A corrupted or hostile value previously reached
+  `Vec::with_capacity` or `vec![0u8; len]` directly; since Rust aborts the
+  whole process on an allocation failure rather than raising a catchable
+  panic, an oversized length could take down the embedding process, not
+  just the call in progress.
 
 ## [0.2.0] - 2026-09-28
 

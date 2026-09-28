@@ -54,12 +54,31 @@ pub(crate) struct TopologyUpdate {
     pub segment_owners: Vec<Vec<u32>>,
 }
 
+/// Safety ceiling on a declared item count (servers or segments), checked
+/// before allocating for it. Not a protocol limit: no real cluster comes
+/// anywhere near this many nodes or segments. It exists so a corrupted or
+/// hostile count gets a typed error instead of an allocation big enough to
+/// abort the process.
+const MAX_TOPOLOGY_COUNT: u32 = 1_000_000;
+
+fn check_topology_count(what: &'static str, declared: u32) -> Result<()> {
+    if declared > MAX_TOPOLOGY_COUNT {
+        return Err(Error::DeclaredLengthTooLarge {
+            what,
+            declared,
+            max: MAX_TOPOLOGY_COUNT,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn read_topology_update<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<TopologyUpdate> {
     let topology_id = read_vint(reader).await?;
 
     let num_servers = read_vint(reader).await?;
+    check_topology_count("a server count", num_servers)?;
     let mut servers = Vec::with_capacity(num_servers as usize);
     for _ in 0..num_servers {
         let host = read_string(reader).await?;
@@ -70,6 +89,7 @@ pub(crate) async fn read_topology_update<R: AsyncRead + Unpin>(
     let hash_function_version = reader.read_u8().await?;
 
     let num_segments = read_vint(reader).await?;
+    check_topology_count("a segment count", num_segments)?;
     let mut segment_owners = Vec::with_capacity(num_segments as usize);
     for _ in 0..num_segments {
         let num_owners = reader.read_u8().await?;
@@ -168,6 +188,46 @@ mod tests {
                 index: 1,
                 num_servers: 1
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_server_count_over_the_safety_limit() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, 1); // topology id
+        write_vint(&mut buf, MAX_TOPOLOGY_COUNT + 1); // num servers
+
+        let result = read_topology_update(&mut buf.as_slice()).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::DeclaredLengthTooLarge {
+                declared,
+                max: MAX_TOPOLOGY_COUNT,
+                ..
+            }) if declared == MAX_TOPOLOGY_COUNT + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_segment_count_over_the_safety_limit() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, 1); // topology id
+        write_vint(&mut buf, 1); // num servers
+        write_array(&mut buf, b"node1");
+        buf.extend_from_slice(&7000u16.to_be_bytes());
+        buf.push(3); // hash function version
+        write_vint(&mut buf, MAX_TOPOLOGY_COUNT + 1); // num segments
+
+        let result = read_topology_update(&mut buf.as_slice()).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::DeclaredLengthTooLarge {
+                declared,
+                max: MAX_TOPOLOGY_COUNT,
+                ..
+            }) if declared == MAX_TOPOLOGY_COUNT + 1
         ));
     }
 
