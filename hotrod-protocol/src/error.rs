@@ -5,6 +5,7 @@
 //! else is a client-side or transport failure.
 
 use std::io;
+use std::time::Duration;
 
 /// Errors that can occur while talking to a Hot Rod server.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +60,14 @@ pub enum Error {
         "topology update references owner index {index}, but only {num_servers} servers were listed"
     )]
     InvalidTopologyOwnerIndex { index: u32, num_servers: usize },
+
+    /// Fires when a connect, or an operation's full write-then-read cycle,
+    /// does not finish within the configured timeout. The connection this
+    /// happened on may have an unwritten or unread partial protocol frame
+    /// left on the wire and must not be reused: treat it the same as an
+    /// `Io` error and reconnect.
+    #[error("operation timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Result alias for `hotrod_protocol::Error`.
