@@ -24,10 +24,6 @@ pub(crate) enum ClientIntelligence {
     Basic,
     /// Cluster membership plus per-segment hash ownership. What
     /// `HotRodCluster`'s per-node connections send.
-    // Not constructed outside tests yet: `HotRodCluster` starts sending this
-    // once `cluster.rs` lands later in this phase (see
-    // docs/adr/0003-hash-aware-routing-scope.md).
-    #[allow(dead_code)]
     HashDistributionAware,
 }
 

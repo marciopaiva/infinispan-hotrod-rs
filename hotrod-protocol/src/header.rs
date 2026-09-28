@@ -64,10 +64,6 @@ pub(crate) fn write_request_header(
 #[derive(Debug)]
 pub(crate) struct ResponseHeader {
     pub status: Status,
-    // Not read outside tests yet: consumed by `HotRodConnection`'s
-    // `take_pending_topology_update` once `cluster.rs` lands later in this
-    // phase (see docs/adr/0003-hash-aware-routing-scope.md).
-    #[allow(dead_code)]
     pub topology_update: Option<TopologyUpdate>,
 }
 

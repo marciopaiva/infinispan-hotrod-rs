@@ -13,16 +13,17 @@ use crate::error::{Error, Result};
 use crate::header::{read_response_header, write_request_header, OpCode};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
-use crate::topology::ClientIntelligence;
+use crate::topology::{ClientIntelligence, TopologyUpdate};
 use crate::varint::read_vint;
 use crate::wire::{read_array, read_string, write_array, write_expiration_params, Expiration};
 
-/// Sent on every request: phase 1 does not track cluster topology yet
-/// (see ADR 0001 and issue #3), so `HotRodConnection` always advertises
-/// BASIC intelligence and this placeholder id. Encoded as `u32::from_ne_bytes`
-/// would not do here: it must go through the same unsigned-vint path as any
-/// other topology id (see `varint` module docs).
-const DEFAULT_TOPOLOGY_ID: i32 = -1;
+/// Sent on every request until the sender has topology awareness to report
+/// a real one: `HotRodConnection` always sends this, and it's also what
+/// `HotRodCluster` starts a fresh pooled connection with before its first
+/// topology update arrives. Encoded as `u32::from_ne_bytes` would not do
+/// here: it must go through the same unsigned-vint path as any other
+/// topology id (see `varint` module docs).
+pub(crate) const DEFAULT_TOPOLOGY_ID: i32 = -1;
 
 /// The outcome of a versioned write (`replace_if_unmodified`,
 /// `remove_if_unmodified`): whether the server's copy still had the version
@@ -49,19 +50,67 @@ pub struct HotRodConnection {
     stream: BufStream<TcpStream>,
     cache_name: Vec<u8>,
     next_message_id: u64,
+    intelligence: ClientIntelligence,
+    topology_id: i32,
+    /// The topology update parsed from the most recent response, if any.
+    /// Cleared by `take_pending_topology_update`.
+    pending_topology_update: Option<TopologyUpdate>,
 }
 
 impl HotRodConnection {
     /// Opens a TCP connection and targets the given cache. An empty
     /// `cache_name` targets the server's default cache.
     pub async fn connect(addr: impl ToSocketAddrs, cache_name: &str) -> Result<Self> {
+        Self::connect_with(
+            addr,
+            cache_name,
+            ClientIntelligence::Basic,
+            DEFAULT_TOPOLOGY_ID,
+        )
+        .await
+    }
+
+    /// Opens a TCP connection that advertises `HashDistributionAware`
+    /// intelligence, for use as one of `HotRodCluster`'s pooled per-node
+    /// connections. `topology_id` is the id already known to the cluster, so
+    /// the server does not resend a topology update the client already has.
+    pub(crate) async fn connect_hash_aware(
+        addr: impl ToSocketAddrs,
+        cache_name: &str,
+        topology_id: i32,
+    ) -> Result<Self> {
+        Self::connect_with(
+            addr,
+            cache_name,
+            ClientIntelligence::HashDistributionAware,
+            topology_id,
+        )
+        .await
+    }
+
+    async fn connect_with(
+        addr: impl ToSocketAddrs,
+        cache_name: &str,
+        intelligence: ClientIntelligence,
+        topology_id: i32,
+    ) -> Result<Self> {
         let tcp = TcpStream::connect(addr).await?;
         tcp.set_nodelay(true)?;
         Ok(Self {
             stream: BufStream::new(tcp),
             cache_name: cache_name.as_bytes().to_vec(),
             next_message_id: 1,
+            intelligence,
+            topology_id,
+            pending_topology_update: None,
         })
+    }
+
+    /// Returns the topology update parsed from the most recently completed
+    /// operation, if the server sent one, taking it so a later call returns
+    /// `None` until another update arrives.
+    pub(crate) fn take_pending_topology_update(&mut self) -> Option<TopologyUpdate> {
+        self.pending_topology_update.take()
     }
 
     /// Authenticates the connection using SASL PLAIN. Must be called before
@@ -312,21 +361,20 @@ impl HotRodConnection {
             message_id,
             cache_name,
             opcode,
-            ClientIntelligence::Basic,
-            DEFAULT_TOPOLOGY_ID,
+            self.intelligence,
+            self.topology_id,
         );
         request.extend_from_slice(body);
 
         self.stream.write_all(&request).await?;
         self.stream.flush().await?;
 
-        let header = read_response_header(
-            &mut self.stream,
-            message_id,
-            opcode,
-            ClientIntelligence::Basic,
-        )
-        .await?;
+        let header =
+            read_response_header(&mut self.stream, message_id, opcode, self.intelligence).await?;
+        if let Some(update) = &header.topology_update {
+            self.topology_id = update.topology_id as i32;
+        }
+        self.pending_topology_update = header.topology_update.clone();
         Ok((message_id, header))
     }
 }

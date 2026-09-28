@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cluster;
 mod connection;
 mod digest;
 mod error;
@@ -20,6 +21,7 @@ mod topology;
 mod varint;
 mod wire;
 
+pub use cluster::HotRodCluster;
 pub use connection::{HotRodConnection, VersionedResult, VersionedValue};
 pub use error::{Error, Result};
 pub use wire::Expiration;
