@@ -6,7 +6,13 @@ extension that exposes it to PHP userland.
 
 ## Status
 
-Scaffolding stage. No protocol parsing exists yet.
+Phase 1 complete: a single connection to one cache, PLAIN authentication,
+and the core operations (`get`, `put`, `remove`, `put_if_absent`,
+`replace`, `replace_if_unmodified`, `remove_if_unmodified`). See
+`docs/adr/0001-mirror-java-client-scope.md` for the full roadmap and
+`hotrod-protocol/CHANGELOG.md` for release notes.
+
+The PHP extension has not started yet.
 
 ## Layout
 
