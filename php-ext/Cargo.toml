@@ -1,0 +1,12 @@
+[package]
+name = "php-ext"
+version = "0.1.0"
+edition = "2021"
+description = "PHP extension bridging hotrod-protocol into PHP userland"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hotrod-protocol = { path = "../hotrod-protocol" }

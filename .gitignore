@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+*.so
+*.dll
+*.dylib
+.DS_Store
+
+# Claude Code
+CLAUDE.md
+.claude/
