@@ -61,6 +61,9 @@ relying on server-side redirects.
   whole process on an allocation failure rather than raising a catchable
   panic, an oversized length could take down the embedding process, not
   just the call in progress.
+- `HotRodCluster` no longer re-resolves a segment owner's hostname on
+  every call. The resolved address is now cached per topology and only
+  redone once a new topology update replaces it.
 
 ## [0.2.0] - 2026-09-28
 
