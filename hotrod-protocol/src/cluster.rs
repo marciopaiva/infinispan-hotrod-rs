@@ -403,6 +403,8 @@ impl HotRodCluster {
         let Some(&primary) = topology.segment_owners[segment as usize].first() else {
             return Ok(self.active_seed_addr);
         };
+        // Safe: `topology::read_topology_update` rejects any owner index
+        // that is out of range for `servers` before this type is built.
         let server = topology.servers[primary as usize].clone();
         resolve_server_addr(&server).await
     }

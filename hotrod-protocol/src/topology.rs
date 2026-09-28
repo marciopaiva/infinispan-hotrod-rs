@@ -14,7 +14,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::varint::read_vint;
 use crate::wire::read_string;
 
@@ -80,6 +80,17 @@ pub(crate) async fn read_topology_update<R: AsyncRead + Unpin>(
         segment_owners.push(owners);
     }
 
+    for owners in &segment_owners {
+        for &index in owners {
+            if index as usize >= servers.len() {
+                return Err(Error::InvalidTopologyOwnerIndex {
+                    index,
+                    num_servers: servers.len(),
+                });
+            }
+        }
+    }
+
     Ok(TopologyUpdate {
         topology_id,
         servers,
@@ -135,6 +146,29 @@ mod tests {
         );
         assert_eq!(update.hash_function_version, 3);
         assert_eq!(update.segment_owners, vec![vec![0], vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn rejects_owner_index_out_of_range_for_the_server_list() {
+        let mut buf = Vec::new();
+        write_vint(&mut buf, 1); // topology id
+        write_vint(&mut buf, 1); // num servers
+        write_array(&mut buf, b"node1");
+        buf.extend_from_slice(&7000u16.to_be_bytes());
+        buf.push(3); // hash function version
+        write_vint(&mut buf, 1); // num segments
+        buf.push(1); // segment 0: one owner
+        write_vint(&mut buf, 1); // owner index 1, but only server 0 exists
+
+        let result = read_topology_update(&mut buf.as_slice()).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidTopologyOwnerIndex {
+                index: 1,
+                num_servers: 1
+            })
+        ));
     }
 
     #[test]

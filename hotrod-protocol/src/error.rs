@@ -54,6 +54,11 @@ pub enum Error {
 
     #[error("server's topology update uses hash function version {0}, which this client does not implement")]
     UnsupportedHashFunctionVersion(u8),
+
+    #[error(
+        "topology update references owner index {index}, but only {num_servers} servers were listed"
+    )]
+    InvalidTopologyOwnerIndex { index: u32, num_servers: usize },
 }
 
 /// Result alias for `hotrod_protocol::Error`.
