@@ -16,6 +16,7 @@ mod header;
 mod sasl;
 mod scram;
 mod status;
+mod topology;
 mod varint;
 mod wire;
 
