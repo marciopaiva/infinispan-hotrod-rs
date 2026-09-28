@@ -35,7 +35,9 @@ relying on server-side redirects.
   connection may have a partial frame in flight afterward and must not
   be reused, the same hazard `Error::Io` already carries.
   `HotRodCluster` treats `Error::Timeout` the same as `Error::Io` in its
-  pooled-connection retry logic.
+  pooled-connection retry logic. `DEFAULT_TIMEOUT` is now re-exported from
+  the crate root, so a caller overriding the default can reference it
+  (for example, `DEFAULT_TIMEOUT * 2`) instead of repeating the literal.
 
 ### Changed
 

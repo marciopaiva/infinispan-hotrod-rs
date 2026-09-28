@@ -22,6 +22,6 @@ mod varint;
 mod wire;
 
 pub use cluster::HotRodCluster;
-pub use connection::{HotRodConnection, VersionedResult, VersionedValue};
+pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT};
 pub use error::{Error, Result};
 pub use wire::Expiration;
