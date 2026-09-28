@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{Error, Result};
 use crate::status::Status;
+use crate::topology::{read_topology_update, ClientIntelligence, TopologyUpdate};
 use crate::varint::{read_vlong, write_vint, write_vlong};
 use crate::wire::{read_string, write_array, write_no_media_type_pair};
 
@@ -17,18 +18,6 @@ const RESPONSE_MAGIC: u8 = 0xA1;
 
 /// Hot Rod protocol version 4.1, the version targeted by ADR 0001.
 const PROTOCOL_VERSION: u8 = 41;
-
-/// The client does not track cluster topology yet (phase 1, see ADR 0001
-/// and issue #3), so it always advertises BASIC intelligence. This also
-/// tells the server not to push topology updates, which this client has no
-/// way to consume.
-const CLIENT_INTELLIGENCE_BASIC: u8 = 1;
-
-/// Sent on every request until the client has topology awareness to report
-/// a real one. Encoded as `u32::from_ne_bytes` would not do here: it must
-/// go through the same unsigned-vint path as any other topology id (see
-/// `varint` module docs).
-const DEFAULT_TOPOLOGY_ID: i32 = -1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpCode {
@@ -57,6 +46,8 @@ pub(crate) fn write_request_header(
     message_id: u64,
     cache_name: &[u8],
     opcode: OpCode,
+    intelligence: ClientIntelligence,
+    topology_id: i32,
 ) {
     buf.push(REQUEST_MAGIC);
     write_vlong(buf, message_id);
@@ -64,8 +55,8 @@ pub(crate) fn write_request_header(
     buf.push(opcode as u8);
     write_array(buf, cache_name);
     write_vint(buf, 0); // flags: none set in phase 1
-    buf.push(CLIENT_INTELLIGENCE_BASIC);
-    write_vint(buf, DEFAULT_TOPOLOGY_ID as u32);
+    buf.push(intelligence.as_byte());
+    write_vint(buf, topology_id as u32);
     write_no_media_type_pair(buf);
     write_vint(buf, 0); // additional params (protocol 4.0+): none
 }
@@ -73,6 +64,11 @@ pub(crate) fn write_request_header(
 #[derive(Debug)]
 pub(crate) struct ResponseHeader {
     pub status: Status,
+    // Not read outside tests yet: consumed by `HotRodConnection`'s
+    // `take_pending_topology_update` once `cluster.rs` lands later in this
+    // phase (see docs/adr/0003-hash-aware-routing-scope.md).
+    #[allow(dead_code)]
+    pub topology_update: Option<TopologyUpdate>,
 }
 
 /// Reads and validates a response header against the request that
@@ -84,6 +80,7 @@ pub(crate) async fn read_response_header<R: AsyncRead + Unpin>(
     reader: &mut R,
     request_message_id: u64,
     request_opcode: OpCode,
+    intelligence: ClientIntelligence,
 ) -> Result<ResponseHeader> {
     let magic = reader.read_u8().await?;
     if magic != RESPONSE_MAGIC {
@@ -102,9 +99,18 @@ pub(crate) async fn read_response_header<R: AsyncRead + Unpin>(
     let status = Status(reader.read_u8().await?);
 
     let topology_marker = reader.read_u8().await?;
-    if topology_marker != 0 {
-        return Err(Error::UnsupportedTopologyUpdate);
-    }
+    let topology_update = if topology_marker == 0 {
+        None
+    } else {
+        match intelligence {
+            // A compliant server never sends a topology update to a BASIC
+            // client, so seeing one here means the server disagrees about
+            // the intelligence just advertised, and the stream cannot be
+            // trusted to stay in sync from this point on.
+            ClientIntelligence::Basic => return Err(Error::UnsupportedTopologyUpdate),
+            ClientIntelligence::HashDistributionAware => Some(read_topology_update(reader).await?),
+        }
+    };
 
     // The server reports a failure through the generic ERROR_RESPONSE opcode
     // (0x50) rather than the operation's own response opcode, so the error
@@ -130,7 +136,10 @@ pub(crate) async fn read_response_header<R: AsyncRead + Unpin>(
         return Err(Error::UnknownStatus(status.0));
     }
 
-    Ok(ResponseHeader { status })
+    Ok(ResponseHeader {
+        status,
+        topology_update,
+    })
 }
 
 #[cfg(test)]
@@ -141,7 +150,14 @@ mod tests {
     #[allow(clippy::vec_init_then_push)]
     fn header_field_order_matches_codec30() {
         let mut buf = Vec::new();
-        write_request_header(&mut buf, 7, b"my-cache", OpCode::Get);
+        write_request_header(
+            &mut buf,
+            7,
+            b"my-cache",
+            OpCode::Get,
+            ClientIntelligence::Basic,
+            -1,
+        );
 
         let mut expected = Vec::new();
         expected.push(0xA0); // magic
@@ -168,10 +184,59 @@ mod tests {
         resp.push(0x00); // status: success
         resp.push(0x00); // no topology change
 
-        let header = read_response_header(&mut resp.as_slice(), 7, OpCode::Get)
-            .await
-            .expect("read_response_header");
+        let header = read_response_header(
+            &mut resp.as_slice(),
+            7,
+            OpCode::Get,
+            ClientIntelligence::Basic,
+        )
+        .await
+        .expect("read_response_header");
         assert!(header.status.is_success());
+        assert!(header.topology_update.is_none());
+    }
+
+    #[tokio::test]
+    async fn basic_client_rejects_topology_update() {
+        let resp = vec![0xA1, 7, 0x04, 0x00, 0x01]; // topology marker set
+
+        let err = read_response_header(
+            &mut resp.as_slice(),
+            7,
+            OpCode::Get,
+            ClientIntelligence::Basic,
+        )
+        .await
+        .expect_err("expected UnsupportedTopologyUpdate");
+        assert!(matches!(err, Error::UnsupportedTopologyUpdate));
+    }
+
+    #[tokio::test]
+    async fn hash_distribution_aware_client_parses_topology_update() {
+        let mut resp = vec![0xA1, 7, 0x04, 0x00, 0x01]; // topology marker set
+        write_vint(&mut resp, 9); // topology id
+        write_vint(&mut resp, 1); // num servers
+        write_array(&mut resp, b"node1");
+        resp.extend_from_slice(&7000u16.to_be_bytes());
+        resp.push(3); // hash function version
+        write_vint(&mut resp, 0); // num segments
+
+        let header = read_response_header(
+            &mut resp.as_slice(),
+            7,
+            OpCode::Get,
+            ClientIntelligence::HashDistributionAware,
+        )
+        .await
+        .expect("read_response_header");
+        assert!(header.status.is_success());
+        let update = header.topology_update.expect("topology update");
+        assert_eq!(update.topology_id, 9);
+        assert_eq!(update.servers.len(), 1);
+        assert_eq!(update.servers[0].host, "node1");
+        assert_eq!(update.servers[0].port, 7000);
+        assert_eq!(update.hash_function_version, 3);
+        assert!(update.segment_owners.is_empty());
     }
 
     #[tokio::test]
@@ -179,9 +244,14 @@ mod tests {
         let mut resp = vec![0xA1, 7, 0x04, 0x85, 0x00];
         write_array(&mut resp, b"boom");
 
-        let err = read_response_header(&mut resp.as_slice(), 7, OpCode::Get)
-            .await
-            .expect_err("expected a Server error");
+        let err = read_response_header(
+            &mut resp.as_slice(),
+            7,
+            OpCode::Get,
+            ClientIntelligence::Basic,
+        )
+        .await
+        .expect_err("expected a Server error");
         match err {
             Error::Server { status, message } => {
                 assert_eq!(status, 0x85);
@@ -201,9 +271,14 @@ mod tests {
         let mut resp = vec![0xA1, 7, 0x50, 0x84, 0x00];
         write_array(&mut resp, b"parse error");
 
-        let err = read_response_header(&mut resp.as_slice(), 7, OpCode::Put)
-            .await
-            .expect_err("expected a Server error");
+        let err = read_response_header(
+            &mut resp.as_slice(),
+            7,
+            OpCode::Put,
+            ClientIntelligence::Basic,
+        )
+        .await
+        .expect_err("expected a Server error");
         match err {
             Error::Server { status, message } => {
                 assert_eq!(status, 0x84);

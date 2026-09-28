@@ -12,10 +12,6 @@
 //! do), and the hash function version and each segment's owner count are raw
 //! single bytes.
 
-// Not wired up yet: consumed by `header.rs` starting in a later commit of
-// this phase (see docs/adr/0003-hash-aware-routing-scope.md).
-#![allow(dead_code)]
-
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::Result;
@@ -28,6 +24,10 @@ pub(crate) enum ClientIntelligence {
     Basic,
     /// Cluster membership plus per-segment hash ownership. What
     /// `HotRodCluster`'s per-node connections send.
+    // Not constructed outside tests yet: `HotRodCluster` starts sending this
+    // once `cluster.rs` lands later in this phase (see
+    // docs/adr/0003-hash-aware-routing-scope.md).
+    #[allow(dead_code)]
     HashDistributionAware,
 }
 
