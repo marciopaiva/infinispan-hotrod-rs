@@ -4,7 +4,7 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-29
 
 Phase 3 of the roadmap, scoped down in
 `docs/adr/0003-hash-aware-routing-scope.md`: cluster topology tracking
