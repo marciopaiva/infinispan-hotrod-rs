@@ -51,6 +51,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
   caller that needs the same effect can loop over `remove` for each key,
   the same workaround the Java client itself relies on.
 
+### Tested
+
+- Live-server coverage for `contains_key`, `ping`, `size`, `clear`, `stats`,
+  `get_all` and `put_all`, on both `HotRodConnection` and `HotRodCluster`.
+  Every operation added since v0.3.0 previously had only unit-test coverage
+  against a fake in-process server that echoes back whatever opcode it is
+  given, the same gap that let the wrong `remove_all` opcode above pass
+  unnoticed until a real server rejected it. `tests/live_server.rs` now
+  serializes its tests behind a shared lock, since `clear` wipes the whole
+  cache and would otherwise race against another test's keys under cargo's
+  default parallel test execution.
+
 ## [0.3.0] - 2026-09-29
 
 Phase 3 of the roadmap, scoped down in
