@@ -20,6 +20,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   every keyed operation broken for the lifetime of the instance.
   `connect`/`connect_with_timeout` already failed over between seeds at
   bootstrap; nothing repeated that afterward until now.
+- `HotRodCluster::authenticate_with` no longer panics once the seed
+  connection has been evicted from the pool by an earlier
+  `Error::Io`/`Error::Timeout` failure. It now reconnects the seed the
+  same way `call`/`ensure_connection` already do, instead of indexing
+  the pool directly and assuming the entry is still there.
 
 ### Removed
 

@@ -378,13 +378,15 @@ impl HotRodCluster {
         .await
     }
 
+    /// Authenticates the seed connection, reconnecting it first if an
+    /// earlier operation failure evicted it from the pool: the seed is not
+    /// guaranteed to still be pooled by the time this runs, since
+    /// `call`/`call_seed` evict it on `Error::Io`/`Error::Timeout`, and a
+    /// caller can re-authenticate (a token refresh, or a retry after an
+    /// earlier `authenticate_*` failure) at any point afterward.
     async fn authenticate_with(&mut self, method: AuthMethod) -> Result<()> {
         let seed = self.active_seed_addr;
-        let conn = &mut self
-            .connections
-            .get_mut(&seed)
-            .expect("connect() always leaves the seed connection in the pool")
-            .conn;
+        let conn = &mut self.ensure_connection(seed, None).await?.conn;
         method.authenticate(conn).await?;
         self.auth = Some(method);
         Ok(())
@@ -1212,6 +1214,42 @@ mod tests {
 
         seed_task.await.unwrap();
         owner_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticate_with_reconnects_the_seed_if_it_was_evicted_from_the_pool() {
+        let expected_plain_response = b"\0user\0pass".to_vec();
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let expected_for_seed = expected_plain_response.clone();
+        let seed_task = tokio::spawn(async move {
+            // The initial connect() connection, evicted and dropped below
+            // without ever being used.
+            let (_first, _) = seed_listener.accept().await.unwrap();
+            // The reconnect authenticate_with triggers once it finds the
+            // seed missing from the pool.
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut stream, &expected_for_seed).await;
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+
+        // Simulates an earlier operation failure evicting the seed
+        // connection from the pool, the same as `call`/`call_seed` do on
+        // Error::Io/Error::Timeout.
+        cluster.connections.remove(&seed_addr);
+
+        cluster
+            .authenticate_plain("", "user", "pass")
+            .await
+            .expect("authenticate should reconnect the evicted seed instead of panicking");
+
+        assert!(cluster.connections.contains_key(&seed_addr));
+
+        seed_task.await.unwrap();
     }
 
     /// Same shape as `response_header`, but with the topology marker set and
