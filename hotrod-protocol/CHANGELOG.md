@@ -14,6 +14,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   bound the Java client enforces) and returns `Error::MalformedVarint`
   instead of shifting past the target type's width, which could panic
   with overflow checks on or silently produce a wrong value in release.
+- `HotRodCluster` now fails over to the other seed addresses it was
+  constructed with once the active one stops responding, instead of
+  leaving `size`, `clear`, `ping`, `stats`, `get_all`, `put_all` and
+  every keyed operation broken for the lifetime of the instance.
+  `connect`/`connect_with_timeout` already failed over between seeds at
+  bootstrap; nothing repeated that afterward until now.
 
 ### Removed
 

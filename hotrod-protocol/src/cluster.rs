@@ -127,11 +127,17 @@ struct PooledConnection {
 /// instance per task instead of sharing one.
 pub struct HotRodCluster {
     cache_name: String,
+    /// Every seed address this instance was constructed with, in the order
+    /// given to `connect`/`connect_with_timeout`. `active_seed_addr` is
+    /// always one of these; `failover_seed` tries the rest when it stops
+    /// responding.
+    seed_addrs: Vec<SocketAddr>,
     /// The seed this instance is currently connected to; also the fallback
     /// used before a topology has arrived and the retry target when a
     /// computed owner's connection fails. Never evicted by a topology
     /// update, even if this address stops being listed: it is the last
-    /// resort every retry falls back to.
+    /// resort every retry falls back to. Can change at runtime: see
+    /// `failover_seed`.
     active_seed_addr: SocketAddr,
     topology_id: i32,
     topology: Option<ClusterTopology>,
@@ -283,6 +289,7 @@ impl HotRodCluster {
                     connections.insert(addr, PooledConnection { origin: None, conn });
                     return Ok(Self {
                         cache_name: cache_name.to_string(),
+                        seed_addrs: seed_addrs.to_vec(),
                         active_seed_addr: addr,
                         topology_id: DEFAULT_TOPOLOGY_ID,
                         topology: None,
@@ -575,8 +582,12 @@ impl HotRodCluster {
     /// Routes `key` to its computed owner, running `op` against that
     /// connection (opening and authenticating it first if this is the first
     /// call to reach it). On an I/O error, the failed connection is dropped
-    /// from the pool and `op` is retried once against the seed connection;
-    /// any other error, or a second failure, is returned as is.
+    /// from the pool: if the owner was a computed node, `op` is retried once
+    /// against the seed connection (itself subject to failover, see
+    /// `run_seed_op`); if the owner already was the seed, `op` goes straight
+    /// to `failover_and_retry` instead of trying the same dead address
+    /// again. Any other error, or a failure with nowhere left to retry, is
+    /// returned as is.
     async fn call(&mut self, key: &[u8], op: Operation) -> Result<OperationResult> {
         let (addr, origin) = self.owner_addr(key).await?;
         let outcome = {
@@ -595,46 +606,124 @@ impl HotRodCluster {
         }
         self.connections.remove(&addr);
         if addr == self.active_seed_addr {
-            return Err(err);
+            return self.failover_and_retry(&op, err).await;
         }
+        self.run_seed_op(&op).await
+    }
 
+    /// Runs `op` against the seed connection, for an operation with no key
+    /// to route by. Opens or reopens the seed connection first if an
+    /// earlier failure evicted it. On `Error::Io` or `Error::Timeout`,
+    /// either opening the connection or running `op`, the connection is
+    /// dropped from the pool and `failover_and_retry` takes over.
+    async fn call_seed(&mut self, op: Operation) -> Result<OperationResult> {
+        self.run_seed_op(&op).await
+    }
+
+    /// Shared by `call_seed` and `call`'s owner-to-seed retry: runs `op`
+    /// against the seed connection, connecting it first if it is not
+    /// already pooled. On `Error::Io`/`Error::Timeout` from either step,
+    /// the seed connection is evicted and the failure handed to
+    /// `failover_and_retry`. Any other error is returned as is.
+    async fn run_seed_op(&mut self, op: &Operation) -> Result<OperationResult> {
         let seed = self.active_seed_addr;
-        let pooled = self.ensure_connection(seed, None).await?;
-        match run_operation(&mut pooled.conn, &op).await {
+        let attempt = match self.ensure_connection(seed, None).await {
+            Ok(pooled) => run_operation(&mut pooled.conn, op).await,
+            Err(err) => Err(err),
+        };
+        match attempt {
             Ok(value) => {
                 self.record_topology_update(seed);
                 Ok(value)
             }
             Err(err) => {
+                if !matches!(err, Error::Io(_) | Error::Timeout(_)) {
+                    return Err(err);
+                }
+                self.connections.remove(&seed);
+                self.failover_and_retry(op, err).await
+            }
+        }
+    }
+
+    /// Called once the current seed connection has just failed with
+    /// `Error::Io`/`Error::Timeout`. Tries every other seed address (see
+    /// `failover_seed`) and, if one accepts a connection, retries `op`
+    /// against it once, promoting it to `active_seed_addr`. If no other
+    /// seed is reachable either, `original_err`, the failure that triggered
+    /// this in the first place, is returned rather than whatever
+    /// `failover_seed` itself failed with: that is the error the caller's
+    /// operation actually hit.
+    async fn failover_and_retry(
+        &mut self,
+        op: &Operation,
+        original_err: Error,
+    ) -> Result<OperationResult> {
+        let Ok(new_seed) = self.failover_seed().await else {
+            return Err(original_err);
+        };
+        let pooled = self
+            .connections
+            .get_mut(&new_seed)
+            .expect("failover_seed leaves the new seed connection pooled");
+        match run_operation(&mut pooled.conn, op).await {
+            Ok(value) => {
+                self.record_topology_update(new_seed);
+                Ok(value)
+            }
+            Err(err) => {
                 if matches!(err, Error::Io(_) | Error::Timeout(_)) {
-                    self.connections.remove(&seed);
+                    self.connections.remove(&new_seed);
                 }
                 Err(err)
             }
         }
     }
 
-    /// Runs `op` against the seed connection, for an operation with no key
-    /// to route by. Opens or reopens the seed connection first if an
-    /// earlier failure evicted it. On `Error::Io` or `Error::Timeout` the
-    /// connection is dropped from the pool, the same as `call` does when a
-    /// keyed operation lands on the seed; there is no further fallback to
-    /// retry against, since the seed already is the fallback.
-    async fn call_seed(&mut self, op: Operation) -> Result<OperationResult> {
-        let seed = self.active_seed_addr;
-        let pooled = self.ensure_connection(seed, None).await?;
-        match run_operation(&mut pooled.conn, &op).await {
-            Ok(value) => {
-                self.record_topology_update(seed);
-                Ok(value)
+    /// Tries every seed address other than the current `active_seed_addr`,
+    /// in the order given to `connect`, until one accepts a connection and,
+    /// if credentials were set, authenticates. The first to succeed is
+    /// pooled and promoted to `active_seed_addr`. Returns the last error
+    /// seen if every other seed also fails to connect or authenticate, or a
+    /// generic error if there was no other seed to try in the first place.
+    async fn failover_seed(&mut self) -> Result<SocketAddr> {
+        let previous = self.active_seed_addr;
+        let mut last_err: Option<Error> = None;
+        for &addr in &self.seed_addrs {
+            if addr == previous {
+                continue;
             }
-            Err(err) => {
-                if matches!(err, Error::Io(_) | Error::Timeout(_)) {
-                    self.connections.remove(&seed);
+            let mut conn = match HotRodConnection::connect_hash_aware(
+                addr,
+                &self.cache_name,
+                self.topology_id,
+                self.timeout,
+            )
+            .await
+            {
+                Ok(conn) => conn,
+                Err(err) => {
+                    last_err = Some(err);
+                    continue;
                 }
-                Err(err)
+            };
+            if let Some(auth) = &self.auth {
+                if let Err(err) = auth.authenticate(&mut conn).await {
+                    last_err = Some(err);
+                    continue;
+                }
             }
+            self.connections
+                .insert(addr, PooledConnection { origin: None, conn });
+            self.active_seed_addr = addr;
+            return Ok(addr);
         }
+        Err(last_err.unwrap_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no other seed address available to fail over to",
+            ))
+        }))
     }
 
     /// The address to route `key` to, and the topology server it came
@@ -873,6 +962,82 @@ mod tests {
         assert!(matches!(result, Err(Error::Timeout(_))));
         assert!(!cluster.connections.contains_key(&owner_addr));
         assert!(!cluster.connections.contains_key(&seed_addr));
+    }
+
+    #[tokio::test]
+    async fn seed_failure_fails_over_to_the_next_seed_address() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let other_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other_listener.local_addr().unwrap();
+        let other_task = tokio::spawn(async move {
+            let (mut stream, _) = other_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut cluster = HotRodCluster::connect_with_timeout(
+            &[seed_addr],
+            "my-cache",
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("connect to seed");
+        // Simulates a second seed given at construction time, without
+        // racing it against `seed_addr` during connect itself.
+        cluster.seed_addrs = vec![seed_addr, other_addr];
+
+        let result = cluster
+            .get(b"key")
+            .await
+            .expect("get should fail over to the other seed");
+
+        assert_eq!(result, None);
+        assert_eq!(cluster.active_seed_addr, other_addr);
+        assert!(cluster.connections.contains_key(&other_addr));
+        assert!(!cluster.connections.contains_key(&seed_addr));
+
+        other_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seed_failure_returns_the_original_error_when_no_other_seed_is_reachable() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let dead_addr = unreachable_addr().await;
+
+        let mut cluster = HotRodCluster::connect_with_timeout(
+            &[seed_addr],
+            "my-cache",
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("connect to seed");
+        cluster.seed_addrs = vec![seed_addr, dead_addr];
+
+        let result = cluster.get(b"key").await;
+
+        assert!(
+            matches!(result, Err(Error::Timeout(_))),
+            "should surface the seed's own timeout, not failover_seed's connect error"
+        );
+        assert_eq!(
+            cluster.active_seed_addr, seed_addr,
+            "active seed stays unchanged when no other seed is reachable"
+        );
     }
 
     #[tokio::test]
