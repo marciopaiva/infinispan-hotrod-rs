@@ -46,6 +46,10 @@ relying on server-side redirects.
   already pooled connection immediately, not only ones opened later; a
   caller restoring the previous bound afterward uses the value
   `timeout()` returned beforehand.
+- `contains_key`, `ping`, `size`, `clear` and `stats` on `HotRodConnection`
+  and `HotRodCluster`. On `HotRodCluster`, `contains_key` routes by the
+  key's segment owner like `get` and `put` already do; the other four
+  have no key to route by and always go to the seed connection.
 
 ### Changed
 

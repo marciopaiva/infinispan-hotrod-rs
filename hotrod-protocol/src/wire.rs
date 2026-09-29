@@ -3,6 +3,8 @@
 //! expiration parameters. All shapes are taken from the Java client's
 //! `ByteBufUtil` and `TimeUnitParam`.
 
+use std::collections::HashMap;
+
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{Error, Result};
@@ -45,6 +47,53 @@ pub(crate) async fn read_string<R: AsyncRead + Unpin>(reader: &mut R) -> Result<
 pub(crate) fn write_no_media_type_pair(buf: &mut Vec<u8>) {
     buf.push(0); // key media type
     buf.push(0); // value media type
+}
+
+/// Consumes one `MediaType` from the wire without keeping its value.
+/// Mirrors `CodecUtils.readMediaType`: a definition byte of 0 carries
+/// nothing else, 1 is a predefined type (a vInt id, then parameters), 2 is
+/// a custom type (a length-prefixed name, then parameters). Used to stay
+/// in sync with a response that carries a server-chosen media type (only
+/// `ping` does today), since phase 1 never negotiates one itself.
+pub(crate) async fn skip_media_type<R: AsyncRead + Unpin>(reader: &mut R) -> Result<()> {
+    match reader.read_u8().await? {
+        0 => Ok(()),
+        1 => {
+            read_vint(reader).await?; // predefined type id
+            skip_media_type_params(reader).await
+        }
+        2 => {
+            read_array(reader).await?; // custom type name
+            skip_media_type_params(reader).await
+        }
+        other => Err(Error::UnknownMediaTypeDefinition(other)),
+    }
+}
+
+async fn skip_media_type_params<R: AsyncRead + Unpin>(reader: &mut R) -> Result<()> {
+    let count = read_vint(reader).await?;
+    for _ in 0..count {
+        read_array(reader).await?; // parameter name
+        read_array(reader).await?; // parameter value
+    }
+    Ok(())
+}
+
+/// Reads a vInt-counted sequence of string/string pairs, as returned by
+/// `stats` (`StatsOperation.createResponse`). The count only drives a loop
+/// here, never sizes an allocation up front, so a corrupted or hostile
+/// count cannot trigger the allocation hazard `read_array` guards against.
+pub(crate) async fn read_string_map<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<HashMap<String, String>> {
+    let count = read_vint(reader).await?;
+    let mut map = HashMap::new();
+    for _ in 0..count {
+        let name = read_string(reader).await?;
+        let value = read_string(reader).await?;
+        map.insert(name, value);
+    }
+    Ok(map)
 }
 
 /// Time-to-live for an entry, as passed to `put`, `putIfAbsent`, `replace`

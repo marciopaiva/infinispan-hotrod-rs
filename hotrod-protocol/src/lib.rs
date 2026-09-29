@@ -5,7 +5,8 @@
 //! connection to one cache, authenticated with PLAIN, SCRAM-SHA-512,
 //! DIGEST-SHA-256 or OAUTHBEARER, exposing the core operations (`get`,
 //! `put`, `remove`, `put_if_absent`, `replace`, `replace_if_unmodified`,
-//! `remove_if_unmodified`). `HotRodCluster` (phase 3, see
+//! `remove_if_unmodified`, `contains_key`, `ping`, `size`, `clear`,
+//! `stats`). `HotRodCluster` (phase 3, see
 //! `docs/adr/0003-hash-aware-routing-scope.md`) wraps a pool of such
 //! connections across a multi-node cluster, tracking its topology and
 //! routing each operation to the segment's primary owner instead of

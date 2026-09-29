@@ -28,9 +28,14 @@ pub(crate) enum OpCode {
     ReplaceIfUnmodified = 0x09,
     Remove = 0x0B,
     RemoveIfUnmodified = 0x0D,
+    ContainsKey = 0x0F,
+    Clear = 0x13,
+    Stats = 0x15,
+    Ping = 0x17,
     GetWithMetadata = 0x1B,
     AuthMechList = 0x21,
     Auth = 0x23,
+    Size = 0x29,
 }
 
 impl OpCode {

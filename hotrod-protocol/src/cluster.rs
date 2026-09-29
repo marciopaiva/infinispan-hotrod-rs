@@ -156,6 +156,11 @@ enum Operation {
     GetWithVersion(Vec<u8>),
     ReplaceIfUnmodified(Vec<u8>, Vec<u8>, u64, Expiration, Expiration),
     RemoveIfUnmodified(Vec<u8>, u64),
+    ContainsKey(Vec<u8>),
+    Ping,
+    Size,
+    Clear,
+    Stats,
 }
 
 enum OperationResult {
@@ -164,6 +169,10 @@ enum OperationResult {
     Bool(bool),
     GetWithVersion(Option<VersionedValue>),
     Versioned(VersionedResult),
+    Ping,
+    Size(u32),
+    Clear,
+    Stats(HashMap<String, String>),
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -192,6 +201,17 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
         Operation::RemoveIfUnmodified(key, version) => Ok(OperationResult::Versioned(
             conn.remove_if_unmodified(key, *version).await?,
         )),
+        Operation::ContainsKey(key) => Ok(OperationResult::Bool(conn.contains_key(key).await?)),
+        Operation::Ping => {
+            conn.ping().await?;
+            Ok(OperationResult::Ping)
+        }
+        Operation::Size => Ok(OperationResult::Size(conn.size().await?)),
+        Operation::Clear => {
+            conn.clear().await?;
+            Ok(OperationResult::Clear)
+        }
+        Operation::Stats => Ok(OperationResult::Stats(conn.stats().await?)),
     }
 }
 
@@ -448,6 +468,55 @@ impl HotRodCluster {
         }
     }
 
+    /// Returns `true` if `key` exists in the cache. Routed the same way as
+    /// `get`.
+    pub async fn contains_key(&mut self, key: &[u8]) -> Result<bool> {
+        let op = Operation::ContainsKey(key.to_vec());
+        match self.call(key, op).await? {
+            OperationResult::Bool(value) => Ok(value),
+            _ => unreachable!("Operation::ContainsKey always yields OperationResult::Bool"),
+        }
+    }
+
+    /// Checks the seed connection is reachable and its handshake still
+    /// holds. There is no key to route by, so this always targets the seed
+    /// rather than a computed owner.
+    pub async fn ping(&mut self) -> Result<()> {
+        match self.call_seed(Operation::Ping).await? {
+            OperationResult::Ping => Ok(()),
+            _ => unreachable!("Operation::Ping always yields OperationResult::Ping"),
+        }
+    }
+
+    /// The number of entries in the cache. The server computes this
+    /// cluster-wide from a single request, so which pooled connection it
+    /// is sent against (always the seed here) does not change the result.
+    pub async fn size(&mut self) -> Result<u32> {
+        match self.call_seed(Operation::Size).await? {
+            OperationResult::Size(value) => Ok(value),
+            _ => unreachable!("Operation::Size always yields OperationResult::Size"),
+        }
+    }
+
+    /// Removes every entry from the cache, cluster-wide. Like `size`, the
+    /// server fans this out itself.
+    pub async fn clear(&mut self) -> Result<()> {
+        match self.call_seed(Operation::Clear).await? {
+            OperationResult::Clear => Ok(()),
+            _ => unreachable!("Operation::Clear always yields OperationResult::Clear"),
+        }
+    }
+
+    /// Statistics from whichever node the seed connection currently
+    /// targets. Unlike `size` and `clear`, this is not aggregated across
+    /// the cluster by the protocol: it reflects only that one node.
+    pub async fn stats(&mut self) -> Result<HashMap<String, String>> {
+        match self.call_seed(Operation::Stats).await? {
+            OperationResult::Stats(value) => Ok(value),
+            _ => unreachable!("Operation::Stats always yields OperationResult::Stats"),
+        }
+    }
+
     /// Routes `key` to its computed owner, running `op` against that
     /// connection (opening and authenticating it first if this is the first
     /// call to reach it). On an I/O error, the failed connection is dropped
@@ -474,6 +543,29 @@ impl HotRodCluster {
             return Err(err);
         }
 
+        let seed = self.active_seed_addr;
+        let pooled = self.ensure_connection(seed, None).await?;
+        match run_operation(&mut pooled.conn, &op).await {
+            Ok(value) => {
+                self.record_topology_update(seed);
+                Ok(value)
+            }
+            Err(err) => {
+                if matches!(err, Error::Io(_) | Error::Timeout(_)) {
+                    self.connections.remove(&seed);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Runs `op` against the seed connection, for an operation with no key
+    /// to route by. Opens or reopens the seed connection first if an
+    /// earlier failure evicted it. On `Error::Io` or `Error::Timeout` the
+    /// connection is dropped from the pool, the same as `call` does when a
+    /// keyed operation lands on the seed; there is no further fallback to
+    /// retry against, since the seed already is the fallback.
+    async fn call_seed(&mut self, op: Operation) -> Result<OperationResult> {
         let seed = self.active_seed_addr;
         let pooled = self.ensure_connection(seed, None).await?;
         match run_operation(&mut pooled.conn, &op).await {
@@ -997,5 +1089,110 @@ mod tests {
         );
 
         owner_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contains_key_routes_to_the_computed_owner() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = owner_listener.local_addr().unwrap();
+        let owner_task = tokio::spawn(async move {
+            let (mut stream, _) = owner_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x0F, "expected a ContainsKey request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x10, 0x00);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: owner_addr.ip().to_string(),
+                port: owner_addr.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        let result = cluster
+            .contains_key(b"key")
+            .await
+            .expect("contains_key against owner");
+        assert!(result);
+
+        owner_task.await.unwrap();
+    }
+
+    /// `size`, `clear`, `ping` and `stats` have no key to route by, so they
+    /// always target the seed connection, per the Propose step in issue
+    /// #40. The topology here points every key's owner at an address that
+    /// never accepts a connection: if any of the four routed there instead
+    /// of the seed, the call would hang until the timeout rather than
+    /// complete against `seed_task`.
+    #[tokio::test]
+    async fn size_clear_ping_and_stats_always_target_the_seed() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x29, "expected a Size request");
+            let mut resp = response_header(id, 0x2A, 0x00);
+            write_vint(&mut resp, 4);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x13, "expected a Clear request");
+            let resp = response_header(id, 0x14, 0x00);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x17, "expected a Ping request");
+            let mut resp = response_header(id, 0x18, 0x00);
+            resp.push(0); // key media type: none
+            resp.push(0); // value media type: none
+            resp.push(41); // server protocol version
+            write_vint(&mut resp, 0); // no supported opcodes listed
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x15, "expected a Stats request");
+            let mut resp = response_header(id, 0x16, 0x00);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let unreachable = unreachable_addr().await;
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: unreachable.ip().to_string(),
+                port: unreachable.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        assert_eq!(cluster.size().await.expect("size"), 4);
+        cluster.clear().await.expect("clear");
+        cluster.ping().await.expect("ping");
+        assert!(cluster.stats().await.expect("stats").is_empty());
+
+        seed_task.await.unwrap();
     }
 }

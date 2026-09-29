@@ -25,6 +25,9 @@ pub enum Error {
     #[error("server returned an unrecognized status byte: {0:#04x}")]
     UnknownStatus(u8),
 
+    #[error("server sent an unrecognized media type definition byte: {0:#04x}")]
+    UnknownMediaTypeDefinition(u8),
+
     #[error("server error (status {status:#04x}): {message}")]
     Server { status: u8, message: String },
 
