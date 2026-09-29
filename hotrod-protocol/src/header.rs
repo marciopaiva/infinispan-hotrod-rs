@@ -38,6 +38,7 @@ pub(crate) enum OpCode {
     Size = 0x29,
     PutAll = 0x2D,
     GetAll = 0x2F,
+    RemoveAll = 0x45,
 }
 
 impl OpCode {
