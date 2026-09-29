@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::lookup_host;
+use tokio::task::JoinSet;
 
 use crate::connection::{
     HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT, DEFAULT_TOPOLOGY_ID,
@@ -207,22 +208,39 @@ impl HotRodCluster {
     /// Same as `connect`, but with a caller-supplied timeout in place of
     /// `DEFAULT_TIMEOUT`, applied to every connection this instance opens,
     /// now or later when routing discovers a new node.
+    ///
+    /// Every seed is dialed concurrently rather than one after another, so
+    /// the whole call is bounded by `timeout` regardless of how many seeds
+    /// are given: an unreachable seed no longer adds its own `timeout` to
+    /// the total. The first seed to accept a connection wins; the others
+    /// are dropped mid-connect. If every seed fails, the reported error is
+    /// the one from the seed listed first in `seed_addrs`, not whichever
+    /// happened to finish last.
     pub async fn connect_with_timeout(
         seed_addrs: &[SocketAddr],
         cache_name: &str,
         timeout: Duration,
     ) -> Result<Self> {
-        let mut last_err: Option<Error> = None;
-        for &addr in seed_addrs {
-            match HotRodConnection::connect_hash_aware(
-                addr,
-                cache_name,
-                DEFAULT_TOPOLOGY_ID,
-                timeout,
-            )
-            .await
-            {
-                Ok(conn) => {
+        let mut attempts = JoinSet::new();
+        for (index, &addr) in seed_addrs.iter().enumerate() {
+            let cache_name = cache_name.to_string();
+            attempts.spawn(async move {
+                let result = HotRodConnection::connect_hash_aware(
+                    addr,
+                    &cache_name,
+                    DEFAULT_TOPOLOGY_ID,
+                    timeout,
+                )
+                .await;
+                (index, addr, result)
+            });
+        }
+
+        let mut errors: Vec<Option<Error>> = seed_addrs.iter().map(|_| None).collect();
+        let mut join_failure: Option<Error> = None;
+        while let Some(joined) = attempts.join_next().await {
+            match joined {
+                Ok((_index, addr, Ok(conn))) => {
                     let mut connections = HashMap::new();
                     connections.insert(addr, PooledConnection { origin: None, conn });
                     return Ok(Self {
@@ -235,15 +253,23 @@ impl HotRodCluster {
                         timeout,
                     });
                 }
-                Err(err) => last_err = Some(err),
+                Ok((index, _addr, Err(err))) => errors[index] = Some(err),
+                Err(join_err) => {
+                    join_failure.get_or_insert_with(|| Error::Io(io::Error::other(join_err)));
+                }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no seed addresses provided",
-            ))
-        }))
+        Err(errors
+            .into_iter()
+            .flatten()
+            .next()
+            .or(join_failure)
+            .unwrap_or_else(|| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "no seed addresses provided",
+                ))
+            }))
     }
 
     /// The timeout currently bounding every operation on this instance's
@@ -588,6 +614,46 @@ mod tests {
     #[tokio::test]
     async fn connect_fails_with_no_seed_addresses() {
         let result = HotRodCluster::connect(&[], "my-cache").await;
+        assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    /// Binds a listener and immediately drops it, so the returned address
+    /// keeps refusing connections without anything else on it.
+    async fn unreachable_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_with_timeout_succeeds_via_whichever_seed_is_reachable() {
+        let dead_addr = unreachable_addr().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let cluster = HotRodCluster::connect_with_timeout(
+            &[dead_addr, addr],
+            "my-cache",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the reachable seed should win the race");
+
+        assert_eq!(cluster.active_seed_addr, addr);
+    }
+
+    #[tokio::test]
+    async fn connect_with_timeout_fails_when_every_seed_is_unreachable() {
+        let dead_addrs = [unreachable_addr().await, unreachable_addr().await];
+
+        let result =
+            HotRodCluster::connect_with_timeout(&dead_addrs, "my-cache", Duration::from_secs(5))
+                .await;
+
         assert!(matches!(result, Err(Error::Io(_))));
     }
 

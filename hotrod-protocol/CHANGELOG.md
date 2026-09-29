@@ -86,6 +86,14 @@ relying on server-side redirects.
   any connection whose server is missing from the latest update, without
   re-resolving any hostname to check. The seed connection is exempt: it
   is the permanent fallback every retry falls back to.
+- `HotRodCluster::connect_with_timeout` now dials every seed address
+  concurrently instead of one after another. With N seeds, an unreachable
+  one used to add its own full `timeout` to the total before the next
+  seed was even tried; now the whole call is bounded by `timeout`
+  regardless of how many seeds are given. The first seed to connect wins
+  and the rest are dropped mid-connect; if every seed fails, the reported
+  error is the one from the seed listed first, not whichever attempt
+  happened to finish last.
 
 ### Documented
 
