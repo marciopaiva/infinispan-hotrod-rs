@@ -6,20 +6,33 @@ extension that exposes it to PHP userland.
 
 ## Status
 
-Phase 1 complete: a single connection to one cache, PLAIN authentication,
-and the core operations (`get`, `put`, `remove`, `put_if_absent`,
-`replace`, `replace_if_unmodified`, `remove_if_unmodified`).
+`hotrod-protocol` mirrors the official Java client's core cache API and
+its cluster-aware routing. Everything else is an open gap, tracked as
+its own issue. See `docs/adr/` for how each phase was scoped and
+`hotrod-protocol/CHANGELOG.md` for release notes.
 
-Phase 2 complete: SCRAM-SHA-512, DIGEST-SHA-256 and OAUTHBEARER
-authentication (GSSAPI deferred to its own issue).
-
-Phase 3 complete: `HotRodCluster` tracks cluster topology and routes
-each request to the segment's primary owner, using Infinispan's own
-`MurmurHash3`, instead of relying on server-side redirects. See
-`docs/adr/0001-mirror-java-client-scope.md` for the full roadmap,
-`docs/adr/0002-phase-2-sasl-scope.md` for how phase 2 was scoped,
-`docs/adr/0003-hash-aware-routing-scope.md` for how phase 3 was scoped,
-and `hotrod-protocol/CHANGELOG.md` for release notes.
+| Feature | Java client | `hotrod-protocol` |
+| --- | --- | --- |
+| Core operations (get, put, remove, putIfAbsent, replace, versioned variants) | Yes | Yes |
+| Bulk operations (getAll, putAll, removeAll) | Yes | Yes |
+| containsKey, ping, size, clear, stats | Yes | Yes |
+| Full entry metadata (creation, last used, lifespan, max idle) | Yes | Yes |
+| Authentication: PLAIN, SCRAM-SHA-512, DIGEST-SHA-256, OAUTHBEARER | Yes | Yes |
+| Authentication: GSSAPI | Yes | No ([#9](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/9)) |
+| TLS and mutual TLS | Yes | No |
+| Cluster topology tracking, hash-aware routing | Yes | Yes |
+| Client listeners (cache events) | Yes | No ([#4](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/4)) |
+| Near caching | Yes | No ([#5](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/5)) |
+| Transactions | Yes | No |
+| Multimap cache | Yes | No |
+| Counters | Yes | No |
+| Remote query (Protobuf / Ickle) | Yes | No |
+| Remote task execution | Yes | No |
+| Streaming for large values | Yes | No |
+| Server-side iteration | Yes | No |
+| Stats and telemetry (metrics, tracing) | Yes | No |
+| Remote administration | Yes | No |
+| Multi-cluster failover | Yes | No |
 
 The PHP extension has not started yet.
 
