@@ -99,6 +99,16 @@ pub enum Error {
     /// reason of its own.
     #[error("operation timed out after {0:?}")]
     Timeout(Duration),
+
+    /// A prior operation on this connection ended without its response
+    /// being read in full (`Error::Timeout`, or the operation's future
+    /// dropped before resolving for a reason of its own), so the stream may
+    /// have a partial frame in flight. `HotRodConnection` now enforces the
+    /// rule the two errors above only documented: it refuses every further
+    /// operation once this happens, instead of leaving a caller free to
+    /// reuse a connection that is silently desynced. Reconnect instead.
+    #[error("connection is poisoned by a prior operation that did not complete: reconnect instead of reusing it")]
+    PoisonedConnection,
 }
 
 /// Result alias for `hotrod_protocol::Error`.

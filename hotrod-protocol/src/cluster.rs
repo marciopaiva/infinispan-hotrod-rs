@@ -10,12 +10,14 @@
 //! variant the server uses.
 //!
 //! The same cancellation hazard documented on `connection`'s module docs
-//! applies to each pooled connection here, and is sharper: `call` only
-//! evicts a pooled connection from `self.connections` when the operation
-//! itself returns `Error::Io` or `Error::Timeout`. A future dropped
-//! externally before it resolves never returns anything, so the poisoned
-//! connection stays in the pool and is handed to the next call routed to
-//! the same owner instead of being reconnected.
+//! applies to each pooled connection here. `HotRodConnection` now enforces
+//! it itself, marking a connection poisoned before every request and
+//! clearing that mark only once the response is read in full, so a future
+//! dropped externally before it resolves leaves the mark set even though it
+//! never returns anything for `call` to inspect. `ensure_connection` checks
+//! that mark directly before handing a pooled connection to the next
+//! operation, evicting and reconnecting it first if it is poisoned, rather
+//! than relying only on the operation's own return value.
 //!
 //! Every operation takes `&mut self`, so one `HotRodCluster` instance runs
 //! its operations one at a time, even when they route to different nodes.
@@ -768,6 +770,13 @@ impl HotRodCluster {
     /// connection for `record_topology_update` to check later; pass `None`
     /// for the seed or a retry fallback.
     ///
+    /// A connection already pooled at `addr` is evicted and reopened first
+    /// if `HotRodConnection::is_poisoned` reports it unsafe to reuse: a
+    /// future dropped mid-operation elsewhere in the program leaves it that
+    /// way without ever returning an error here for `call` to react to, so
+    /// this is checked directly instead of only trusting a prior
+    /// operation's return value.
+    ///
     /// Returning the connection directly, instead of a caller repeating the
     /// lookup afterward, keeps the pool entry's existence a fact the borrow
     /// checker enforces rather than an invariant a caller has to assume.
@@ -776,6 +785,13 @@ impl HotRodCluster {
         addr: SocketAddr,
         origin: Option<TopologyServer>,
     ) -> Result<&mut PooledConnection> {
+        if self
+            .connections
+            .get(&addr)
+            .is_some_and(|pooled| pooled.conn.is_poisoned())
+        {
+            self.connections.remove(&addr);
+        }
         match self.connections.entry(addr) {
             hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
             hash_map::Entry::Vacant(entry) => {
@@ -964,6 +980,51 @@ mod tests {
         assert!(matches!(result, Err(Error::Timeout(_))));
         assert!(!cluster.connections.contains_key(&owner_addr));
         assert!(!cluster.connections.contains_key(&seed_addr));
+    }
+
+    /// A future dropped before it resolves never returns an `Error::Io`/
+    /// `Error::Timeout` for `call` to evict on, unlike the case above. This
+    /// checks the other enforcement path instead: `HotRodConnection` itself
+    /// comes out of the drop poisoned, and `ensure_connection` evicts and
+    /// reconnects it on the next call rather than reusing a connection that
+    /// may still have the abandoned request's response arriving on it.
+    #[tokio::test]
+    async fn a_dropped_operation_future_leaves_the_pooled_connection_poisoned_and_gets_reconnected()
+    {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut first, _) = seed_listener.accept().await.unwrap();
+            read_request_opcode(&mut first).await;
+
+            let (mut second, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut second).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut second).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            second.write_all(&resp).await.unwrap();
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+
+        // The seed never answers the first request, so racing it against a
+        // short external timeout drops `cluster.get`'s future mid-flight,
+        // the same hazard a caller's own `select!` can trigger. The pooled
+        // connection stays in the pool, poisoned, since nothing here ever
+        // saw an `Error::Io`/`Error::Timeout` to evict it on.
+        let raced = tokio::time::timeout(Duration::from_millis(100), cluster.get(b"key")).await;
+        assert!(raced.is_err(), "the outer timeout should win the race");
+        assert!(cluster.connections.contains_key(&seed_addr));
+
+        let result = cluster
+            .get(b"key")
+            .await
+            .expect("get should reconnect the poisoned seed instead of reading a desynced stream");
+        assert_eq!(result, None);
+
+        seed_task.await.unwrap();
     }
 
     #[tokio::test]

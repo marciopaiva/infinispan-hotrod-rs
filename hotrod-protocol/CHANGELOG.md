@@ -25,6 +25,19 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `Error::Io`/`Error::Timeout` failure. It now reconnects the seed the
   same way `call`/`ensure_connection` already do, instead of indexing
   the pool directly and assuming the entry is still there.
+- The connection-poisoning rule the module docs on `HotRodConnection` and
+  `HotRodCluster` already described is now enforced instead of merely
+  documented. `HotRodConnection` marks itself poisoned before writing a
+  request and clears the mark only once the response has been read in
+  full; a future dropped before that point, for `Error::Timeout` or any
+  other reason, leaves the mark set, and every later operation on that
+  connection then fails fast with the new `Error::PoisonedConnection`
+  instead of reading from a stream that may still have a partial frame
+  in flight. `HotRodCluster::ensure_connection` checks a pooled
+  connection's poisoned mark directly before handing it to the next
+  operation, evicting and reconnecting it first if needed, rather than
+  only reacting to whatever `Error::Io`/`Error::Timeout` an operation
+  happens to return.
 
 ### Removed
 
