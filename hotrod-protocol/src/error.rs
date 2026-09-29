@@ -77,6 +77,18 @@ pub enum Error {
         max: u32,
     },
 
+    // Unlike `DeclaredLengthTooLarge`, this is not about an untrusted length
+    // the server sent, but about a caller's own `get_all`/`put_all` batch.
+    // Checking it before building the request avoids constructing and
+    // sending an oversized frame that the server was always going to
+    // reject anyway.
+    #[error("{what} has {len} entries, which exceeds this client's limit of {max}")]
+    BatchTooLarge {
+        what: &'static str,
+        len: usize,
+        max: usize,
+    },
+
     // A corrupted or hostile stream could otherwise send an unbounded run
     // of continuation bytes (the 0x80 bit set on every byte), shifting
     // `result` past the target type's width: a panic with overflow checks

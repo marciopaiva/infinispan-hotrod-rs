@@ -61,6 +61,16 @@ pub(crate) const DEFAULT_TOPOLOGY_ID: i32 = -1;
 /// after one fires.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Safety ceiling on the number of entries `get_all`/`put_all` accept in
+/// one call, checked before a single byte is written. This is not a
+/// protocol limit either: a real Hot Rod server enforces its own maximum
+/// frame size and rejects whatever does not fit, but that rejection would
+/// arrive only after this client already built and sent a frame that could
+/// be gigabytes long, for a request that was always going to fail. A
+/// caller with more entries than this needs several smaller calls instead,
+/// the same way `get`/`put` scale to many keys today.
+pub const MAX_BULK_ENTRIES: usize = 100_000;
+
 /// Races `fut` against `timeout`, turning an elapsed deadline into
 /// `Error::Timeout` instead of leaving the caller to wait forever.
 async fn with_timeout<T>(timeout: Duration, fut: impl Future<Output = Result<T>>) -> Result<T> {
@@ -628,17 +638,24 @@ impl HotRodConnection {
     /// no entry is simply missing from the result map, the same as `get`
     /// returning `None` for it.
     ///
-    /// No batch size limit is enforced here: the caller is responsible for
-    /// not handing over more entries than `wire::MAX_ARRAY_LEN` and the
-    /// server can accept in one frame.
+    /// Returns `Error::BatchTooLarge` without writing anything if `keys` has
+    /// more than `MAX_BULK_ENTRIES` entries. A caller with more keys than
+    /// that needs several smaller calls instead.
     pub async fn get_all(
         &mut self,
         keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
     ) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
+        if keys.len() > MAX_BULK_ENTRIES {
+            return Err(Error::BatchTooLarge {
+                what: "get_all",
+                len: keys.len(),
+                max: MAX_BULK_ENTRIES,
+            });
+        }
         self.begin_operation()?;
         let timeout = self.timeout;
         let result = with_timeout(timeout, async {
-            let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
             let mut body = Vec::new();
             write_vint(&mut body, keys.len() as u32);
             for key in &keys {
@@ -665,20 +682,27 @@ impl HotRodConnection {
     /// Writes every key/value pair in `entries` in one request, all sharing
     /// the same `lifespan`/`max_idle`.
     ///
-    /// Same absence of a batch size limit as `get_all`.
+    /// Same `MAX_BULK_ENTRIES` ceiling as `get_all`, checked the same way.
     pub async fn put_all(
         &mut self,
         entries: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
+            .collect();
+        if entries.len() > MAX_BULK_ENTRIES {
+            return Err(Error::BatchTooLarge {
+                what: "put_all",
+                len: entries.len(),
+                max: MAX_BULK_ENTRIES,
+            });
+        }
         self.begin_operation()?;
         let timeout = self.timeout;
         let result = with_timeout(timeout, async {
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
-                .into_iter()
-                .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
-                .collect();
             let mut body = Vec::new();
             write_expiration_params(&mut body, lifespan, max_idle);
             write_vint(&mut body, entries.len() as u32);
@@ -1187,5 +1211,61 @@ mod tests {
         assert_eq!(result.max_idle, Expiration::Immortal);
 
         server.await.unwrap();
+    }
+
+    /// The oversized-batch check must reject the call before a single byte
+    /// reaches the network: the listener below accepts a connection and then
+    /// does nothing else, so this test would hang if `get_all` tried to read
+    /// a response instead of failing fast on the length check.
+    #[tokio::test]
+    async fn get_all_rejects_a_batch_over_the_limit_without_touching_the_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+
+        let keys = vec![b"key".to_vec(); MAX_BULK_ENTRIES + 1];
+        let result = conn.get_all(keys).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::BatchTooLarge {
+                what: "get_all",
+                len,
+                max: MAX_BULK_ENTRIES,
+            }) if len == MAX_BULK_ENTRIES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn put_all_rejects_a_batch_over_the_limit_without_touching_the_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+
+        let entries = vec![(b"key".to_vec(), b"value".to_vec()); MAX_BULK_ENTRIES + 1];
+        let result = conn
+            .put_all(entries, Expiration::Default, Expiration::Default)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::BatchTooLarge {
+                what: "put_all",
+                len,
+                max: MAX_BULK_ENTRIES,
+            }) if len == MAX_BULK_ENTRIES + 1
+        ));
     }
 }

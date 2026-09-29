@@ -6,6 +6,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [0.4.0] - 2026-09-29
 
+### Added
+
+- `Error::BatchTooLarge` and the new `MAX_BULK_ENTRIES` constant (100,000).
+  `HotRodConnection::get_all`/`put_all` now reject a batch over that size
+  before writing anything, instead of building and sending a frame that
+  could grow unbounded with the caller's input and that a real server was
+  always going to reject once its own frame size limit kicked in.
+  `HotRodCluster::get_all`/`put_all` inherit the same ceiling, since both
+  delegate to the `HotRodConnection` methods.
+
 ### Fixed
 
 - `read_vint`/`read_vlong` no longer loop forever on a continuation byte
@@ -50,6 +60,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
   fake in-process server that echoes back whatever opcode it is given. A
   caller that needs the same effect can loop over `remove` for each key,
   the same workaround the Java client itself relies on.
+
+### Documented
+
+- `HotRodCluster::get_all`/`put_all` now explain in their doc comments why
+  always routing to the seed connection, regardless of which node owns
+  each key, is a network-efficiency trade-off and not a correctness gap:
+  a distributed cache node forwards a request for a key it does not own to
+  the real owner over internal cluster RPC. Splitting the batch
+  client-side by owner was considered and rejected for this issue, as a
+  bigger change than a hardening fix warrants.
 
 ### Tested
 

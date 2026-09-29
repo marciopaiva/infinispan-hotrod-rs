@@ -547,10 +547,18 @@ impl HotRodCluster {
     }
 
     /// Fetches every key in `keys` that exists, in one request to the seed
-    /// connection. There is no key to route by a single owner: the Propose
-    /// step for issue #41 chose the same answer already picked for
-    /// `size`/`clear`/`ping`/`stats` in issue #40, always the seed, over
-    /// splitting the batch client-side by owner.
+    /// connection, regardless of which node in the cluster actually owns
+    /// each key. This is not a correctness gap: a distributed cache's node
+    /// forwards a request for a key it does not own to the real owner over
+    /// internal cluster RPC and returns the result, the same as any other
+    /// node would. Splitting the batch client-side by owner would save that
+    /// internal hop for keys the seed does not hold, but the Propose step
+    /// for issue #41 (and its revisit in issue #68) chose to keep the single
+    /// request to the seed, the same answer already picked for
+    /// `size`/`clear`/`ping`/`stats` in issue #40, rather than take on the
+    /// added complexity of a client-side split for a network-efficiency
+    /// gain, not a bug fix. `MAX_BULK_ENTRIES` is enforced by the
+    /// underlying `HotRodConnection::get_all` this delegates to.
     pub async fn get_all(
         &mut self,
         keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
@@ -563,7 +571,8 @@ impl HotRodCluster {
     }
 
     /// Writes every key/value pair in `entries` in one request to the seed
-    /// connection. Routed the same way as `get_all`, for the same reason.
+    /// connection. Routed the same way as `get_all`, for the same reason,
+    /// and enforcing the same `MAX_BULK_ENTRIES` ceiling.
     pub async fn put_all(
         &mut self,
         entries: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
