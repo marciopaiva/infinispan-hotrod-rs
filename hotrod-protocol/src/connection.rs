@@ -172,6 +172,21 @@ impl HotRodConnection {
         self.pending_topology_update.take()
     }
 
+    /// The timeout currently bounding every operation and authentication
+    /// round on this connection.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Overrides the timeout used from this call onward, in place of the one
+    /// given at connect time. Applies to every subsequent operation and
+    /// authentication round, not just the next one: a caller that wants a
+    /// single call to have a different bound must set it back afterward,
+    /// typically to the value `timeout()` returned beforehand.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
     /// Authenticates the connection using SASL PLAIN. Must be called before
     /// any cache operation if the server requires authentication.
     ///
@@ -514,5 +529,33 @@ mod tests {
         let result = conn.get(b"key").await;
 
         assert!(matches!(result, Err(Error::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn set_timeout_overrides_the_bound_used_by_the_next_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let mut conn = HotRodConnection::connect_with_timeout(addr, "", Duration::from_secs(30))
+            .await
+            .expect("connect should succeed even though the server stays silent");
+        assert_eq!(conn.timeout(), Duration::from_secs(30));
+
+        conn.set_timeout(Duration::from_millis(100));
+        assert_eq!(conn.timeout(), Duration::from_millis(100));
+
+        let start = tokio::time::Instant::now();
+        let result = conn.get(b"key").await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the overridden timeout should have fired, not the 30s one from connect"
+        );
     }
 }

@@ -38,6 +38,14 @@ relying on server-side redirects.
   pooled-connection retry logic. `DEFAULT_TIMEOUT` is now re-exported from
   the crate root, so a caller overriding the default can reference it
   (for example, `DEFAULT_TIMEOUT * 2`) instead of repeating the literal.
+- `timeout`/`set_timeout` on `HotRodConnection` and `HotRodCluster`, so a
+  caller can give a single slow operation more time, or a
+  latency-sensitive one less, without reconnecting with a different
+  fixed timeout. The override applies to every operation from the call
+  onward, not just the next one, and on `HotRodCluster` reaches every
+  already pooled connection immediately, not only ones opened later; a
+  caller restoring the previous bound afterward uses the value
+  `timeout()` returned beforehand.
 
 ### Changed
 
