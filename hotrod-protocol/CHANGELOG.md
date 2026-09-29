@@ -4,6 +4,20 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-09-29
+
+### Removed
+
+- `remove_all` on `HotRodConnection` and `HotRodCluster`. It sent opcode
+  `0x45`, which does not exist in the real Hot Rod protocol: there is no
+  bulk remove operation defined at all, which is also why the official
+  Java client has no public `removeAll(Set)`. A real server rejects the
+  request with `HotRodUnknownOperationException: Unknown operation 69`;
+  this had gone unnoticed since the unit tests for it ran only against a
+  fake in-process server that echoes back whatever opcode it is given. A
+  caller that needs the same effect can loop over `remove` for each key,
+  the same workaround the Java client itself relies on.
+
 ## [0.3.0] - 2026-09-29
 
 Phase 3 of the roadmap, scoped down in
@@ -57,9 +71,6 @@ relying on server-side redirects.
   `HotRodCluster`, both always target the seed connection, the same
   routing already chosen for `size`/`clear`/`ping`/`stats`, rather than
   splitting the batch client-side by segment owner.
-- `remove_all` on `HotRodConnection` and `HotRodCluster`, removing several
-  keys in one request. Same absence of a batch size limit, and the same
-  always-the-seed routing on `HotRodCluster`, as `get_all`/`put_all`.
 - `VersionedValue`, returned by `get_with_version`, now carries the entry's
   full metadata alongside the value and version: `created`, `lifespan`,
   `last_used` and `max_idle`. `lifespan` and `max_idle` reuse the existing

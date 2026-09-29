@@ -163,7 +163,6 @@ enum Operation {
     Stats,
     GetAll(Vec<Vec<u8>>),
     PutAll(Vec<(Vec<u8>, Vec<u8>)>, Expiration, Expiration),
-    RemoveAll(Vec<Vec<u8>>),
 }
 
 enum OperationResult {
@@ -178,7 +177,6 @@ enum OperationResult {
     Stats(HashMap<String, String>),
     GetAll(HashMap<Vec<u8>, Vec<u8>>),
     PutAll,
-    RemoveAll,
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -231,11 +229,6 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
             )
             .await?;
             Ok(OperationResult::PutAll)
-        }
-        Operation::RemoveAll(keys) => {
-            conn.remove_all(keys.iter().map(|key| key.as_slice()))
-                .await?;
-            Ok(OperationResult::RemoveAll)
         }
     }
 }
@@ -576,20 +569,6 @@ impl HotRodCluster {
         {
             OperationResult::PutAll => Ok(()),
             _ => unreachable!("Operation::PutAll always yields OperationResult::PutAll"),
-        }
-    }
-
-    /// Removes every key in `keys` that exists, in one request to the seed
-    /// connection. Routed the same way as `get_all`/`put_all`, for the same
-    /// reason.
-    pub async fn remove_all(
-        &mut self,
-        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
-    ) -> Result<()> {
-        let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
-        match self.call_seed(Operation::RemoveAll(keys)).await? {
-            OperationResult::RemoveAll => Ok(()),
-            _ => unreachable!("Operation::RemoveAll always yields OperationResult::RemoveAll"),
         }
     }
 
@@ -1334,48 +1313,6 @@ mod tests {
             )
             .await
             .expect("put_all");
-
-        seed_task.await.unwrap();
-    }
-
-    /// `remove_all` has no single key to route by either, same reasoning as
-    /// `get_all`/`put_all` above.
-    #[tokio::test]
-    async fn remove_all_always_targets_the_seed() {
-        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let seed_addr = seed_listener.local_addr().unwrap();
-        let seed_task = tokio::spawn(async move {
-            let (mut stream, _) = seed_listener.accept().await.unwrap();
-
-            let (id, opcode) = read_request_opcode(&mut stream).await;
-            assert_eq!(opcode, 0x45, "expected a RemoveAll request");
-            let count = read_vint(&mut stream).await.unwrap();
-            for _ in 0..count {
-                let _key = read_array(&mut stream).await.unwrap();
-            }
-            let resp = response_header(id, 0x46, 0x00);
-            stream.write_all(&resp).await.unwrap();
-        });
-
-        let unreachable = unreachable_addr().await;
-
-        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
-            .await
-            .expect("connect to seed");
-        cluster.topology = Some(ClusterTopology {
-            servers: vec![TopologyServer {
-                host: unreachable.ip().to_string(),
-                port: unreachable.port(),
-            }],
-            hash_function_version: 3,
-            segment_owners: vec![vec![0]],
-            resolved_addrs: HashMap::new(),
-        });
-
-        cluster
-            .remove_all([b"key".as_slice()])
-            .await
-            .expect("remove_all");
 
         seed_task.await.unwrap();
     }
