@@ -246,6 +246,25 @@ impl HotRodCluster {
         }))
     }
 
+    /// The timeout currently bounding every operation on this instance's
+    /// pooled connections.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Overrides the timeout used from this call onward, in place of the
+    /// one given at connect time. Applies immediately to every already
+    /// pooled connection and to every one opened later. Applies to every
+    /// subsequent operation, not just the next one: a caller that wants a
+    /// single call to have a different bound must set it back afterward,
+    /// typically to the value `timeout()` returned beforehand.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+        for pooled in self.connections.values_mut() {
+            pooled.conn.set_timeout(timeout);
+        }
+    }
+
     /// Authenticates using SASL PLAIN. See `HotRodConnection::authenticate_plain`.
     pub async fn authenticate_plain(
         &mut self,
@@ -570,6 +589,34 @@ mod tests {
     async fn connect_fails_with_no_seed_addresses() {
         let result = HotRodCluster::connect(&[], "my-cache").await;
         assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn set_timeout_applies_to_an_already_pooled_connection() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let mut cluster =
+            HotRodCluster::connect_with_timeout(&[seed_addr], "my-cache", Duration::from_secs(30))
+                .await
+                .expect("connect to seed");
+        assert_eq!(cluster.timeout(), Duration::from_secs(30));
+
+        cluster.set_timeout(Duration::from_millis(100));
+        assert_eq!(cluster.timeout(), Duration::from_millis(100));
+
+        let start = tokio::time::Instant::now();
+        let result = cluster.get(b"key").await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "set_timeout should have applied to the seed connection already in the pool"
+        );
     }
 
     #[tokio::test]
