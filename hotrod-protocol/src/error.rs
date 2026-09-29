@@ -77,6 +77,15 @@ pub enum Error {
         max: u32,
     },
 
+    // A corrupted or hostile stream could otherwise send an unbounded run
+    // of continuation bytes (the 0x80 bit set on every byte), shifting
+    // `result` past the target type's width: a panic with overflow checks
+    // on, or a silently wrong, masked value in release. The encoding never
+    // needs more than 5 bytes for a vInt or 10 for a vLong, the same bound
+    // the Java client enforces.
+    #[error("malformed varint: continuation bit still set after {max_bytes} bytes")]
+    MalformedVarint { max_bytes: u8 },
+
     /// Fires when a connect, or an operation's full write-then-read cycle,
     /// does not finish within the configured timeout. The connection this
     /// happened on may have an unwritten or unread partial protocol frame

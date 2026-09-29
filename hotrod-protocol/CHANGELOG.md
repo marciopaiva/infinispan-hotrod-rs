@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [0.4.0] - 2026-09-29
 
+### Fixed
+
+- `read_vint`/`read_vlong` no longer loop forever on a continuation byte
+  run that never terminates. Each now stops after the number of bytes
+  the encoding can ever need (5 for a vInt, 10 for a vLong, the same
+  bound the Java client enforces) and returns `Error::MalformedVarint`
+  instead of shifting past the target type's width, which could panic
+  with overflow checks on or silently produce a wrong value in release.
+
 ### Removed
 
 - `remove_all` on `HotRodConnection` and `HotRodCluster`. It sent opcode

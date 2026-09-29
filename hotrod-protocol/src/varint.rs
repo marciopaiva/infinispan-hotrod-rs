@@ -9,7 +9,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub(crate) fn write_vint(buf: &mut Vec<u8>, mut value: u32) {
     loop {
@@ -37,10 +37,17 @@ pub(crate) fn write_vlong(buf: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+/// A vInt never needs more than 5 continuation bytes to cover 32 bits at
+/// 7 bits per byte; a longer run is malformed input, not a longer number.
+const MAX_VINT_BYTES: u8 = 5;
+
+/// Same reasoning as `MAX_VINT_BYTES`, for a vLong's 64 bits.
+const MAX_VLONG_BYTES: u8 = 10;
+
 pub(crate) async fn read_vint<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u32> {
     let mut result: u32 = 0;
     let mut shift = 0u32;
-    loop {
+    for _ in 0..MAX_VINT_BYTES {
         let byte = reader.read_u8().await?;
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
@@ -48,12 +55,15 @@ pub(crate) async fn read_vint<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u3
         }
         shift += 7;
     }
+    Err(Error::MalformedVarint {
+        max_bytes: MAX_VINT_BYTES,
+    })
 }
 
 pub(crate) async fn read_vlong<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64> {
     let mut result: u64 = 0;
     let mut shift = 0u32;
-    loop {
+    for _ in 0..MAX_VLONG_BYTES {
         let byte = reader.read_u8().await?;
         result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
@@ -61,6 +71,9 @@ pub(crate) async fn read_vlong<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u
         }
         shift += 7;
     }
+    Err(Error::MalformedVarint {
+        max_bytes: MAX_VLONG_BYTES,
+    })
 }
 
 #[cfg(test)]
@@ -110,5 +123,23 @@ mod tests {
         write_vlong(&mut buf, u64::MAX);
         let value = read_vlong(&mut buf.as_slice()).await.expect("read_vlong");
         assert_eq!(value, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn read_vint_rejects_a_continuation_run_longer_than_five_bytes() {
+        let buf = [0x80u8; 5];
+        let err = read_vint(&mut buf.as_slice())
+            .await
+            .expect_err("expected MalformedVarint");
+        assert!(matches!(err, Error::MalformedVarint { max_bytes: 5 }));
+    }
+
+    #[tokio::test]
+    async fn read_vlong_rejects_a_continuation_run_longer_than_ten_bytes() {
+        let buf = [0x80u8; 10];
+        let err = read_vlong(&mut buf.as_slice())
+            .await
+            .expect_err("expected MalformedVarint");
+        assert!(matches!(err, Error::MalformedVarint { max_bytes: 10 }));
     }
 }
