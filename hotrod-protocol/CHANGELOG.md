@@ -76,6 +76,15 @@ relying on server-side redirects.
   `Error::Io` or `Error::Timeout` return value, which a dropped future
   never produces.
 
+### Tested
+
+- `HotRodCluster::ensure_connection` replaying the seed's SASL PLAIN
+  credentials onto a newly opened pooled connection, and `owner_addr`
+  surfacing a typed error instead of hanging or panicking when a
+  topology's owner host does not resolve. Both previously had coverage
+  only through the live-server tests, which are `#[ignore]`d by default
+  and need a real cluster.
+
 ## [0.2.0] - 2026-09-28
 
 Phase 2 of the roadmap, scoped down in
