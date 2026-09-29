@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -77,11 +77,22 @@ pub enum VersionedResult {
 }
 
 /// A value together with the entry version needed to make a later
-/// `replace_if_unmodified` or `remove_if_unmodified` call.
+/// `replace_if_unmodified` or `remove_if_unmodified` call, plus the entry's
+/// full metadata as returned by the server.
+///
+/// `created` and `last_used` are `None` exactly when `lifespan` and
+/// `max_idle` respectively are `Expiration::Immortal`: the server never
+/// sends a timestamp for a half of the entry that does not expire.
+/// `Expiration::Default` is never produced here; it exists only for the
+/// write side (`put` and friends).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     pub value: Vec<u8>,
     pub version: u64,
+    pub created: Option<SystemTime>,
+    pub lifespan: Expiration,
+    pub last_used: Option<SystemTime>,
+    pub max_idle: Expiration,
 }
 
 pub struct HotRodConnection {
@@ -370,7 +381,9 @@ impl HotRodConnection {
     }
 
     /// Fetches a value together with its entry version, for use in a later
-    /// `replace_if_unmodified` or `remove_if_unmodified` call.
+    /// `replace_if_unmodified` or `remove_if_unmodified` call, and the
+    /// entry's full metadata (creation and last-used time, lifespan and
+    /// max idle).
     pub async fn get_with_version(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
         let timeout = self.timeout;
         with_timeout(timeout, async {
@@ -620,25 +633,45 @@ impl HotRodConnection {
 
     /// Mirrors `GetWithMetadataOperation.readMetadataValue`: flags select
     /// which timestamp/duration pairs are present, then an 8-byte version
-    /// and the value always follow. Timestamps and durations are consumed
-    /// to keep the stream in sync but are not part of phase 1's API.
+    /// and the value always follow. The timestamps are server wall-clock
+    /// time in epoch milliseconds (`TimeService.wallClockTime`), the
+    /// durations are in seconds.
     async fn read_versioned_value(&mut self) -> Result<VersionedValue> {
         const INFINITE_LIFESPAN: u8 = 0x01;
         const INFINITE_MAXIDLE: u8 = 0x02;
 
         let flags = tokio::io::AsyncReadExt::read_u8(&mut self.stream).await?;
-        if flags & INFINITE_LIFESPAN == 0 {
-            let _creation = tokio::io::AsyncReadExt::read_u64(&mut self.stream).await?;
-            let _lifespan = read_vint(&mut self.stream).await?;
-        }
-        if flags & INFINITE_MAXIDLE == 0 {
-            let _last_used = tokio::io::AsyncReadExt::read_u64(&mut self.stream).await?;
-            let _max_idle = read_vint(&mut self.stream).await?;
-        }
+        let (created, lifespan) = if flags & INFINITE_LIFESPAN == 0 {
+            let creation = tokio::io::AsyncReadExt::read_u64(&mut self.stream).await?;
+            let lifespan = read_vint(&mut self.stream).await?;
+            (
+                Some(UNIX_EPOCH + Duration::from_millis(creation)),
+                Expiration::Seconds(lifespan as u64),
+            )
+        } else {
+            (None, Expiration::Immortal)
+        };
+        let (last_used, max_idle) = if flags & INFINITE_MAXIDLE == 0 {
+            let last_used = tokio::io::AsyncReadExt::read_u64(&mut self.stream).await?;
+            let max_idle = read_vint(&mut self.stream).await?;
+            (
+                Some(UNIX_EPOCH + Duration::from_millis(last_used)),
+                Expiration::Seconds(max_idle as u64),
+            )
+        } else {
+            (None, Expiration::Immortal)
+        };
         let version = tokio::io::AsyncReadExt::read_u64(&mut self.stream).await?;
         let value = read_array(&mut self.stream).await?;
 
-        Ok(VersionedValue { value, version })
+        Ok(VersionedValue {
+            value,
+            version,
+            created,
+            lifespan,
+            last_used,
+            max_idle,
+        })
     }
 
     async fn write_and_read_header(
@@ -1041,6 +1074,51 @@ mod tests {
         conn.remove_all([b"a".as_slice(), b"b".as_slice()])
             .await
             .expect("remove_all");
+
+        server.await.unwrap();
+    }
+
+    /// One half of the entry has a finite duration, the other is immortal,
+    /// so both branches of `read_versioned_value` run in the same test.
+    #[tokio::test]
+    async fn get_with_version_exposes_full_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request(&mut stream).await;
+            assert_eq!(opcode, 0x1B, "expected a GetWithMetadata request");
+            let _key = read_array(&mut stream).await.unwrap();
+
+            let mut resp = response_header(id, 0x1C, 0x00);
+            const INFINITE_MAXIDLE: u8 = 0x02;
+            resp.push(INFINITE_MAXIDLE); // finite lifespan, immortal max idle
+            resp.extend_from_slice(&1_700_000_000_000u64.to_be_bytes()); // creation
+            write_vint(&mut resp, 100); // lifespan seconds
+            resp.extend_from_slice(&42u64.to_be_bytes()); // version
+            write_array(&mut resp, b"value");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+        let result = conn
+            .get_with_version(b"key")
+            .await
+            .expect("get_with_version")
+            .expect("entry exists");
+
+        assert_eq!(result.value, b"value");
+        assert_eq!(result.version, 42);
+        assert_eq!(
+            result.created,
+            Some(std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000))
+        );
+        assert_eq!(result.lifespan, Expiration::Seconds(100));
+        assert_eq!(result.last_used, None);
+        assert_eq!(result.max_idle, Expiration::Immortal);
 
         server.await.unwrap();
     }
