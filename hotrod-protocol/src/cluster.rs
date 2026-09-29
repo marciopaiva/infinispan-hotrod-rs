@@ -17,6 +17,7 @@
 //! connection stays in the pool and is handed to the next call routed to
 //! the same owner instead of being reconnected.
 
+use std::collections::hash_map;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -395,12 +396,8 @@ impl HotRodCluster {
     /// any other error, or a second failure, is returned as is.
     async fn call(&mut self, key: &[u8], op: Operation) -> Result<OperationResult> {
         let (addr, origin) = self.owner_addr(key).await?;
-        self.ensure_connection(addr, origin).await?;
         let outcome = {
-            let pooled = self
-                .connections
-                .get_mut(&addr)
-                .expect("ensure_connection just inserted it");
+            let pooled = self.ensure_connection(addr, origin).await?;
             run_operation(&mut pooled.conn, &op).await
         };
         let err = match outcome {
@@ -419,11 +416,7 @@ impl HotRodCluster {
         }
 
         let seed = self.active_seed_addr;
-        self.ensure_connection(seed, None).await?;
-        let pooled = self
-            .connections
-            .get_mut(&seed)
-            .expect("ensure_connection just inserted it");
+        let pooled = self.ensure_connection(seed, None).await?;
         match run_operation(&mut pooled.conn, &op).await {
             Ok(value) => {
                 self.record_topology_update(seed);
@@ -473,30 +466,35 @@ impl HotRodCluster {
     }
 
     /// Opens and authenticates a pooled connection to `addr` if one is not
-    /// already there. `origin` is the topology server `addr` was resolved
-    /// from, stored alongside the connection for `record_topology_update`
-    /// to check later; pass `None` for the seed or a retry fallback.
+    /// already there, and returns it either way. `origin` is the topology
+    /// server `addr` was resolved from, stored alongside a newly opened
+    /// connection for `record_topology_update` to check later; pass `None`
+    /// for the seed or a retry fallback.
+    ///
+    /// Returning the connection directly, instead of a caller repeating the
+    /// lookup afterward, keeps the pool entry's existence a fact the borrow
+    /// checker enforces rather than an invariant a caller has to assume.
     async fn ensure_connection(
         &mut self,
         addr: SocketAddr,
         origin: Option<TopologyServer>,
-    ) -> Result<()> {
-        if self.connections.contains_key(&addr) {
-            return Ok(());
+    ) -> Result<&mut PooledConnection> {
+        match self.connections.entry(addr) {
+            hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            hash_map::Entry::Vacant(entry) => {
+                let mut conn = HotRodConnection::connect_hash_aware(
+                    addr,
+                    &self.cache_name,
+                    self.topology_id,
+                    self.timeout,
+                )
+                .await?;
+                if let Some(auth) = &self.auth {
+                    auth.authenticate(&mut conn).await?;
+                }
+                Ok(entry.insert(PooledConnection { origin, conn }))
+            }
         }
-        let mut conn = HotRodConnection::connect_hash_aware(
-            addr,
-            &self.cache_name,
-            self.topology_id,
-            self.timeout,
-        )
-        .await?;
-        if let Some(auth) = &self.auth {
-            auth.authenticate(&mut conn).await?;
-        }
-        self.connections
-            .insert(addr, PooledConnection { origin, conn });
-        Ok(())
     }
 
     /// Applies whatever topology update the connection at `addr` parsed

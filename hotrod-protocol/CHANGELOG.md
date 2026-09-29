@@ -45,6 +45,14 @@ relying on server-side redirects.
   explicit client intelligence and topology id through internally. Its
   public behavior is unchanged: it still advertises `BASIC` intelligence
   and topology id `-1`, exactly as before.
+- `HotRodCluster::ensure_connection` now returns the pooled connection
+  itself instead of just confirming it is there. `call` no longer looks
+  it back up afterward through two `.expect("ensure_connection just
+  inserted it")` calls: that invariant held only because nothing ran
+  between the insert and the lookup, which was already fragile and would
+  have needed re-proving against any future change to the pool. The
+  connection's existence is now a fact the borrow checker enforces, not
+  one a caller assumes.
 
 ### Fixed
 
