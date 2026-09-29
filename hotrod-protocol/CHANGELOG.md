@@ -57,6 +57,9 @@ relying on server-side redirects.
   `HotRodCluster`, both always target the seed connection, the same
   routing already chosen for `size`/`clear`/`ping`/`stats`, rather than
   splitting the batch client-side by segment owner.
+- `remove_all` on `HotRodConnection` and `HotRodCluster`, removing several
+  keys in one request. Same absence of a batch size limit, and the same
+  always-the-seed routing on `HotRodCluster`, as `get_all`/`put_all`.
 
 ### Changed
 

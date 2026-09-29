@@ -593,6 +593,31 @@ impl HotRodConnection {
         .await
     }
 
+    /// Removes every key in `keys` that exists, in one request. A key with
+    /// no entry is simply skipped, the same as `remove` returning `false`
+    /// for it.
+    ///
+    /// Same absence of a batch size limit as `get_all`.
+    pub async fn remove_all(
+        &mut self,
+        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
+    ) -> Result<()> {
+        let timeout = self.timeout;
+        with_timeout(timeout, async {
+            let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
+            let mut body = Vec::new();
+            write_vint(&mut body, keys.len() as u32);
+            for key in &keys {
+                write_array(&mut body, key);
+            }
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::RemoveAll, &body)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Mirrors `GetWithMetadataOperation.readMetadataValue`: flags select
     /// which timestamp/duration pairs are present, then an 8-byte version
     /// and the value always follow. Timestamps and durations are consumed
@@ -986,6 +1011,36 @@ mod tests {
         )
         .await
         .expect("put_all");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_all_completes_on_a_bare_success_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request(&mut stream).await;
+            assert_eq!(opcode, 0x45, "expected a RemoveAll request");
+            let count = crate::varint::read_vint(&mut stream).await.unwrap();
+            let mut keys = Vec::new();
+            for _ in 0..count {
+                keys.push(read_array(&mut stream).await.unwrap());
+            }
+            assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+
+            let resp = response_header(id, 0x46, 0x00);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+        conn.remove_all([b"a".as_slice(), b"b".as_slice()])
+            .await
+            .expect("remove_all");
 
         server.await.unwrap();
     }
