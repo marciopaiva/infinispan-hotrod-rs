@@ -161,6 +161,8 @@ enum Operation {
     Size,
     Clear,
     Stats,
+    GetAll(Vec<Vec<u8>>),
+    PutAll(Vec<(Vec<u8>, Vec<u8>)>, Expiration, Expiration),
 }
 
 enum OperationResult {
@@ -173,6 +175,8 @@ enum OperationResult {
     Size(u32),
     Clear,
     Stats(HashMap<String, String>),
+    GetAll(HashMap<Vec<u8>, Vec<u8>>),
+    PutAll,
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -212,6 +216,20 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
             Ok(OperationResult::Clear)
         }
         Operation::Stats => Ok(OperationResult::Stats(conn.stats().await?)),
+        Operation::GetAll(keys) => Ok(OperationResult::GetAll(
+            conn.get_all(keys.iter().map(|key| key.as_slice())).await?,
+        )),
+        Operation::PutAll(entries, lifespan, max_idle) => {
+            conn.put_all(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                *lifespan,
+                *max_idle,
+            )
+            .await?;
+            Ok(OperationResult::PutAll)
+        }
     }
 }
 
@@ -514,6 +532,43 @@ impl HotRodCluster {
         match self.call_seed(Operation::Stats).await? {
             OperationResult::Stats(value) => Ok(value),
             _ => unreachable!("Operation::Stats always yields OperationResult::Stats"),
+        }
+    }
+
+    /// Fetches every key in `keys` that exists, in one request to the seed
+    /// connection. There is no key to route by a single owner: the Propose
+    /// step for issue #41 chose the same answer already picked for
+    /// `size`/`clear`/`ping`/`stats` in issue #40, always the seed, over
+    /// splitting the batch client-side by owner.
+    pub async fn get_all(
+        &mut self,
+        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
+    ) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
+        match self.call_seed(Operation::GetAll(keys)).await? {
+            OperationResult::GetAll(value) => Ok(value),
+            _ => unreachable!("Operation::GetAll always yields OperationResult::GetAll"),
+        }
+    }
+
+    /// Writes every key/value pair in `entries` in one request to the seed
+    /// connection. Routed the same way as `get_all`, for the same reason.
+    pub async fn put_all(
+        &mut self,
+        entries: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
+        lifespan: Expiration,
+        max_idle: Expiration,
+    ) -> Result<()> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
+            .collect();
+        match self
+            .call_seed(Operation::PutAll(entries, lifespan, max_idle))
+            .await?
+        {
+            OperationResult::PutAll => Ok(()),
+            _ => unreachable!("Operation::PutAll always yields OperationResult::PutAll"),
         }
     }
 
@@ -1192,6 +1247,72 @@ mod tests {
         cluster.clear().await.expect("clear");
         cluster.ping().await.expect("ping");
         assert!(cluster.stats().await.expect("stats").is_empty());
+
+        seed_task.await.unwrap();
+    }
+
+    /// `get_all` and `put_all` have no single key to route by either, per
+    /// the Propose step in issue #41: same setup as
+    /// `size_clear_ping_and_stats_always_target_the_seed`, an owner address
+    /// that never accepts a connection, so a call routed there instead of
+    /// the seed would hang until the timeout rather than complete.
+    #[tokio::test]
+    async fn get_all_and_put_all_always_target_the_seed() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2F, "expected a GetAll request");
+            let count = read_vint(&mut stream).await.unwrap();
+            for _ in 0..count {
+                let _key = read_array(&mut stream).await.unwrap();
+            }
+            let mut resp = response_header(id, 0x30, 0x00);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2D, "expected a PutAll request");
+            let _time_units = stream.read_u8().await.unwrap();
+            let count = read_vint(&mut stream).await.unwrap();
+            for _ in 0..count {
+                let _key = read_array(&mut stream).await.unwrap();
+                let _value = read_array(&mut stream).await.unwrap();
+            }
+            let resp = response_header(id, 0x2E, 0x00);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let unreachable = unreachable_addr().await;
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: unreachable.ip().to_string(),
+                port: unreachable.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        assert!(cluster
+            .get_all([b"key".as_slice()])
+            .await
+            .expect("get_all")
+            .is_empty());
+        cluster
+            .put_all(
+                [(b"key".as_slice(), b"value".as_slice())],
+                Expiration::Default,
+                Expiration::Default,
+            )
+            .await
+            .expect("put_all");
 
         seed_task.await.unwrap();
     }

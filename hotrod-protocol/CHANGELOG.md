@@ -50,6 +50,13 @@ relying on server-side redirects.
   and `HotRodCluster`. On `HotRodCluster`, `contains_key` routes by the
   key's segment owner like `get` and `put` already do; the other four
   have no key to route by and always go to the seed connection.
+- `get_all` and `put_all` on `HotRodConnection` and `HotRodCluster`, each
+  fetching or writing several keys in one request. No batch size limit is
+  enforced: the caller is responsible for not handing over more entries
+  than `wire::MAX_ARRAY_LEN` and the server can accept in one frame. On
+  `HotRodCluster`, both always target the seed connection, the same
+  routing already chosen for `size`/`clear`/`ping`/`stats`, rather than
+  splitting the batch client-side by segment owner.
 
 ### Changed
 

@@ -36,6 +36,8 @@ pub(crate) enum OpCode {
     AuthMechList = 0x21,
     Auth = 0x23,
     Size = 0x29,
+    PutAll = 0x2D,
+    GetAll = 0x2F,
 }
 
 impl OpCode {

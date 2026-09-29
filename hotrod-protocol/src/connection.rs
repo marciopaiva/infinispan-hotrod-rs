@@ -32,7 +32,7 @@ use crate::header::{read_response_header, write_request_header, OpCode};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::topology::{ClientIntelligence, TopologyUpdate};
-use crate::varint::read_vint;
+use crate::varint::{read_vint, write_vint};
 use crate::wire::{
     read_array, read_string, read_string_map, skip_media_type, write_array,
     write_expiration_params, Expiration,
@@ -527,6 +527,72 @@ impl HotRodConnection {
         .await
     }
 
+    /// Fetches every key in `keys` that exists, in one request. A key with
+    /// no entry is simply missing from the result map, the same as `get`
+    /// returning `None` for it.
+    ///
+    /// No batch size limit is enforced here: the caller is responsible for
+    /// not handing over more entries than `wire::MAX_ARRAY_LEN` and the
+    /// server can accept in one frame.
+    pub async fn get_all(
+        &mut self,
+        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
+    ) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let timeout = self.timeout;
+        with_timeout(timeout, async {
+            let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
+            let mut body = Vec::new();
+            write_vint(&mut body, keys.len() as u32);
+            for key in &keys {
+                write_array(&mut body, key);
+            }
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::GetAll, &body)
+                .await?;
+
+            let size = read_vint(&mut self.stream).await?;
+            let mut result = HashMap::new();
+            for _ in 0..size {
+                let key = read_array(&mut self.stream).await?;
+                let value = read_array(&mut self.stream).await?;
+                result.insert(key, value);
+            }
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Writes every key/value pair in `entries` in one request, all sharing
+    /// the same `lifespan`/`max_idle`.
+    ///
+    /// Same absence of a batch size limit as `get_all`.
+    pub async fn put_all(
+        &mut self,
+        entries: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
+        lifespan: Expiration,
+        max_idle: Expiration,
+    ) -> Result<()> {
+        let timeout = self.timeout;
+        with_timeout(timeout, async {
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+                .into_iter()
+                .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
+                .collect();
+            let mut body = Vec::new();
+            write_expiration_params(&mut body, lifespan, max_idle);
+            write_vint(&mut body, entries.len() as u32);
+            for (key, value) in &entries {
+                write_array(&mut body, key);
+                write_array(&mut body, value);
+            }
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::PutAll, &body)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Mirrors `GetWithMetadataOperation.readMetadataValue`: flags select
     /// which timestamp/duration pairs are present, then an 8-byte version
     /// and the value always follow. Timestamps and durations are consumed
@@ -847,6 +913,79 @@ mod tests {
         assert_eq!(stats.get("currentNumberOfEntries"), Some(&"3".to_string()));
         assert_eq!(stats.get("timeSinceStart"), Some(&"120".to_string()));
         assert_eq!(stats.len(), 2);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_all_returns_only_the_keys_the_server_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request(&mut stream).await;
+            assert_eq!(opcode, 0x2F, "expected a GetAll request");
+            let count = crate::varint::read_vint(&mut stream).await.unwrap();
+            let mut keys = Vec::new();
+            for _ in 0..count {
+                keys.push(read_array(&mut stream).await.unwrap());
+            }
+            assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+
+            let mut resp = response_header(id, 0x30, 0x00);
+            write_vint(&mut resp, 1);
+            write_array(&mut resp, b"a");
+            write_array(&mut resp, b"value-a");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+        let result = conn
+            .get_all([b"a".as_slice(), b"b".as_slice()])
+            .await
+            .expect("get_all");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get(b"a".as_slice()), Some(&b"value-a".to_vec()));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_all_completes_on_a_bare_success_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request(&mut stream).await;
+            assert_eq!(opcode, 0x2D, "expected a PutAll request");
+            let _time_units = stream.read_u8().await.unwrap();
+            let count = crate::varint::read_vint(&mut stream).await.unwrap();
+            let mut entries = Vec::new();
+            for _ in 0..count {
+                let key = read_array(&mut stream).await.unwrap();
+                let value = read_array(&mut stream).await.unwrap();
+                entries.push((key, value));
+            }
+            assert_eq!(entries, vec![(b"a".to_vec(), b"1".to_vec())]);
+
+            let resp = response_header(id, 0x2E, 0x00);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+        conn.put_all(
+            [(b"a".as_slice(), b"1".as_slice())],
+            Expiration::Default,
+            Expiration::Default,
+        )
+        .await
+        .expect("put_all");
 
         server.await.unwrap();
     }
