@@ -60,6 +60,12 @@ relying on server-side redirects.
 - `remove_all` on `HotRodConnection` and `HotRodCluster`, removing several
   keys in one request. Same absence of a batch size limit, and the same
   always-the-seed routing on `HotRodCluster`, as `get_all`/`put_all`.
+- `VersionedValue`, returned by `get_with_version`, now carries the entry's
+  full metadata alongside the value and version: `created`, `lifespan`,
+  `last_used` and `max_idle`. `lifespan` and `max_idle` reuse the existing
+  `Expiration` type; `created` and `last_used` are `None` exactly when the
+  corresponding side is immortal, since the server never sends a timestamp
+  for a half of the entry that does not expire.
 
 ### Changed
 
