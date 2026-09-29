@@ -90,21 +90,36 @@ struct ClusterTopology {
     resolved_addrs: HashMap<u32, SocketAddr>,
 }
 
+/// A pooled connection together with the topology server it was opened
+/// for. `origin` is `None` for the initial seed connection, opened before
+/// any topology update has arrived, and `Some` for a connection opened to
+/// a computed owner. `record_topology_update` compares `origin` against
+/// each new update's server list to evict a connection whose node has
+/// left the cluster, without re-resolving any hostname to do it.
+struct PooledConnection {
+    origin: Option<TopologyServer>,
+    conn: HotRodConnection,
+}
+
 /// A cache client that tracks cluster topology and routes each operation to
 /// the segment's primary owner instead of relying on server-side
 /// redirects, matching the Java client's intelligent routing.
 ///
 /// Bound to one cache, like `HotRodConnection`. A single instance keeps one
-/// pooled connection per node it has needed to talk to so far.
+/// pooled connection per node it has needed to talk to so far, up to the
+/// number of nodes in the latest topology: `record_topology_update` drops
+/// any pooled connection to a node that topology no longer lists.
 pub struct HotRodCluster {
     cache_name: String,
     /// The seed this instance is currently connected to; also the fallback
     /// used before a topology has arrived and the retry target when a
-    /// computed owner's connection fails.
+    /// computed owner's connection fails. Never evicted by a topology
+    /// update, even if this address stops being listed: it is the last
+    /// resort every retry falls back to.
     active_seed_addr: SocketAddr,
     topology_id: i32,
     topology: Option<ClusterTopology>,
-    connections: HashMap<SocketAddr, HotRodConnection>,
+    connections: HashMap<SocketAddr, PooledConnection>,
     auth: Option<AuthMethod>,
     timeout: Duration,
 }
@@ -194,7 +209,7 @@ impl HotRodCluster {
             {
                 Ok(conn) => {
                     let mut connections = HashMap::new();
-                    connections.insert(addr, conn);
+                    connections.insert(addr, PooledConnection { origin: None, conn });
                     return Ok(Self {
                         cache_name: cache_name.to_string(),
                         active_seed_addr: addr,
@@ -260,10 +275,11 @@ impl HotRodCluster {
 
     async fn authenticate_with(&mut self, method: AuthMethod) -> Result<()> {
         let seed = self.active_seed_addr;
-        let conn = self
+        let conn = &mut self
             .connections
             .get_mut(&seed)
-            .expect("connect() always leaves the seed connection in the pool");
+            .expect("connect() always leaves the seed connection in the pool")
+            .conn;
         method.authenticate(conn).await?;
         self.auth = Some(method);
         Ok(())
@@ -378,14 +394,14 @@ impl HotRodCluster {
     /// from the pool and `op` is retried once against the seed connection;
     /// any other error, or a second failure, is returned as is.
     async fn call(&mut self, key: &[u8], op: Operation) -> Result<OperationResult> {
-        let addr = self.owner_addr(key).await?;
-        self.ensure_connection(addr).await?;
+        let (addr, origin) = self.owner_addr(key).await?;
+        self.ensure_connection(addr, origin).await?;
         let outcome = {
-            let conn = self
+            let pooled = self
                 .connections
                 .get_mut(&addr)
                 .expect("ensure_connection just inserted it");
-            run_operation(conn, &op).await
+            run_operation(&mut pooled.conn, &op).await
         };
         let err = match outcome {
             Ok(value) => {
@@ -403,12 +419,12 @@ impl HotRodCluster {
         }
 
         let seed = self.active_seed_addr;
-        self.ensure_connection(seed).await?;
-        let conn = self
+        self.ensure_connection(seed, None).await?;
+        let pooled = self
             .connections
             .get_mut(&seed)
             .expect("ensure_connection just inserted it");
-        match run_operation(conn, &op).await {
+        match run_operation(&mut pooled.conn, &op).await {
             Ok(value) => {
                 self.record_topology_update(seed);
                 Ok(value)
@@ -422,14 +438,18 @@ impl HotRodCluster {
         }
     }
 
-    /// The address to route `key` to: the segment's primary owner once a
-    /// topology is known, otherwise the seed connection.
-    async fn owner_addr(&mut self, key: &[u8]) -> Result<SocketAddr> {
+    /// The address to route `key` to, and the topology server it came
+    /// from: the segment's primary owner once a topology is known,
+    /// otherwise the seed connection with no origin. The origin is what
+    /// `record_topology_update` later checks a new update's server list
+    /// against, so it must be `None` exactly when the address is
+    /// `active_seed_addr`.
+    async fn owner_addr(&mut self, key: &[u8]) -> Result<(SocketAddr, Option<TopologyServer>)> {
         let Some(topology) = &self.topology else {
-            return Ok(self.active_seed_addr);
+            return Ok((self.active_seed_addr, None));
         };
         if topology.segment_owners.is_empty() {
-            return Ok(self.active_seed_addr);
+            return Ok((self.active_seed_addr, None));
         }
         let segment = hash::segment(
             key,
@@ -437,24 +457,30 @@ impl HotRodCluster {
             topology.hash_function_version,
         )?;
         let Some(&primary) = topology.segment_owners[segment as usize].first() else {
-            return Ok(self.active_seed_addr);
+            return Ok((self.active_seed_addr, None));
         };
-        if let Some(&addr) = topology.resolved_addrs.get(&primary) {
-            return Ok(addr);
-        }
         // Safe: `topology::read_topology_update` rejects any owner index
         // that is out of range for `servers` before this type is built.
         let server = topology.servers[primary as usize].clone();
+        if let Some(&addr) = topology.resolved_addrs.get(&primary) {
+            return Ok((addr, Some(server)));
+        }
         let addr = resolve_server_addr(&server).await?;
         if let Some(topology) = self.topology.as_mut() {
             topology.resolved_addrs.insert(primary, addr);
         }
-        Ok(addr)
+        Ok((addr, Some(server)))
     }
 
     /// Opens and authenticates a pooled connection to `addr` if one is not
-    /// already there.
-    async fn ensure_connection(&mut self, addr: SocketAddr) -> Result<()> {
+    /// already there. `origin` is the topology server `addr` was resolved
+    /// from, stored alongside the connection for `record_topology_update`
+    /// to check later; pass `None` for the seed or a retry fallback.
+    async fn ensure_connection(
+        &mut self,
+        addr: SocketAddr,
+        origin: Option<TopologyServer>,
+    ) -> Result<()> {
         if self.connections.contains_key(&addr) {
             return Ok(());
         }
@@ -468,20 +494,36 @@ impl HotRodCluster {
         if let Some(auth) = &self.auth {
             auth.authenticate(&mut conn).await?;
         }
-        self.connections.insert(addr, conn);
+        self.connections
+            .insert(addr, PooledConnection { origin, conn });
         Ok(())
     }
 
     /// Applies whatever topology update the connection at `addr` parsed
-    /// from its last response, if any.
+    /// from its last response, if any, and reconciles the pool against it:
+    /// a pooled connection whose origin server is no longer listed has
+    /// left the cluster, and is dropped rather than kept open forever. No
+    /// hostname is re-resolved to do this: `origin` is compared to the
+    /// update's servers by value, and the seed connection is always kept
+    /// regardless, since it is the permanent retry fallback.
     fn record_topology_update(&mut self, addr: SocketAddr) {
-        let Some(conn) = self.connections.get_mut(&addr) else {
+        let Some(pooled) = self.connections.get_mut(&addr) else {
             return;
         };
-        let Some(update) = conn.take_pending_topology_update() else {
+        let Some(update) = pooled.conn.take_pending_topology_update() else {
             return;
         };
         self.topology_id = update.topology_id as i32;
+
+        let seed = self.active_seed_addr;
+        self.connections.retain(|&addr, pooled| {
+            addr == seed
+                || pooled
+                    .origin
+                    .as_ref()
+                    .is_none_or(|origin| update.servers.contains(origin))
+        });
+
         self.topology = Some(ClusterTopology {
             servers: update.servers,
             hash_function_version: update.hash_function_version,
@@ -584,7 +626,7 @@ mod tests {
             resolved_addrs: HashMap::new(),
         });
 
-        let first = cluster.owner_addr(b"key").await.expect("first resolution");
+        let (first, _origin) = cluster.owner_addr(b"key").await.expect("first resolution");
         assert_eq!(first, addr);
 
         // Break the hostname on the topology directly: if `owner_addr`
@@ -593,7 +635,7 @@ mod tests {
         cluster.topology.as_mut().unwrap().servers[0].host =
             "this-hostname-does-not-resolve.invalid".to_string();
 
-        let second = cluster.owner_addr(b"key").await.expect("cached resolution");
+        let (second, _origin) = cluster.owner_addr(b"key").await.expect("cached resolution");
         assert_eq!(second, addr);
     }
 
@@ -732,6 +774,103 @@ mod tests {
         assert_eq!(result, None);
 
         seed_task.await.unwrap();
+        owner_task.await.unwrap();
+    }
+
+    /// Same shape as `response_header`, but with the topology marker set and
+    /// a topology update payload appended, encoded the way
+    /// `topology::read_topology_update` expects: a vInt topology id, a
+    /// vInt-counted server list (vInt-prefixed host, then a raw big-endian
+    /// port), a hash function version byte, and a vInt-counted segment list
+    /// naming owners by index into that server list.
+    fn response_header_with_topology(
+        message_id: u64,
+        opcode: u8,
+        status: u8,
+        servers: &[(&str, u16)],
+    ) -> Vec<u8> {
+        let mut buf = vec![0xA1];
+        write_vlong(&mut buf, message_id);
+        buf.push(opcode);
+        buf.push(status);
+        buf.push(1); // topology update follows
+
+        write_vint(&mut buf, 9); // new topology id
+        write_vint(&mut buf, servers.len() as u32);
+        for (host, port) in servers {
+            write_array(&mut buf, host.as_bytes());
+            buf.extend_from_slice(&port.to_be_bytes());
+        }
+        buf.push(3); // hash function version
+        write_vint(&mut buf, 1); // one segment
+        buf.push(1); // one owner
+        write_vint(&mut buf, 0); // server 0 owns it
+
+        buf
+    }
+
+    #[tokio::test]
+    async fn record_topology_update_evicts_a_pooled_connection_to_a_node_no_longer_listed() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = owner_listener.local_addr().unwrap();
+        let owner_task = tokio::spawn(async move {
+            let (mut stream, _) = owner_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+
+            // The new topology drops the owner itself, listing only the
+            // seed: the node this connection was opened for has left the
+            // cluster.
+            let resp = response_header_with_topology(
+                id,
+                0x04,
+                0x02, // KEY_DOES_NOT_EXIST
+                &[(&seed_addr.ip().to_string(), seed_addr.port())],
+            );
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+
+        cluster.topology = Some(ClusterTopology {
+            servers: vec![TopologyServer {
+                host: owner_addr.ip().to_string(),
+                port: owner_addr.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0]],
+            resolved_addrs: HashMap::new(),
+        });
+
+        let result = cluster.get(b"key").await.expect("get against owner");
+        assert_eq!(result, None);
+
+        assert!(
+            cluster.connections.contains_key(&seed_addr),
+            "the seed connection must never be evicted"
+        );
+        assert!(
+            !cluster.connections.contains_key(&owner_addr),
+            "the owner connection must be evicted once its node leaves the topology"
+        );
+        assert_eq!(
+            cluster.topology.as_ref().unwrap().servers,
+            vec![TopologyServer {
+                host: seed_addr.ip().to_string(),
+                port: seed_addr.port(),
+            }]
+        );
+
         owner_task.await.unwrap();
     }
 }

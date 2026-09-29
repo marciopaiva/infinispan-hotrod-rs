@@ -64,6 +64,12 @@ relying on server-side redirects.
 - `HotRodCluster` no longer re-resolves a segment owner's hostname on
   every call. The resolved address is now cached per topology and only
   redone once a new topology update replaces it.
+- `HotRodCluster` no longer keeps a pooled connection open forever once
+  its node leaves the cluster. Each pooled connection now remembers the
+  topology server it was opened for, and `record_topology_update` drops
+  any connection whose server is missing from the latest update, without
+  re-resolving any hostname to check. The seed connection is exempt: it
+  is the permanent fallback every retry falls back to.
 
 ### Documented
 
