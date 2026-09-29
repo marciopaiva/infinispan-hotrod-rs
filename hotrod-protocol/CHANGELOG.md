@@ -89,6 +89,13 @@ relying on server-side redirects.
   in that state is not evicted, since `call` only does so on an
   `Error::Io` or `Error::Timeout` return value, which a dropped future
   never produces.
+- `HotRodCluster`'s module and struct docs now state explicitly that
+  every operation takes `&mut self`, so one instance serializes all its
+  operations, even ones routed to different nodes. This is more
+  restrictive than `HotRodConnection`'s own one-request-at-a-time model,
+  and was previously undocumented. A caller that wants operations
+  against different nodes to run concurrently needs one `HotRodCluster`
+  instance per task, not one shared behind a lock.
 
 ### Tested
 
