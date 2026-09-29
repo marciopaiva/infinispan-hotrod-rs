@@ -16,6 +16,14 @@
 //! externally before it resolves never returns anything, so the poisoned
 //! connection stays in the pool and is handed to the next call routed to
 //! the same owner instead of being reconnected.
+//!
+//! Every operation takes `&mut self`, so one `HotRodCluster` instance runs
+//! its operations one at a time, even when they route to different nodes.
+//! This is more restrictive than `HotRodConnection`'s own one-request-at-a-
+//! time model, which only serializes per connection. A caller that wants
+//! operations against different nodes to run concurrently needs multiple
+//! `HotRodCluster` instances, each bound to the same seeds, rather than one
+//! instance shared behind a lock.
 
 use std::collections::hash_map;
 use std::collections::HashMap;
@@ -110,6 +118,12 @@ struct PooledConnection {
 /// pooled connection per node it has needed to talk to so far, up to the
 /// number of nodes in the latest topology: `record_topology_update` drops
 /// any pooled connection to a node that topology no longer lists.
+///
+/// Every method takes `&mut self`, so one instance runs its operations one
+/// at a time regardless of which node each is routed to: sharing a single
+/// instance across concurrent tasks serializes them all. For operations
+/// against different nodes to run concurrently, use one `HotRodCluster`
+/// instance per task instead of sharing one.
 pub struct HotRodCluster {
     cache_name: String,
     /// The seed this instance is currently connected to; also the fallback
