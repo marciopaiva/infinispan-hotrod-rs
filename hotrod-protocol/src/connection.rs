@@ -18,6 +18,13 @@
 //! that resolves another branch first, or an aborted task all have the
 //! same effect as `Error::Timeout`: the connection must be reconnected,
 //! never reused.
+//!
+//! This is enforced, not just documented: every operation marks the
+//! connection poisoned before it writes its request, and clears that mark
+//! only once the response has been read in full. A future dropped before
+//! that point leaves the mark set, and every later operation on the same
+//! connection then fails fast with `Error::PoisonedConnection` instead of
+//! touching an already desynced stream.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -53,6 +60,16 @@ pub(crate) const DEFAULT_TOPOLOGY_ID: i32 = -1;
 /// looser bound. See `Error::Timeout` for what happens to a connection
 /// after one fires.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Safety ceiling on the number of entries `get_all`/`put_all` accept in
+/// one call, checked before a single byte is written. This is not a
+/// protocol limit either: a real Hot Rod server enforces its own maximum
+/// frame size and rejects whatever does not fit, but that rejection would
+/// arrive only after this client already built and sent a frame that could
+/// be gigabytes long, for a request that was always going to fail. A
+/// caller with more entries than this needs several smaller calls instead,
+/// the same way `get`/`put` scale to many keys today.
+pub const MAX_BULK_ENTRIES: usize = 100_000;
 
 /// Races `fut` against `timeout`, turning an elapsed deadline into
 /// `Error::Timeout` instead of leaving the caller to wait forever.
@@ -105,6 +122,9 @@ pub struct HotRodConnection {
     /// Cleared by `take_pending_topology_update`.
     pending_topology_update: Option<TopologyUpdate>,
     timeout: Duration,
+    /// Set before a request is written, cleared only once its response has
+    /// been read in full. See the module docs for what this guards against.
+    poisoned: bool,
 }
 
 impl HotRodConnection {
@@ -177,7 +197,39 @@ impl HotRodConnection {
             topology_id,
             pending_topology_update: None,
             timeout,
+            poisoned: false,
         })
+    }
+
+    /// `true` once a prior operation left this connection with a possible
+    /// partial frame in flight and every further operation is refusing to
+    /// run. `HotRodCluster` checks this before handing a pooled connection
+    /// to the next operation, instead of waiting to see whether that
+    /// operation happens to come back with an error.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Refuses to start a new operation over a connection a prior one left
+    /// poisoned, then marks the connection poisoned itself. Cleared only by
+    /// `end_operation(true)`, once the new operation's response has been
+    /// read in full.
+    fn begin_operation(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::PoisonedConnection);
+        }
+        self.poisoned = true;
+        Ok(())
+    }
+
+    /// Clears the poisoned mark `begin_operation` set, but only when
+    /// `succeeded` is true: an operation that failed partway through
+    /// reading its response leaves the connection poisoned, since the exact
+    /// byte position the stream stopped at is unknown.
+    fn end_operation(&mut self, succeeded: bool) {
+        if succeeded {
+            self.poisoned = false;
+        }
     }
 
     /// Returns the topology update parsed from the most recently completed
@@ -247,8 +299,9 @@ impl HotRodConnection {
     /// responses and feeding back challenges until the server marks the
     /// exchange complete.
     async fn run_sasl(&mut self, mut mechanism: impl SaslMechanism) -> Result<()> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let empty_cache_name: Vec<u8> = Vec::new();
 
             self.write_and_read_header(&empty_cache_name, OpCode::AuthMechList, &[])
@@ -284,12 +337,15 @@ impl HotRodConnection {
                 challenge = Some(bytes);
             }
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_array(&mut body, key);
             let cache_name = self.cache_name.clone();
@@ -301,7 +357,9 @@ impl HotRodConnection {
             }
             Ok(Some(read_array(&mut self.stream).await?))
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     pub async fn put(
@@ -311,15 +369,18 @@ impl HotRodConnection {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let body = key_value_body(key, value, lifespan, max_idle);
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Put, &body)
                 .await?;
             Ok(())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Returns `true` if the entry was stored, `false` if the key already
@@ -331,8 +392,9 @@ impl HotRodConnection {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<bool> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let body = key_value_body(key, value, lifespan, max_idle);
             let cache_name = self.cache_name.clone();
             let (_message_id, header) = self
@@ -340,7 +402,9 @@ impl HotRodConnection {
                 .await?;
             Ok(!header.status.is_not_executed())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Returns `true` if the key existed and was replaced, `false` if it
@@ -352,8 +416,9 @@ impl HotRodConnection {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<bool> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let body = key_value_body(key, value, lifespan, max_idle);
             let cache_name = self.cache_name.clone();
             let (_message_id, header) = self
@@ -361,14 +426,17 @@ impl HotRodConnection {
                 .await?;
             Ok(!header.status.is_not_executed())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Returns `true` if the key existed and was removed, `false` if it did
     /// not exist.
     pub async fn remove(&mut self, key: &[u8]) -> Result<bool> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_array(&mut body, key);
             let cache_name = self.cache_name.clone();
@@ -377,7 +445,9 @@ impl HotRodConnection {
                 .await?;
             Ok(!header.status.is_not_exist())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Fetches a value together with its entry version, for use in a later
@@ -385,8 +455,9 @@ impl HotRodConnection {
     /// entry's full metadata (creation and last-used time, lifespan and
     /// max idle).
     pub async fn get_with_version(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_array(&mut body, key);
             let cache_name = self.cache_name.clone();
@@ -398,7 +469,9 @@ impl HotRodConnection {
             }
             self.read_versioned_value().await.map(Some)
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Replaces the value only if the entry's current version still matches
@@ -411,8 +484,9 @@ impl HotRodConnection {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<VersionedResult> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_array(&mut body, key);
             write_expiration_params(&mut body, lifespan, max_idle);
@@ -425,7 +499,9 @@ impl HotRodConnection {
                 .await?;
             Ok(versioned_result(header.status))
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Removes the entry only if its current version still matches
@@ -435,8 +511,9 @@ impl HotRodConnection {
         key: &[u8],
         version: u64,
     ) -> Result<VersionedResult> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_array(&mut body, key);
             body.extend_from_slice(&version.to_be_bytes());
@@ -447,7 +524,9 @@ impl HotRodConnection {
                 .await?;
             Ok(versioned_result(header.status))
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Checks the server is reachable and the connection's handshake still
@@ -460,8 +539,9 @@ impl HotRodConnection {
     /// versions, but it is still read off the wire to keep the stream in
     /// sync for the next request.
     pub async fn ping(&mut self) -> Result<()> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Ping, &[])
                 .await?;
@@ -474,34 +554,42 @@ impl HotRodConnection {
             }
             Ok(())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// The number of entries in the cache. The server computes this
     /// cluster-wide from a single request; the client does no fan-out of
     /// its own.
     pub async fn size(&mut self) -> Result<u32> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Size, &[])
                 .await?;
             read_vint(&mut self.stream).await
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Removes every entry from the cache, cluster-wide. Like `size`, the
     /// server fans this out itself.
     pub async fn clear(&mut self) -> Result<()> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Clear, &[])
                 .await?;
             Ok(())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Returns `true` if `key` exists in the cache.
@@ -512,8 +600,9 @@ impl HotRodConnection {
     /// exactly even though the two statuses this operation can return
     /// never make them disagree today.
     pub async fn contains_key(&mut self, key: &[u8]) -> Result<bool> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_array(&mut body, key);
             let cache_name = self.cache_name.clone();
@@ -522,7 +611,9 @@ impl HotRodConnection {
                 .await?;
             Ok(header.status.is_success() && !header.status.is_not_exist())
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Per-node statistics as name/value string pairs
@@ -530,30 +621,41 @@ impl HotRodConnection {
     /// cluster by the protocol: it reflects only the node this connection
     /// is open to.
     pub async fn stats(&mut self) -> Result<HashMap<String, String>> {
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
+        let result = with_timeout(timeout, async {
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Stats, &[])
                 .await?;
             read_string_map(&mut self.stream).await
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Fetches every key in `keys` that exists, in one request. A key with
     /// no entry is simply missing from the result map, the same as `get`
     /// returning `None` for it.
     ///
-    /// No batch size limit is enforced here: the caller is responsible for
-    /// not handing over more entries than `wire::MAX_ARRAY_LEN` and the
-    /// server can accept in one frame.
+    /// Returns `Error::BatchTooLarge` without writing anything if `keys` has
+    /// more than `MAX_BULK_ENTRIES` entries. A caller with more keys than
+    /// that needs several smaller calls instead.
     pub async fn get_all(
         &mut self,
         keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
     ) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
+        if keys.len() > MAX_BULK_ENTRIES {
+            return Err(Error::BatchTooLarge {
+                what: "get_all",
+                len: keys.len(),
+                max: MAX_BULK_ENTRIES,
+            });
+        }
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
-            let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_vint(&mut body, keys.len() as u32);
             for key in &keys {
@@ -572,25 +674,35 @@ impl HotRodConnection {
             }
             Ok(result)
         })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Writes every key/value pair in `entries` in one request, all sharing
     /// the same `lifespan`/`max_idle`.
     ///
-    /// Same absence of a batch size limit as `get_all`.
+    /// Same `MAX_BULK_ENTRIES` ceiling as `get_all`, checked the same way.
     pub async fn put_all(
         &mut self,
         entries: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
+            .collect();
+        if entries.len() > MAX_BULK_ENTRIES {
+            return Err(Error::BatchTooLarge {
+                what: "put_all",
+                len: entries.len(),
+                max: MAX_BULK_ENTRIES,
+            });
+        }
+        self.begin_operation()?;
         let timeout = self.timeout;
-        with_timeout(timeout, async {
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = entries
-                .into_iter()
-                .map(|(key, value)| (key.as_ref().to_vec(), value.as_ref().to_vec()))
-                .collect();
+        let result = with_timeout(timeout, async {
             let mut body = Vec::new();
             write_expiration_params(&mut body, lifespan, max_idle);
             write_vint(&mut body, entries.len() as u32);
@@ -603,32 +715,9 @@ impl HotRodConnection {
                 .await?;
             Ok(())
         })
-        .await
-    }
-
-    /// Removes every key in `keys` that exists, in one request. A key with
-    /// no entry is simply skipped, the same as `remove` returning `false`
-    /// for it.
-    ///
-    /// Same absence of a batch size limit as `get_all`.
-    pub async fn remove_all(
-        &mut self,
-        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
-    ) -> Result<()> {
-        let timeout = self.timeout;
-        with_timeout(timeout, async {
-            let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.as_ref().to_vec()).collect();
-            let mut body = Vec::new();
-            write_vint(&mut body, keys.len() as u32);
-            for key in &keys {
-                write_array(&mut body, key);
-            }
-            let cache_name = self.cache_name.clone();
-            self.write_and_read_header(&cache_name, OpCode::RemoveAll, &body)
-                .await?;
-            Ok(())
-        })
-        .await
+        .await;
+        self.end_operation(result.is_ok());
+        result
     }
 
     /// Mirrors `GetWithMetadataOperation.readMetadataValue`: flags select
@@ -777,6 +866,37 @@ mod tests {
         let result = conn.get(b"key").await;
 
         assert!(matches!(result, Err(Error::Timeout(_))));
+    }
+
+    /// A timeout leaves the connection poisoned: a following operation must
+    /// fail immediately with `Error::PoisonedConnection`, never touching
+    /// the network, rather than reading from a stream that may still have
+    /// the earlier request's response landing on it mid-frame.
+    #[tokio::test]
+    async fn operation_after_a_timeout_fails_fast_instead_of_reusing_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let mut conn = HotRodConnection::connect_with_timeout(addr, "", Duration::from_millis(100))
+            .await
+            .expect("connect should succeed even though the server stays silent");
+
+        let first = conn.get(b"key").await;
+        assert!(matches!(first, Err(Error::Timeout(_))));
+
+        let start = tokio::time::Instant::now();
+        let second = conn.get(b"key").await;
+
+        assert!(matches!(second, Err(Error::PoisonedConnection)));
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "a poisoned connection should fail immediately, not wait out another timeout"
+        );
     }
 
     #[tokio::test]
@@ -1048,36 +1168,6 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn remove_all_completes_on_a_bare_success_status() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (id, opcode) = read_request(&mut stream).await;
-            assert_eq!(opcode, 0x45, "expected a RemoveAll request");
-            let count = crate::varint::read_vint(&mut stream).await.unwrap();
-            let mut keys = Vec::new();
-            for _ in 0..count {
-                keys.push(read_array(&mut stream).await.unwrap());
-            }
-            assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
-
-            let resp = response_header(id, 0x46, 0x00);
-            stream.write_all(&resp).await.unwrap();
-        });
-
-        let mut conn = HotRodConnection::connect(addr, "my-cache")
-            .await
-            .expect("connect");
-        conn.remove_all([b"a".as_slice(), b"b".as_slice()])
-            .await
-            .expect("remove_all");
-
-        server.await.unwrap();
-    }
-
     /// One half of the entry has a finite duration, the other is immortal,
     /// so both branches of `read_versioned_value` run in the same test.
     #[tokio::test]
@@ -1121,5 +1211,61 @@ mod tests {
         assert_eq!(result.max_idle, Expiration::Immortal);
 
         server.await.unwrap();
+    }
+
+    /// The oversized-batch check must reject the call before a single byte
+    /// reaches the network: the listener below accepts a connection and then
+    /// does nothing else, so this test would hang if `get_all` tried to read
+    /// a response instead of failing fast on the length check.
+    #[tokio::test]
+    async fn get_all_rejects_a_batch_over_the_limit_without_touching_the_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+
+        let keys = vec![b"key".to_vec(); MAX_BULK_ENTRIES + 1];
+        let result = conn.get_all(keys).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::BatchTooLarge {
+                what: "get_all",
+                len,
+                max: MAX_BULK_ENTRIES,
+            }) if len == MAX_BULK_ENTRIES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn put_all_rejects_a_batch_over_the_limit_without_touching_the_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+
+        let entries = vec![(b"key".to_vec(), b"value".to_vec()); MAX_BULK_ENTRIES + 1];
+        let result = conn
+            .put_all(entries, Expiration::Default, Expiration::Default)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::BatchTooLarge {
+                what: "put_all",
+                len,
+                max: MAX_BULK_ENTRIES,
+            }) if len == MAX_BULK_ENTRIES + 1
+        ));
     }
 }

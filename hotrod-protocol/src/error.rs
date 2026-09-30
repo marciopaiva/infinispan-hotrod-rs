@@ -77,6 +77,27 @@ pub enum Error {
         max: u32,
     },
 
+    // Unlike `DeclaredLengthTooLarge`, this is not about an untrusted length
+    // the server sent, but about a caller's own `get_all`/`put_all` batch.
+    // Checking it before building the request avoids constructing and
+    // sending an oversized frame that the server was always going to
+    // reject anyway.
+    #[error("{what} has {len} entries, which exceeds this client's limit of {max}")]
+    BatchTooLarge {
+        what: &'static str,
+        len: usize,
+        max: usize,
+    },
+
+    // A corrupted or hostile stream could otherwise send an unbounded run
+    // of continuation bytes (the 0x80 bit set on every byte), shifting
+    // `result` past the target type's width: a panic with overflow checks
+    // on, or a silently wrong, masked value in release. The encoding never
+    // needs more than 5 bytes for a vInt or 10 for a vLong, the same bound
+    // the Java client enforces.
+    #[error("malformed varint: continuation bit still set after {max_bytes} bytes")]
+    MalformedVarint { max_bytes: u8 },
+
     /// Fires when a connect, or an operation's full write-then-read cycle,
     /// does not finish within the configured timeout. The connection this
     /// happened on may have an unwritten or unread partial protocol frame
@@ -90,6 +111,16 @@ pub enum Error {
     /// reason of its own.
     #[error("operation timed out after {0:?}")]
     Timeout(Duration),
+
+    /// A prior operation on this connection ended without its response
+    /// being read in full (`Error::Timeout`, or the operation's future
+    /// dropped before resolving for a reason of its own), so the stream may
+    /// have a partial frame in flight. `HotRodConnection` now enforces the
+    /// rule the two errors above only documented: it refuses every further
+    /// operation once this happens, instead of leaving a caller free to
+    /// reuse a connection that is silently desynced. Reconnect instead.
+    #[error("connection is poisoned by a prior operation that did not complete: reconnect instead of reusing it")]
+    PoisonedConnection,
 }
 
 /// Result alias for `hotrod_protocol::Error`.

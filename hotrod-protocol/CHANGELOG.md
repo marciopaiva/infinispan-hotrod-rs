@@ -4,6 +4,85 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-09-29
+
+### Added
+
+- `Error::BatchTooLarge` and the new `MAX_BULK_ENTRIES` constant (100,000).
+  `HotRodConnection::get_all`/`put_all` now reject a batch over that size
+  before writing anything, instead of building and sending a frame that
+  could grow unbounded with the caller's input and that a real server was
+  always going to reject once its own frame size limit kicked in.
+  `HotRodCluster::get_all`/`put_all` inherit the same ceiling, since both
+  delegate to the `HotRodConnection` methods.
+
+### Fixed
+
+- `read_vint`/`read_vlong` no longer loop forever on a continuation byte
+  run that never terminates. Each now stops after the number of bytes
+  the encoding can ever need (5 for a vInt, 10 for a vLong, the same
+  bound the Java client enforces) and returns `Error::MalformedVarint`
+  instead of shifting past the target type's width, which could panic
+  with overflow checks on or silently produce a wrong value in release.
+- `HotRodCluster` now fails over to the other seed addresses it was
+  constructed with once the active one stops responding, instead of
+  leaving `size`, `clear`, `ping`, `stats`, `get_all`, `put_all` and
+  every keyed operation broken for the lifetime of the instance.
+  `connect`/`connect_with_timeout` already failed over between seeds at
+  bootstrap; nothing repeated that afterward until now.
+- `HotRodCluster::authenticate_with` no longer panics once the seed
+  connection has been evicted from the pool by an earlier
+  `Error::Io`/`Error::Timeout` failure. It now reconnects the seed the
+  same way `call`/`ensure_connection` already do, instead of indexing
+  the pool directly and assuming the entry is still there.
+- The connection-poisoning rule the module docs on `HotRodConnection` and
+  `HotRodCluster` already described is now enforced instead of merely
+  documented. `HotRodConnection` marks itself poisoned before writing a
+  request and clears the mark only once the response has been read in
+  full; a future dropped before that point, for `Error::Timeout` or any
+  other reason, leaves the mark set, and every later operation on that
+  connection then fails fast with the new `Error::PoisonedConnection`
+  instead of reading from a stream that may still have a partial frame
+  in flight. `HotRodCluster::ensure_connection` checks a pooled
+  connection's poisoned mark directly before handing it to the next
+  operation, evicting and reconnecting it first if needed, rather than
+  only reacting to whatever `Error::Io`/`Error::Timeout` an operation
+  happens to return.
+
+### Removed
+
+- `remove_all` on `HotRodConnection` and `HotRodCluster`. It sent opcode
+  `0x45`, which does not exist in the real Hot Rod protocol: there is no
+  bulk remove operation defined at all, which is also why the official
+  Java client has no public `removeAll(Set)`. A real server rejects the
+  request with `HotRodUnknownOperationException: Unknown operation 69`;
+  this had gone unnoticed since the unit tests for it ran only against a
+  fake in-process server that echoes back whatever opcode it is given. A
+  caller that needs the same effect can loop over `remove` for each key,
+  the same workaround the Java client itself relies on.
+
+### Documented
+
+- `HotRodCluster::get_all`/`put_all` now explain in their doc comments why
+  always routing to the seed connection, regardless of which node owns
+  each key, is a network-efficiency trade-off and not a correctness gap:
+  a distributed cache node forwards a request for a key it does not own to
+  the real owner over internal cluster RPC. Splitting the batch
+  client-side by owner was considered and rejected for this issue, as a
+  bigger change than a hardening fix warrants.
+
+### Tested
+
+- Live-server coverage for `contains_key`, `ping`, `size`, `clear`, `stats`,
+  `get_all` and `put_all`, on both `HotRodConnection` and `HotRodCluster`.
+  Every operation added since v0.3.0 previously had only unit-test coverage
+  against a fake in-process server that echoes back whatever opcode it is
+  given, the same gap that let the wrong `remove_all` opcode above pass
+  unnoticed until a real server rejected it. `tests/live_server.rs` now
+  serializes its tests behind a shared lock, since `clear` wipes the whole
+  cache and would otherwise race against another test's keys under cargo's
+  default parallel test execution.
+
 ## [0.3.0] - 2026-09-29
 
 Phase 3 of the roadmap, scoped down in
@@ -57,9 +136,6 @@ relying on server-side redirects.
   `HotRodCluster`, both always target the seed connection, the same
   routing already chosen for `size`/`clear`/`ping`/`stats`, rather than
   splitting the batch client-side by segment owner.
-- `remove_all` on `HotRodConnection` and `HotRodCluster`, removing several
-  keys in one request. Same absence of a batch size limit, and the same
-  always-the-seed routing on `HotRodCluster`, as `get_all`/`put_all`.
 - `VersionedValue`, returned by `get_with_version`, now carries the entry's
   full metadata alongside the value and version: `created`, `lifespan`,
   `last_used` and `max_idle`. `lifespan` and `max_idle` reuse the existing
