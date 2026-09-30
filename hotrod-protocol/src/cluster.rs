@@ -386,9 +386,14 @@ impl HotRodCluster {
     /// `call`/`call_seed` evict it on `Error::Io`/`Error::Timeout`, and a
     /// caller can re-authenticate (a token refresh, or a retry after an
     /// earlier `authenticate_*` failure) at any point afterward.
+    ///
+    /// Reconnecting goes through `ensure_connection_for_reauth`, not
+    /// `ensure_connection`: a freshly opened connection must not be
+    /// auto-authenticated with the old `self.auth` here, since `method` is
+    /// about to authenticate it, possibly with different credentials.
     async fn authenticate_with(&mut self, method: AuthMethod) -> Result<()> {
         let seed = self.active_seed_addr;
-        let conn = &mut self.ensure_connection(seed, None).await?.conn;
+        let conn = &mut self.ensure_connection_for_reauth(seed).await?.conn;
         method.authenticate(conn).await?;
         self.auth = Some(method);
         Ok(())
@@ -794,6 +799,30 @@ impl HotRodCluster {
         addr: SocketAddr,
         origin: Option<TopologyServer>,
     ) -> Result<&mut PooledConnection> {
+        self.ensure_connection_impl(addr, origin, true).await
+    }
+
+    /// Same as `ensure_connection`, but never replays `self.auth` onto a
+    /// freshly opened connection. `authenticate_with` uses this instead of
+    /// `ensure_connection` for the seed: it is about to authenticate that
+    /// connection with its own `method` right after, and replaying the old
+    /// `self.auth` first would apply stale credentials before that (which
+    /// defeats a token refresh if they have already expired) or leave the
+    /// connection authenticated twice in a row with two different methods,
+    /// which a real server is not guaranteed to accept.
+    async fn ensure_connection_for_reauth(
+        &mut self,
+        addr: SocketAddr,
+    ) -> Result<&mut PooledConnection> {
+        self.ensure_connection_impl(addr, None, false).await
+    }
+
+    async fn ensure_connection_impl(
+        &mut self,
+        addr: SocketAddr,
+        origin: Option<TopologyServer>,
+        replay_auth: bool,
+    ) -> Result<&mut PooledConnection> {
         if self
             .connections
             .get(&addr)
@@ -811,8 +840,10 @@ impl HotRodCluster {
                     self.timeout,
                 )
                 .await?;
-                if let Some(auth) = &self.auth {
-                    auth.authenticate(&mut conn).await?;
+                if replay_auth {
+                    if let Some(auth) = &self.auth {
+                        auth.authenticate(&mut conn).await?;
+                    }
                 }
                 Ok(entry.insert(PooledConnection { origin, conn }))
             }
@@ -1316,6 +1347,53 @@ mod tests {
             .authenticate_plain("", "user", "pass")
             .await
             .expect("authenticate should reconnect the evicted seed instead of panicking");
+
+        assert!(cluster.connections.contains_key(&seed_addr));
+
+        seed_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticate_with_does_not_replay_the_old_auth_after_reconnecting_the_evicted_seed() {
+        let old_response = b"\0user\0old-pass".to_vec();
+        let new_response = b"\0user\0new-pass".to_vec();
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let expected_old = old_response.clone();
+        let expected_new = new_response.clone();
+        let seed_task = tokio::spawn(async move {
+            // The initial connect(), authenticated with the old credentials.
+            let (mut first, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut first, &expected_old).await;
+
+            // The reconnect authenticate_with triggers once it finds the
+            // seed missing from the pool. Only the new credentials'
+            // handshake must arrive here: replaying the old ones first,
+            // before the new ones, is exactly the bug this test guards
+            // against.
+            let (mut second, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut second, &expected_new).await;
+        });
+
+        let mut cluster = HotRodCluster::connect(&[seed_addr], "my-cache")
+            .await
+            .expect("connect to seed");
+
+        cluster
+            .authenticate_plain("", "user", "old-pass")
+            .await
+            .expect("authenticate seed connection with the old credentials");
+
+        // Simulates an earlier operation failure evicting the seed
+        // connection from the pool, the same as `call`/`call_seed` do on
+        // Error::Io/Error::Timeout.
+        cluster.connections.remove(&seed_addr);
+
+        cluster
+            .authenticate_plain("", "user", "new-pass")
+            .await
+            .expect("authenticate with the new credentials, without replaying the old ones");
 
         assert!(cluster.connections.contains_key(&seed_addr));
 
