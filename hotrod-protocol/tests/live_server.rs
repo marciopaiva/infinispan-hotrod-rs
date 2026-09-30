@@ -10,6 +10,12 @@
 //! Connection details come from environment variables so the test can also
 //! be pointed at a local server, with defaults matching the CI fixture.
 //!
+//! The `tls_*` tests need a separate, TLS-enabled server instead, started
+//! with `ci/infinispan-tls/setup.sh` (which also generates the throwaway CA
+//! and keystore it uses) and torn down with `ci/infinispan-tls/teardown.sh`.
+//! Like the `cluster_*` tests, this fixture is not part of any CI workflow:
+//! see `docs/adr/0004-tls-support.md` for why.
+//!
 //! `clippy::await_holding_lock` is allowed crate-wide below: `LIVE_SERVER_LOCK`
 //! is a plain `std::sync::Mutex` held across `.await` on purpose. Each
 //! `#[tokio::test]` drives its own single-threaded runtime on its own OS
@@ -21,7 +27,7 @@
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-use hotrod_protocol::{Expiration, HotRodCluster, HotRodConnection, VersionedResult};
+use hotrod_protocol::{Expiration, HotRodCluster, HotRodConnection, TlsConfig, VersionedResult};
 
 /// Serializes every test in this file against the same live server. Most
 /// tests only touch their own keys and would be fine running concurrently,
@@ -75,6 +81,63 @@ async fn connect_with_digest() -> HotRodConnection {
     conn.authenticate_digest(&user, &pass)
         .await
         .expect("authenticate with DIGEST-SHA-256");
+    conn
+}
+
+/// A CA certificate this client never configures for the TLS test server,
+/// used only to prove that `connect_tls` actually rejects a chain it cannot
+/// verify. Its own key never touched disk; the cert is a throwaway,
+/// generated once and pasted in here.
+const UNRELATED_CA_CERTIFICATE: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDGTCCAgGgAwIBAgIUZB5emrA6SCcK5z6b5Ukr+Ve0Rm4wDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRdW5yZWxhdGVkLXRlc3QtY2EwHhcNMjYwOTMwMTAzNTM1
+WhcNMzYwOTI3MTAzNTM1WjAcMRowGAYDVQQDDBF1bnJlbGF0ZWQtdGVzdC1jYTCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANo5Zi1FqUvKzHustPXPpN43
+YlsI25HdAUK+5ZI6Dl6ZdWho1lZVE/K5LyTCx/SwwM14sJE1By6W6PieOFyEWOOu
+S9yf5OQY9k+Mk8Qe78BM5S9apPRaimwPGZmnpISglS43phpEyZAZ50B8Kut9GJVM
+/5tPlIAs8Cg7uFiFahli1xdkDZwPd+Mt07YdwWRYqvsXXVd3A8YBrK2Ml3mw5Mad
+uU7i919gk2pD0rrUAmBeoudo24ly/KeZujR+5W7eXzPM+kobs7tWr9f/Lj3tWBkM
+77//0Fx4easW6owzAmDNRUYa4v24qaRULL0CZAGTE6b/b4+LkSoTtM+8fv59/pUC
+AwEAAaNTMFEwHQYDVR0OBBYEFCgsLHQTo2hzYze07VBJEiNgNQSsMB8GA1UdIwQY
+MBaAFCgsLHQTo2hzYze07VBJEiNgNQSsMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBACoPr0xicslhscxFBzd5xWJlZ7KznFpC1v03XWMY+Ty7PPhD
+R+Epfu78QiiAiy5PcoU9NUkulznsU3lyX3ujGcJHr49FdPvkNMpWeDzeLzUMfszQ
+VJ8pnzToUaOJKOzZki7nC6dRS3IEztW8b7Zzt6RAQ9A6WEC/7ph2Wm8p3laBzpm/
+xhLTRCZPhzNq8xhHlhejFSxMIaNRsHCO2B5KWDxW5jSC3OJOJnR33BPHef6dLJ+N
+lZk3NhkV6entW8Oes/BPh0j9EFXhd3Ddam2wV6G8RpaP2pQGOssdrGm//w87a3bm
+G7ksyDhvKXPeDla1KJ3qp8ohl2FQuQbvuGG5tWw=
+-----END CERTIFICATE-----
+";
+
+/// Connection details for the TLS-enabled server started by
+/// `ci/infinispan-tls/setup.sh`, kept separate from the plain-TCP fixture
+/// since the two run on different ports with different certificates.
+fn tls_ca_certificate() -> Vec<u8> {
+    let path = env_or(
+        "INFINISPAN_TLS_CA_CERT",
+        "../ci/infinispan-tls/generated/ca-cert.pem",
+    );
+    std::fs::read(&path).unwrap_or_else(|err| {
+        panic!("read CA cert at {path} (run ci/infinispan-tls/setup.sh first): {err}")
+    })
+}
+
+async fn connect_tls() -> HotRodConnection {
+    let addr = env_or("INFINISPAN_TLS_ADDR", "127.0.0.1:21222");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+    let tls = TlsConfig {
+        server_name: env_or("INFINISPAN_TLS_SERVER_NAME", "localhost"),
+        ca_certificate: Some(tls_ca_certificate()),
+        client_identity: None,
+    };
+
+    let mut conn = HotRodConnection::connect_tls(&addr, "", &tls)
+        .await
+        .expect("connect_tls");
+    conn.authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
     conn
 }
 
@@ -247,6 +310,51 @@ async fn digest_authenticated_connection_can_put_get_remove() {
 
     let removed = conn.remove(b"ci-digest-key").await.expect("remove");
     assert!(removed);
+}
+
+/// Requires the TLS-enabled server from `ci/infinispan-tls/setup.sh`,
+/// separate from the plain-TCP fixture the other tests in this file use.
+#[tokio::test]
+#[ignore]
+async fn tls_put_get_remove_roundtrip() {
+    let _guard = lock_live_server();
+    let mut conn = connect_tls().await;
+
+    conn.put(
+        b"ci-tls-key",
+        b"ci-tls-value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+
+    let value = conn.get(b"ci-tls-key").await.expect("get");
+    assert_eq!(value, Some(b"ci-tls-value".to_vec()));
+
+    let removed = conn.remove(b"ci-tls-key").await.expect("remove");
+    assert!(removed);
+
+    let value = conn.get(b"ci-tls-key").await.expect("get after remove");
+    assert_eq!(value, None);
+}
+
+/// Same server as `tls_put_get_remove_roundtrip`, configured with a CA that
+/// never signed its certificate: proves `connect_tls` actually verifies the
+/// chain instead of accepting any certificate the server happens to present.
+#[tokio::test]
+#[ignore]
+async fn tls_connect_rejects_a_server_certificate_signed_by_an_untrusted_ca() {
+    let _guard = lock_live_server();
+    let addr = env_or("INFINISPAN_TLS_ADDR", "127.0.0.1:21222");
+    let tls = TlsConfig {
+        server_name: env_or("INFINISPAN_TLS_SERVER_NAME", "localhost"),
+        ca_certificate: Some(UNRELATED_CA_CERTIFICATE.to_vec()),
+        client_identity: None,
+    };
+
+    let result = HotRodConnection::connect_tls(&addr, "", &tls).await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]
