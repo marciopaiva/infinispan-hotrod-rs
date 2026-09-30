@@ -41,6 +41,7 @@ use crate::connection::{
 };
 use crate::error::{Error, Result};
 use crate::hash;
+use crate::tls::TlsConfig;
 use crate::topology::TopologyServer;
 use crate::wire::Expiration;
 
@@ -146,6 +147,12 @@ pub struct HotRodCluster {
     connections: HashMap<SocketAddr, PooledConnection>,
     auth: Option<AuthMethod>,
     timeout: Duration,
+    /// Replayed on every connection this instance opens, seed or
+    /// topology-discovered node alike. `ensure_connection_impl` decides
+    /// `verify_hostname` per connection; the config itself, and whether TLS
+    /// is used at all, does not vary between nodes. See the `tls` module
+    /// docs and ADR 0004.
+    tls: Option<TlsConfig>,
 }
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -267,15 +274,52 @@ impl HotRodCluster {
         cache_name: &str,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::connect_with(seed_addrs, cache_name, timeout, None).await
+    }
+
+    /// Same as `connect`, but over TLS (ADR 0004,
+    /// `docs/adr/0004-tls-support.md`). `tls.server_name` is verified
+    /// against whichever seed this instance connects to; every node
+    /// discovered later through a topology update is verified only against
+    /// `tls.ca_certificate` (or the OS trust store), never by hostname: see
+    /// the `tls` module docs.
+    pub async fn connect_tls(
+        seed_addrs: &[SocketAddr],
+        cache_name: &str,
+        tls: TlsConfig,
+    ) -> Result<Self> {
+        Self::connect_with(seed_addrs, cache_name, DEFAULT_TIMEOUT, Some(tls)).await
+    }
+
+    /// Same as `connect_tls`, but with a caller-supplied timeout in place
+    /// of `DEFAULT_TIMEOUT`.
+    pub async fn connect_tls_with_timeout(
+        seed_addrs: &[SocketAddr],
+        cache_name: &str,
+        tls: TlsConfig,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with(seed_addrs, cache_name, timeout, Some(tls)).await
+    }
+
+    async fn connect_with(
+        seed_addrs: &[SocketAddr],
+        cache_name: &str,
+        timeout: Duration,
+        tls: Option<TlsConfig>,
+    ) -> Result<Self> {
         let mut attempts = JoinSet::new();
         for (index, &addr) in seed_addrs.iter().enumerate() {
             let cache_name = cache_name.to_string();
+            let tls_for_task = tls.clone();
             attempts.spawn(async move {
                 let result = HotRodConnection::connect_hash_aware(
                     addr,
                     &cache_name,
                     DEFAULT_TOPOLOGY_ID,
                     timeout,
+                    tls_for_task.as_ref(),
+                    true, // dialing a seed: verify by hostname
                 )
                 .await;
                 (index, addr, result)
@@ -298,6 +342,7 @@ impl HotRodCluster {
                         connections,
                         auth: None,
                         timeout,
+                        tls,
                     });
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -716,6 +761,8 @@ impl HotRodCluster {
                 &self.cache_name,
                 self.topology_id,
                 self.timeout,
+                self.tls.as_ref(),
+                true, // dialing a seed: verify by hostname
             )
             .await
             {
@@ -838,6 +885,8 @@ impl HotRodCluster {
                     &self.cache_name,
                     self.topology_id,
                     self.timeout,
+                    self.tls.as_ref(),
+                    origin.is_none(),
                 )
                 .await?;
                 if replay_auth {

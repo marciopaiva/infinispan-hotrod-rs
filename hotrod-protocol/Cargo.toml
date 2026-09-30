@@ -15,3 +15,10 @@ hmac = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+
+[dev-dependencies]
+rcgen = "0.14.10"
