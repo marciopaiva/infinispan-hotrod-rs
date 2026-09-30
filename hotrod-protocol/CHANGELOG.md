@@ -8,6 +8,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `connect_tls`/`connect_tls_with_timeout` on `HotRodConnection` and
+  `HotRodCluster`, alongside the existing plain-text constructors, per
+  `docs/adr/0004-tls-support.md` (#46). The new `TlsConfig` carries the
+  seed's expected `server_name`, an optional PEM `ca_certificate` (the
+  OS trust store is used when absent) and an optional `client_identity`
+  (PEM certificate and key) for mutual TLS. The seed connection gets full
+  hostname and CA-chain verification; a node discovered later through a
+  topology update is verified against the same CA chain only, since the
+  topology update carries no hostname to check against, exactly as the
+  ADR decided. `Error::TlsHandshake` and `Error::InvalidTlsMaterial`
+  report the new failure modes instead of a generic `Error::Io`.
 - `Error::BatchTooLarge` and the new `MAX_BULK_ENTRIES` constant (100,000).
   `HotRodConnection::get_all`/`put_all` now reject a batch over that size
   before writing anything, instead of building and sending a frame that
@@ -90,6 +101,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   serializes its tests behind a shared lock, since `clear` wipes the whole
   cache and would otherwise race against another test's keys under cargo's
   default parallel test execution.
+- Live-server coverage for `connect_tls` against a real Infinispan server
+  with TLS enabled, covering a successful `put`/`get`/`remove` round trip
+  and rejection of a server certificate signed by an untrusted CA. Unlike
+  the `cluster_*` tests, this fixture needs its own server, started with
+  the new `ci/infinispan-tls/setup.sh` and torn down with
+  `ci/infinispan-tls/teardown.sh`; like `cluster_*`, it stays out of every
+  CI workflow and is meant to be run by hand (see the ADR for why).
 
 ## [0.3.0] - 2026-09-29
 
