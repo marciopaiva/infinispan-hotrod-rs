@@ -35,6 +35,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `Error::Io`/`Error::Timeout` failure. It now reconnects the seed the
   same way `call`/`ensure_connection` already do, instead of indexing
   the pool directly and assuming the entry is still there.
+- `HotRodCluster::authenticate_with` no longer replays the old
+  credentials in `self.auth` onto a freshly reconnected seed before
+  authenticating it with the new method. Reconnecting the evicted seed
+  went through the same auto-authenticate path every other pooled
+  connection uses, which applied the outdated method first: a call meant
+  to refresh an expired token could fail on stale credentials before the
+  new ones were ever tried, or leave the connection authenticated twice
+  in a row with two different methods.
 - The connection-poisoning rule the module docs on `HotRodConnection` and
   `HotRodCluster` already described is now enforced instead of merely
   documented. `HotRodConnection` marks itself poisoned before writing a
