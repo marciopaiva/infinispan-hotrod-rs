@@ -1,5 +1,6 @@
 /target
 Cargo.lock
+/ci/infinispan-tls/generated/
 bench/java/target/
 *.so
 *.dll
