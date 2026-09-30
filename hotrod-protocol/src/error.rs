@@ -121,6 +121,12 @@ pub enum Error {
     /// reuse a connection that is silently desynced. Reconnect instead.
     #[error("connection is poisoned by a prior operation that did not complete: reconnect instead of reusing it")]
     PoisonedConnection,
+
+    #[error("TLS handshake failed: {0}")]
+    TlsHandshake(String),
+
+    #[error("invalid TLS certificate or key material: {0}")]
+    InvalidTlsMaterial(String),
 }
 
 /// Result alias for `hotrod_protocol::Error`.

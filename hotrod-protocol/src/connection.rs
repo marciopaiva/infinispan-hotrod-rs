@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::header::{read_response_header, write_request_header, OpCode};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
+use crate::tls::{self, TlsConfig, Transport};
 use crate::topology::{ClientIntelligence, TopologyUpdate};
 use crate::varint::{read_vint, write_vint};
 use crate::wire::{
@@ -113,7 +114,7 @@ pub struct VersionedValue {
 }
 
 pub struct HotRodConnection {
-    stream: BufStream<TcpStream>,
+    stream: BufStream<Transport>,
     cache_name: Vec<u8>,
     next_message_id: u64,
     intelligence: ClientIntelligence,
@@ -138,6 +139,8 @@ impl HotRodConnection {
             ClientIntelligence::Basic,
             DEFAULT_TOPOLOGY_ID,
             DEFAULT_TIMEOUT,
+            None,
+            true,
         )
         .await
     }
@@ -156,6 +159,49 @@ impl HotRodConnection {
             ClientIntelligence::Basic,
             DEFAULT_TOPOLOGY_ID,
             timeout,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Same as `connect`, but over TLS (ADR 0004,
+    /// `docs/adr/0004-tls-support.md`), verifying the server's certificate
+    /// both by hostname (against `tls.server_name`) and by chain (against
+    /// `tls.ca_certificate` or the OS trust store).
+    pub async fn connect_tls(
+        addr: impl ToSocketAddrs,
+        cache_name: &str,
+        tls: &TlsConfig,
+    ) -> Result<Self> {
+        Self::connect_with(
+            addr,
+            cache_name,
+            ClientIntelligence::Basic,
+            DEFAULT_TOPOLOGY_ID,
+            DEFAULT_TIMEOUT,
+            Some(tls),
+            true,
+        )
+        .await
+    }
+
+    /// Same as `connect_tls`, but with a caller-supplied timeout in place of
+    /// `DEFAULT_TIMEOUT`.
+    pub async fn connect_tls_with_timeout(
+        addr: impl ToSocketAddrs,
+        cache_name: &str,
+        tls: &TlsConfig,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with(
+            addr,
+            cache_name,
+            ClientIntelligence::Basic,
+            DEFAULT_TOPOLOGY_ID,
+            timeout,
+            Some(tls),
+            true,
         )
         .await
     }
@@ -164,11 +210,18 @@ impl HotRodConnection {
     /// intelligence, for use as one of `HotRodCluster`'s pooled per-node
     /// connections. `topology_id` is the id already known to the cluster, so
     /// the server does not resend a topology update the client already has.
+    ///
+    /// `verify_hostname` is `false` for a connection to a node discovered
+    /// through a topology update, which carries only an address, never a
+    /// hostname to check: see the `tls` module docs and ADR 0004. It is
+    /// `true` for a seed dial, the only case with a real hostname to verify.
     pub(crate) async fn connect_hash_aware(
         addr: impl ToSocketAddrs,
         cache_name: &str,
         topology_id: i32,
         timeout: Duration,
+        tls: Option<&TlsConfig>,
+        verify_hostname: bool,
     ) -> Result<Self> {
         Self::connect_with(
             addr,
@@ -176,6 +229,8 @@ impl HotRodConnection {
             ClientIntelligence::HashDistributionAware,
             topology_id,
             timeout,
+            tls,
+            verify_hostname,
         )
         .await
     }
@@ -186,11 +241,20 @@ impl HotRodConnection {
         intelligence: ClientIntelligence,
         topology_id: i32,
         timeout: Duration,
+        tls: Option<&TlsConfig>,
+        verify_hostname: bool,
     ) -> Result<Self> {
-        let tcp = with_timeout(timeout, async { Ok(TcpStream::connect(addr).await?) }).await?;
-        tcp.set_nodelay(true)?;
+        let stream = with_timeout(timeout, async {
+            let tcp = TcpStream::connect(addr).await?;
+            tcp.set_nodelay(true)?;
+            match tls {
+                Some(tls) => tls::handshake(tcp, tls, verify_hostname).await,
+                None => Ok(Transport::Plain(tcp)),
+            }
+        })
+        .await?;
         Ok(Self {
-            stream: BufStream::new(tcp),
+            stream: BufStream::new(stream),
             cache_name: cache_name.as_bytes().to_vec(),
             next_message_id: 1,
             intelligence,

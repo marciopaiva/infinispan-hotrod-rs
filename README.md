@@ -19,7 +19,7 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Full entry metadata (creation, last used, lifespan, max idle) | Yes | Yes |
 | Authentication: PLAIN, SCRAM-SHA-512, DIGEST-SHA-256, OAUTHBEARER | Yes | Yes |
 | Authentication: GSSAPI | Yes | No ([#9](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/9)) |
-| TLS and mutual TLS | Yes | No ([#46](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/46)) |
+| TLS and mutual TLS | Yes | Yes |
 | Cluster topology tracking, hash-aware routing | Yes | Yes |
 | Client listeners (cache events) | Yes | No ([#4](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/4)) |
 | Near caching | Yes | No ([#5](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/5)) |
