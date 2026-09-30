@@ -14,25 +14,25 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Feature | Java client | `hotrod-protocol` |
 | --- | --- | --- |
 | Core operations (get, put, remove, putIfAbsent, replace, versioned variants) | Yes | Yes |
-| Bulk operations (getAll, putAll, removeAll) | Yes | Yes |
+| Bulk operations (getAll, putAll) | Yes | Yes |
 | containsKey, ping, size, clear, stats | Yes | Yes |
 | Full entry metadata (creation, last used, lifespan, max idle) | Yes | Yes |
 | Authentication: PLAIN, SCRAM-SHA-512, DIGEST-SHA-256, OAUTHBEARER | Yes | Yes |
 | Authentication: GSSAPI | Yes | No ([#9](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/9)) |
-| TLS and mutual TLS | Yes | No |
+| TLS and mutual TLS | Yes | No ([#46](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/46)) |
 | Cluster topology tracking, hash-aware routing | Yes | Yes |
 | Client listeners (cache events) | Yes | No ([#4](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/4)) |
 | Near caching | Yes | No ([#5](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/5)) |
-| Transactions | Yes | No |
-| Multimap cache | Yes | No |
-| Counters | Yes | No |
-| Remote query (Protobuf / Ickle) | Yes | No |
-| Remote task execution | Yes | No |
-| Streaming for large values | Yes | No |
-| Server-side iteration | Yes | No |
-| Stats and telemetry (metrics, tracing) | Yes | No |
-| Remote administration | Yes | No |
-| Multi-cluster failover | Yes | No |
+| Transactions | Yes | No ([#47](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/47)) |
+| Multimap cache | Yes | No ([#48](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/48)) |
+| Counters | Yes | No ([#49](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/49)) |
+| Remote query (Protobuf / Ickle) | Yes | No ([#50](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/50)) |
+| Remote task execution | Yes | No ([#51](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/51)) |
+| Streaming for large values | Yes | No ([#52](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/52)) |
+| Server-side iteration | Yes | No ([#53](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/53)) |
+| Stats and telemetry (metrics, tracing) | Yes | No ([#54](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/54)) |
+| Remote administration | Yes | No ([#55](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/55)) |
+| Multi-cluster failover | Yes | No ([#56](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/56)) |
 
 The PHP extension has not started yet.
 
