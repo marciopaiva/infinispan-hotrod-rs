@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::client::HotRodClient;
 use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
 use crate::error::{Error, Result};
+use crate::listener::{CacheListener, ListenOptions};
 use crate::wire::Expiration;
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -316,6 +317,36 @@ impl RemoteCache {
             OperationResult::PutAll => Ok(()),
             _ => unreachable!("Operation::PutAll always yields OperationResult::PutAll"),
         }
+    }
+
+    /// Registers a listener for this cache's events, with every event
+    /// type and no server-side filtering. See `listen_with` for finer
+    /// control (selected event types, a server-side filter or converter
+    /// factory, replaying the cache's current contents first).
+    pub async fn listen(&self) -> Result<CacheListener> {
+        self.listen_with(&ListenOptions::default()).await
+    }
+
+    /// Registers a listener on a connection dedicated to it alone (see
+    /// `listener.rs`'s module docs for why), targeting the current active
+    /// seed: events are cache-wide, not routed by key, so there is no
+    /// segment owner to pick instead. Not retried against another seed if
+    /// this one refuses the connection: unlike `call`/`run_seed_op`,
+    /// which node ends up holding a long-lived registration is worth the
+    /// caller seeing directly rather than this silently failing over.
+    pub async fn listen_with(&self, options: &ListenOptions) -> Result<CacheListener> {
+        let seed = self.active_seed_addr();
+        let conn = self
+            .client
+            .open_and_authenticate(seed, &self.cache_name, None)
+            .await?;
+        CacheListener::register(
+            conn,
+            self.cache_name.as_bytes(),
+            self.client.timeout(),
+            options,
+        )
+        .await
     }
 
     /// Routes `key` to its computed owner, checking out a connection for

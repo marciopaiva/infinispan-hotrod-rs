@@ -607,7 +607,11 @@ impl HotRodClient {
     /// Opens and authenticates a new connection to `addr` for
     /// `cache_name`, recording `addr`'s origin the first time this client
     /// sees it, regardless of which cache the connection is for.
-    async fn open_and_authenticate(
+    /// `pub(crate)`, not just used by `checkout`/`failover_seed`:
+    /// `remote_cache.rs`'s `listen`/`listen_with` also call this directly
+    /// to get a connection for `listener.rs` to take ownership of, since
+    /// a listener's connection is never pooled (see that module's docs).
+    pub(crate) async fn open_and_authenticate(
         &self,
         addr: SocketAddr,
         cache_name: &str,

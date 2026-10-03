@@ -35,6 +35,8 @@ pub(crate) enum OpCode {
     GetWithMetadata = 0x1B,
     AuthMechList = 0x21,
     Auth = 0x23,
+    AddClientListener = 0x25,
+    RemoveClientListener = 0x27,
     Size = 0x29,
     PutAll = 0x2D,
     GetAll = 0x2F,

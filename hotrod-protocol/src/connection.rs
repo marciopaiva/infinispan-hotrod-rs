@@ -306,6 +306,18 @@ impl HotRodConnection {
         self.pending_topology_update.take()
     }
 
+    /// Consumes the connection and hands back its raw transport. Used by
+    /// `listener.rs` once `add_client_listener` has confirmed the server
+    /// accepted the registration: from that point on, the socket carries an
+    /// unbounded stream of event frames instead of one response per
+    /// request, which is not a shape `HotRodConnection`'s own
+    /// `write_and_read_header`/poisoning model was built for (see its
+    /// module docs). `CacheListener` reads directly off this transport
+    /// instead.
+    pub(crate) fn into_transport(self) -> BufStream<Transport> {
+        self.stream
+    }
+
     /// The timeout currently bounding every operation and authentication
     /// round on this connection.
     pub fn timeout(&self) -> Duration {
@@ -651,6 +663,26 @@ impl HotRodConnection {
         let result = with_timeout(timeout, async {
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Clear, &[])
+                .await?;
+            Ok(())
+        })
+        .await;
+        self.end_operation(result.is_ok());
+        result
+    }
+
+    /// Registers a client listener, `body` already encoded by
+    /// `listener.rs` (listener id, include-current-state flag,
+    /// filter/converter factory names and parameters, raw-data flag,
+    /// event interests). Confirms the server accepted it; the connection
+    /// is expected to be handed to `listener.rs` via `into_transport`
+    /// right after, not reused for further operations here.
+    pub(crate) async fn add_client_listener(&mut self, body: &[u8]) -> Result<()> {
+        self.begin_operation()?;
+        let timeout = self.timeout;
+        let result = with_timeout(timeout, async {
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::AddClientListener, body)
                 .await?;
             Ok(())
         })
