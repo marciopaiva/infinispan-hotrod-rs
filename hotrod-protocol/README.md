@@ -51,20 +51,25 @@ conn.put(b"key", b"value", Expiration::Default, Expiration::Default)
 let value = conn.get(b"key").await?;
 ```
 
-Against a distributed cache spread over a cluster, `HotRodCluster`
-routes each request directly to its owning node:
+Against a distributed cache spread over a cluster, `HotRodClient`
+tracks topology and routes each request directly to its owning node.
+Unlike `HotRodConnection`, it is not bound to one cache: `cache` returns
+a `RemoteCache` handle for a named cache, and both the client and its
+cache handles are cheap to clone and share across tasks, since their
+operations take `&self`:
 
 ```rust
-use hotrod_protocol::{Expiration, HotRodCluster};
+use hotrod_protocol::{Expiration, HotRodClient};
 
 let seeds = ["127.0.0.1:11222".parse()?, "127.0.0.1:11322".parse()?];
-let mut cluster = HotRodCluster::connect(&seeds, "distributed").await?;
-cluster.authenticate_plain("", "user", "password").await?;
+let client = HotRodClient::connect(&seeds).await?;
+client.authenticate_plain("", "user", "password").await?;
+let cache = client.cache("distributed");
 
-cluster
+cache
     .put(b"key", b"value", Expiration::Default, Expiration::Default)
     .await?;
-let value = cluster.get(b"key").await?;
+let value = cache.get(b"key").await?;
 ```
 
 ## License

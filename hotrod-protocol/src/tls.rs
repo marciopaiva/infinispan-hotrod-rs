@@ -6,7 +6,7 @@
 //! opened to one cannot be verified by hostname the way the seed
 //! connection is. `connect_with` in `connection.rs` threads a
 //! `verify_hostname` flag down to `build_client_config` for exactly this
-//! reason: `true` for the seed, `false` for every node a `HotRodCluster`
+//! reason: `true` for the seed, `false` for every node a `HotRodClient`
 //! opens afterward. Either way the certificate must still chain to the
 //! configured CA; only the hostname/IP match is skipped.
 

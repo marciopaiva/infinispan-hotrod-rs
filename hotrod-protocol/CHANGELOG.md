@@ -4,6 +4,29 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `HotRodCluster` is replaced by `HotRodClient` and `RemoteCache`, per
+  `docs/adr/0005-connection-pooling-and-client-cache-split.md` (#77).
+  `HotRodCluster` kept at most one connection per node and serialized
+  every operation through `&mut self`, even operations routed to
+  different nodes. `HotRodClient` now pools several connections per
+  node (per cache) and dispatches through `&self`, so independent
+  operations run concurrently. A cache is no longer bound at connect
+  time: `HotRodClient::connect(seeds)` returns a client shared across
+  any number of named caches, and `client.cache("my-cache")` returns a
+  `RemoteCache` handle carrying the operations `HotRodCluster` used to
+  expose directly (`get`, `put`, `remove`, `ping`, `size`, ...). This is
+  a breaking change with no deprecation path:
+  `HotRodCluster::connect(seeds, "my-cache")` becomes
+  `HotRodClient::connect(seeds).await?.cache("my-cache")`.
+  `authenticate_plain`/`authenticate_scram`/`authenticate_digest`/
+  `authenticate_oauthbearer` move from the cache type to `HotRodClient`,
+  since credentials are replayed onto every pooled connection regardless
+  of which cache a caller later opens.
+
 ## [0.4.0] - 2026-09-29
 
 ### Added

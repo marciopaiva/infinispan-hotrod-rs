@@ -77,7 +77,7 @@ call to compare:
   operation 69"). There is no bulk remove in the protocol at all, which
   is also why `RemoteCache` has no public `removeAll(Set)`.
 
-`hotrod-protocol`'s `HotRodCluster` (multi-node topology routing) is out
+`hotrod-protocol`'s `HotRodClient` (multi-node topology routing) is out
 of scope: comparing it fairly needs a distributed cache across a
 multi-node cluster, a different setup than this single-connection bench.
 

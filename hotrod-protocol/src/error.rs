@@ -106,7 +106,7 @@ pub enum Error {
     ///
     /// This is one way a connection ends up with a partial frame in
     /// flight, not the only one: see the module docs on `HotRodConnection`
-    /// and `HotRodCluster` for the general rule, which also covers a
+    /// and `HotRodClient` for the general rule, which also covers a
     /// caller dropping the operation's future before it resolves for a
     /// reason of its own.
     #[error("operation timed out after {0:?}")]
