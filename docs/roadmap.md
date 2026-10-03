@@ -58,13 +58,37 @@ and multi-cluster failover all assume a client that can hold several
 live connections and dispatch to them concurrently, so this needed to
 land before those features, not alongside the last one that ran into it.
 
+## Next up, now that #77 has landed
+
+The structural blocker is gone, so every P1 item below is unblocked and
+can start whenever its own Propose step is ready; none of them has a
+further dependency on each other.
+
+* **#78 (multi-node CI fixture) is the natural next pick, not just
+  because it is still P0.** #77 was itself validated by hand against a
+  real two-node cluster under `ci/infinispan-kind/` (a disposable `kind`
+  fixture, built for that one validation, not wired into any workflow).
+  That fixture is a reasonable starting point for #78's permanent
+  version, not a from-scratch effort: the main open questions are
+  whether a `kind`-based fixture (already proven to work with this
+  project's `podman`-only CI runners) is the right shape for a
+  standing CI job, and how to keep its runtime acceptable on every push
+  rather than only running it by hand before a risky change.
+* **#4 (client listeners) is the next P1 item to Propose**, per the
+  existing ordering: it is what #5 (near caching) depends on, and
+  nothing about it depends on #78 landing first, so the two can proceed
+  in parallel if there is bandwidth for both.
+* #52 (streaming) and #53 (server-side iteration) remain independent of
+  #4/#5 and of each other; either can be picked up next instead of, or
+  alongside, listeners if that is a better fit for what is needed next.
+
 ## Proposed ordering
 
 | Priority | Item | Issue | Why this order |
 | --- | --- | --- | --- |
 | ~~P0~~ | ~~Connection pooling / concurrent operations~~ | #77 (done) | Structural blocker described above |
-| P0 | Multi-node CI fixture | #78 | The cluster code path is currently exercised only by `#[ignore]`d manual tests; failover and rebalance need a real multi-node run in CI |
-| P1 | Client listeners (cache events) | #4 | Prerequisite for near caching |
+| P0 | Multi-node CI fixture | #78 | The cluster code path is currently exercised only by `#[ignore]`d manual tests; failover and rebalance need a real multi-node run in CI. `ci/infinispan-kind/` is a starting point, see above |
+| P1 | Client listeners (cache events) | #4 | Prerequisite for near caching; unblocked now, next to Propose |
 | P1 | Near caching | #5 | Large latency win once listeners exist, particularly for the PHP bridge |
 | P1 | Streaming (GetStream/PutStream) | #52 | Values are currently always fully buffered in memory |
 | P1 | Server-side iteration | #53 | Only way to walk a cache without already knowing its keys |
