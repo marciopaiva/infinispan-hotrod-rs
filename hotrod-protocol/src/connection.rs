@@ -30,12 +30,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncWriteExt, BufStream};
+use tokio::io::BufStream;
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
-use crate::header::{read_response_header, write_request_header, OpCode};
+use crate::header::OpCode;
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::tls::{self, TlsConfig, Transport};
@@ -871,22 +871,16 @@ impl HotRodConnection {
         let message_id = self.next_message_id;
         self.next_message_id += 1;
 
-        let mut request = Vec::with_capacity(32 + body.len());
-        write_request_header(
-            &mut request,
+        let mut header = crate::header::write_and_read_header(
+            &mut self.stream,
             message_id,
             cache_name,
             opcode,
             self.intelligence,
             self.topology_id,
-        );
-        request.extend_from_slice(body);
-
-        self.stream.write_all(&request).await?;
-        self.stream.flush().await?;
-
-        let mut header =
-            read_response_header(&mut self.stream, message_id, opcode, self.intelligence).await?;
+            body,
+        )
+        .await?;
         if let Some(update) = &header.topology_update {
             self.topology_id = update.topology_id as i32;
         }

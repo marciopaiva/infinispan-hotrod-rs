@@ -23,14 +23,15 @@
 //! reconnection is a documented limitation, not an oversight: see the
 //! ADR.
 
+use std::io;
 use std::time::Duration;
 
 use rand::RngCore;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufStream};
+use tokio::io::{AsyncRead, AsyncReadExt, BufStream};
 
 use crate::connection::{with_timeout, HotRodConnection, DEFAULT_TOPOLOGY_ID};
 use crate::error::{Error, Result};
-use crate::header::{read_response_header, write_request_header, OpCode};
+use crate::header::{write_and_read_header, OpCode, RESPONSE_MAGIC};
 use crate::status::Status;
 use crate::tls::Transport;
 use crate::topology::ClientIntelligence;
@@ -42,7 +43,14 @@ const EVENT_MODIFIED: u8 = 0x61;
 const EVENT_REMOVED: u8 = 0x62;
 const EVENT_EXPIRED: u8 = 0x63;
 
-const RESPONSE_MAGIC: u8 = 0xA1;
+/// Safety ceiling on a filter/converter factory's parameter count: the
+/// wire encodes it as a single byte (`Codec30.writeNamedFactory`), so
+/// `255` is the most this protocol can express at all, not a limit this
+/// client chose. Checked before writing anything, the same reasoning
+/// `MAX_BULK_ENTRIES` already uses for `get_all`/`put_all`: silently
+/// truncating a larger count would desync the request instead of
+/// rejecting it up front.
+const MAX_FACTORY_PARAMS: usize = u8::MAX as usize;
 
 /// Which event types a listener receives: a bitmask on the wire (`0x01`
 /// created, `0x02` modified, `0x04` removed, `0x08` expired). Defaults to
@@ -56,6 +64,7 @@ pub struct CacheEventInterests {
 }
 
 impl CacheEventInterests {
+    /// Every event type: what `ListenOptions::default` uses.
     pub fn all() -> Self {
         Self {
             created: true,
@@ -162,23 +171,40 @@ pub struct CacheListener {
     listener_id: Vec<u8>,
     cache_name: Vec<u8>,
     timeout: Duration,
-    next_message_id: u64,
+    /// Set once a frame has started being read (the magic byte arrived),
+    /// cleared only once that whole frame was parsed successfully.
+    /// Mirrors `HotRodConnection`'s own poisoning rule (see its module
+    /// docs) for the same reason: `next`'s doc explicitly allows pairing
+    /// it with `tokio::select!` or an external timeout, so a future
+    /// dropped mid-frame is exactly as possible here as it is for any
+    /// `HotRodConnection` operation, and leaves the stream in the same
+    /// kind of desynced state if the next call just started reading a
+    /// fresh frame from the middle of the abandoned one.
+    poisoned: bool,
 }
 
-fn write_factory(body: &mut Vec<u8>, factory: Option<&ServerFactory>) {
+fn write_factory(body: &mut Vec<u8>, factory: Option<&ServerFactory>) -> Result<()> {
     match factory {
         None => write_array(body, b""),
         Some(factory) => {
+            if factory.params.len() > MAX_FACTORY_PARAMS {
+                return Err(Error::BatchTooLarge {
+                    what: "a listener's filter/converter factory parameters",
+                    len: factory.params.len(),
+                    max: MAX_FACTORY_PARAMS,
+                });
+            }
             write_array(body, factory.name.as_bytes());
             // A named factory's parameter count is a single byte on the
             // wire (Codec30.writeNamedFactory), not a vInt like every
-            // length-prefixed count elsewhere in this protocol.
+            // other length-prefixed count elsewhere in this protocol.
             body.push(factory.params.len() as u8);
             for param in &factory.params {
                 write_array(body, param);
             }
         }
     }
+    Ok(())
 }
 
 impl CacheListener {
@@ -196,8 +222,8 @@ impl CacheListener {
         let mut body = Vec::new();
         write_array(&mut body, &listener_id);
         body.push(options.include_current_state as u8);
-        write_factory(&mut body, options.filter_factory.as_ref());
-        write_factory(&mut body, options.converter_factory.as_ref());
+        write_factory(&mut body, options.filter_factory.as_ref())?;
+        write_factory(&mut body, options.converter_factory.as_ref())?;
         body.push(options.raw_data as u8);
         write_vint(&mut body, options.interests.as_vint());
 
@@ -208,23 +234,37 @@ impl CacheListener {
             listener_id,
             cache_name: cache_name.to_vec(),
             timeout,
-            next_message_id: 1,
+            poisoned: false,
         })
     }
 
     /// Waits for the next event. Returns `None` once the server closes
-    /// the connection cleanly; any other failure is a terminal `Err`, and
-    /// calling `next` again afterward is not meaningful (no reconnection
-    /// here: see the module docs; call `RemoteCache::listen` again
-    /// instead). Not bounded by this listener's timeout: waiting for the
-    /// next event is the normal state of a listener, not a hung request
-    /// the way every other wait in this crate is.
+    /// the connection cleanly *between* frames; a close or any other
+    /// failure partway through one is a terminal `Err`, same as a
+    /// `PoisonedConnection` error on every following call (no
+    /// reconnection here: see the module docs; call
+    /// `RemoteCache::listen` again instead). Not bounded by this
+    /// listener's timeout: waiting for the next event is the normal
+    /// state of a listener, not a hung request the way every other wait
+    /// in this crate is.
     pub async fn next(&mut self) -> Option<Result<CacheEvent>> {
-        match read_event(&mut self.stream, &self.listener_id).await {
-            Ok(event) => Some(Ok(event)),
-            Err(Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::UnexpectedEof => None,
-            Err(err) => Some(Err(err)),
+        if self.poisoned {
+            return Some(Err(Error::PoisonedConnection));
         }
+        // A clean close is only a `None` when it happens before any byte
+        // of a new frame has arrived; once the magic byte is in, this
+        // client is committed to that frame, and `poisoned` stays set
+        // until it is parsed in full, so neither a later clean close nor
+        // this call being dropped mid-frame is ever mistaken for one.
+        let magic = match self.stream.read_u8().await {
+            Ok(byte) => byte,
+            Err(io_err) if io_err.kind() == io::ErrorKind::UnexpectedEof => return None,
+            Err(io_err) => return Some(Err(Error::Io(io_err))),
+        };
+        self.poisoned = true;
+        let result = read_event_after_magic(&mut self.stream, magic, &self.listener_id).await;
+        self.poisoned = result.is_err();
+        Some(result)
     }
 
     /// Unregisters the listener and waits for the server's confirmation,
@@ -233,31 +273,19 @@ impl CacheListener {
     /// quicker, explicit alternative for a caller that wants the server
     /// to stop tracking the listener right away.
     pub async fn close(mut self) -> Result<()> {
-        let message_id = self.next_message_id;
-
         let mut body = Vec::new();
         write_array(&mut body, &self.listener_id);
 
-        let mut request = Vec::with_capacity(32 + body.len());
-        write_request_header(
-            &mut request,
-            message_id,
-            &self.cache_name,
-            OpCode::RemoveClientListener,
-            ClientIntelligence::Basic,
-            DEFAULT_TOPOLOGY_ID,
-        );
-        request.extend_from_slice(&body);
-
         let timeout = self.timeout;
         with_timeout(timeout, async {
-            self.stream.write_all(&request).await?;
-            self.stream.flush().await?;
-            read_response_header(
+            write_and_read_header(
                 &mut self.stream,
-                message_id,
+                0,
+                &self.cache_name,
                 OpCode::RemoveClientListener,
                 ClientIntelligence::Basic,
+                DEFAULT_TOPOLOGY_ID,
+                &body,
             )
             .await?;
             Ok(())
@@ -266,17 +294,20 @@ impl CacheListener {
     }
 }
 
-/// Reads exactly one event frame: the generic response header shape
-/// (magic, message id, opcode, status, topology marker, always `0` for
-/// an event) followed by the event-specific body. Not built on
+/// Reads the rest of one event frame given its already-read magic byte:
+/// message id, opcode, status, topology marker (always `0` for an
+/// event), then the event-specific body. Not built on
 /// `header::read_response_header`: that function validates the opcode
 /// against one specific request it expects a reply to, which does not
-/// fit a frame the server pushed on its own.
-async fn read_event<R: AsyncRead + Unpin>(
+/// fit a frame the server pushed on its own, and reads the magic byte
+/// itself, which `next` already needed to read on its own to tell a
+/// clean close between frames apart from a dropped connection partway
+/// through one.
+async fn read_event_after_magic<R: AsyncRead + Unpin>(
     stream: &mut R,
+    magic: u8,
     expected_listener_id: &[u8],
 ) -> Result<CacheEvent> {
-    let magic = stream.read_u8().await?;
     if magic != RESPONSE_MAGIC {
         return Err(Error::InvalidMagic(magic));
     }
@@ -291,6 +322,9 @@ async fn read_event<R: AsyncRead + Unpin>(
             status: status.0,
             message,
         });
+    }
+    if !status.is_known() {
+        return Err(Error::UnknownStatus(status.0));
     }
 
     let listener_id = read_array(stream).await?;
@@ -310,31 +344,30 @@ async fn read_event<R: AsyncRead + Unpin>(
     }
 
     match opcode {
-        EVENT_CREATED => {
+        EVENT_CREATED | EVENT_MODIFIED => {
             let key = read_array(stream).await?;
             let version = stream.read_u64().await?;
-            Ok(CacheEvent::Created {
-                key,
-                version,
-                is_retried,
+            Ok(if opcode == EVENT_CREATED {
+                CacheEvent::Created {
+                    key,
+                    version,
+                    is_retried,
+                }
+            } else {
+                CacheEvent::Modified {
+                    key,
+                    version,
+                    is_retried,
+                }
             })
         }
-        EVENT_MODIFIED => {
+        EVENT_REMOVED | EVENT_EXPIRED => {
             let key = read_array(stream).await?;
-            let version = stream.read_u64().await?;
-            Ok(CacheEvent::Modified {
-                key,
-                version,
-                is_retried,
+            Ok(if opcode == EVENT_REMOVED {
+                CacheEvent::Removed { key, is_retried }
+            } else {
+                CacheEvent::Expired { key, is_retried }
             })
-        }
-        EVENT_REMOVED => {
-            let key = read_array(stream).await?;
-            Ok(CacheEvent::Removed { key, is_retried })
-        }
-        EVENT_EXPIRED => {
-            let key = read_array(stream).await?;
-            Ok(CacheEvent::Expired { key, is_retried })
         }
         other => Err(Error::MalformedEvent(format!(
             "unrecognized event opcode {other:#04x}"
@@ -345,6 +378,7 @@ async fn read_event<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
 
     use crate::client::tests::{read_request_opcode, response_header};
@@ -674,6 +708,136 @@ mod tests {
                 assert_eq!(message, "boom");
             }
             other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        server.await.unwrap();
+    }
+
+    /// A status byte that is neither a known success/not-executed/not-exist
+    /// code nor a known error code must be rejected, the same way
+    /// `header::read_response_header` already rejects it for an ordinary
+    /// response (`0x99` matches `status::tests::unrecognized_byte_is_unknown`).
+    #[tokio::test]
+    async fn next_rejects_an_unrecognized_status_byte() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let (id, listener_id) = read_listener_id(&mut stream).await;
+            let resp = response_header(id, 0x26, 0x00);
+            stream.write_all(&resp).await.unwrap();
+
+            let mut frame = vec![0xA1];
+            write_vlong(&mut frame, 0);
+            frame.push(EVENT_CREATED);
+            frame.push(0x99); // unrecognized status
+            frame.push(0); // topology marker
+            write_array(&mut frame, &listener_id);
+            stream.write_all(&frame).await.unwrap();
+        });
+
+        let conn = HotRodConnection::connect(addr, "my-cache").await.unwrap();
+        let mut listener = CacheListener::register(
+            conn,
+            b"my-cache",
+            Duration::from_secs(5),
+            &ListenOptions::default(),
+        )
+        .await
+        .expect("register");
+
+        let err = listener.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::UnknownStatus(0x99)),
+            "unexpected error variant: {err:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// A connection dropped partway through a frame (as opposed to
+    /// cleanly between two frames) must surface as a terminal `Err`, and
+    /// poison the listener the same way a `HotRodConnection` operation
+    /// poisons itself on a partial read: the review that caught this drew
+    /// the comparison directly to `connection.rs`'s own module docs on
+    /// why a partial read can never be treated as if nothing happened.
+    #[tokio::test]
+    async fn next_errors_and_poisons_on_a_connection_dropped_mid_frame() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let (id, _listener_id) = read_listener_id(&mut stream).await;
+            let resp = response_header(id, 0x26, 0x00);
+            stream.write_all(&resp).await.unwrap();
+
+            // Only the first few bytes of a frame (magic, message id,
+            // opcode, status, topology marker): a real frame has more
+            // after this. Dropping `stream` here closes the connection
+            // with a frame already under way.
+            let mut partial = vec![0xA1];
+            write_vlong(&mut partial, 0);
+            partial.push(EVENT_CREATED);
+            partial.push(0x00);
+            partial.push(0);
+            stream.write_all(&partial).await.unwrap();
+        });
+
+        let conn = HotRodConnection::connect(addr, "my-cache").await.unwrap();
+        let mut listener = CacheListener::register(
+            conn,
+            b"my-cache",
+            Duration::from_secs(5),
+            &ListenOptions::default(),
+        )
+        .await
+        .expect("register");
+
+        let first = listener.next().await;
+        assert!(
+            matches!(first, Some(Err(_))),
+            "a connection dropped mid-frame must not look like a clean close: {first:?}"
+        );
+
+        let second = listener.next().await;
+        assert!(
+            matches!(second, Some(Err(Error::PoisonedConnection))),
+            "a listener that errored mid-frame should fail fast on the next call: {second:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_rejects_more_than_255_factory_parameters() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        // The fake server never needs to do anything: `register` must
+        // reject the oversized parameter list locally, before writing
+        // the `AddClientListener` request at all.
+        let server = tokio::spawn(async move {
+            let _ = tcp_listener.accept().await;
+        });
+
+        let conn = HotRodConnection::connect(addr, "my-cache").await.unwrap();
+        let options = ListenOptions {
+            filter_factory: Some(ServerFactory {
+                name: "my-filter".to_string(),
+                params: vec![Vec::new(); 256],
+            }),
+            ..Default::default()
+        };
+
+        let result =
+            CacheListener::register(conn, b"my-cache", Duration::from_secs(5), &options).await;
+        match result {
+            Err(
+                err @ Error::BatchTooLarge {
+                    len: 256, max: 255, ..
+                },
+            ) => drop(err),
+            Err(err) => panic!("unexpected error variant: {err:?}"),
+            Ok(_) => panic!("256 parameters should be rejected"),
         }
 
         server.await.unwrap();

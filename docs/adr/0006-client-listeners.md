@@ -181,6 +181,26 @@ on the server.
   `close` explicitly.
 * No new dependency: `rand`, already used for SCRAM's and DIGEST's
   nonces, generates the listener id too.
+* `CacheListener` carries the same poisoning rule
+  `HotRodConnection` documents and enforces for itself (see its module
+  docs): a flag set once a frame's magic byte has arrived, cleared only
+  once that whole frame parses successfully. Caught by this PR's own
+  review: `next`'s doc explicitly allows pairing it with
+  `tokio::select!`/an external timeout, so a future dropped mid-frame is
+  exactly as reachable here as it is for any `HotRodConnection`
+  operation, and an `UnexpectedEof` partway through a frame is a real
+  failure, not the clean, between-frames close it would have been
+  mistaken for without the fix.
+* A filter/converter factory's parameter count is capped at 255
+  (`MAX_FACTORY_PARAMS`), the most a single wire byte can express
+  (`Codec30.writeNamedFactory`): checked before writing anything,
+  instead of silently truncating a larger count into a desynced
+  request. Also caught by review.
+* `header::write_and_read_header` (write a request, read its response
+  header) is factored out of `HotRodConnection::write_and_read_header`
+  so `CacheListener::close`'s `RemoveClientListener` round trip can
+  share it instead of hand-rolling a second copy that tracks a
+  listener's connection having no topology state to update.
 * Known, accepted limitations for this phase, candidates for a
   follow-up issue if a real use case asks for them: no automatic
   reconnection, no failover across seeds when first registering a
