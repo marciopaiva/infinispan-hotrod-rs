@@ -13,16 +13,17 @@
 //! The `tls_*` tests need a separate, TLS-enabled server instead, started
 //! with `ci/infinispan-tls/setup.sh` (which also generates the throwaway CA
 //! and keystore it uses) and torn down with `ci/infinispan-tls/teardown.sh`.
-//! This fixture is not part of any CI workflow yet: see issue #83, not
-//! `docs/adr/0004-tls-support.md` (which covers the `rustls` choice and
-//! verification rules, never CI).
+//! Runs as the `tls-test` job in `.github/workflows/ci.yml` on every push
+//! to `main` and every PR (issue #83); run the same two scripts by hand
+//! for local iteration. The release workflow explicitly skips these
+//! (`--skip tls_`): its single-node fixture is plain TCP, not TLS.
 //!
 //! The `cluster_*` tests need a two-node cluster instead, started with
 //! `ci/infinispan-cluster/setup.sh` and torn down with
-//! `ci/infinispan-cluster/teardown.sh`. Unlike the `tls_*` fixture, this
-//! one *is* wired into CI (`.github/workflows/ci.yml`'s `cluster-test`
-//! job, issue #78): the routing and failover paths it exercises are
-//! exactly what regresses silently without a real multi-node run.
+//! `ci/infinispan-cluster/teardown.sh`. Also wired into CI (the
+//! `cluster-test` job, issue #78): the routing and failover paths it
+//! exercises are exactly what regresses silently without a real
+//! multi-node run.
 //!
 //! `clippy::await_holding_lock` is allowed crate-wide below: `LIVE_SERVER_LOCK`
 //! is a plain `std::sync::Mutex` held across `.await` on purpose. Each
