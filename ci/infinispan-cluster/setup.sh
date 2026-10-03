@@ -21,11 +21,12 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+source ../lib.sh
 
 NETWORK=hotrod-cluster-test
 ALIAS=infinispan-cluster
 
-docker rm -f infinispan-cluster-node0 infinispan-cluster-node1 >/dev/null 2>&1 || true
+rm_containers infinispan-cluster-node0 infinispan-cluster-node1
 docker network rm "$NETWORK" >/dev/null 2>&1 || true
 docker network create "$NETWORK" >/dev/null
 
@@ -50,25 +51,12 @@ start_node() {
 start_node infinispan-cluster-node0 11222 node0
 start_node infinispan-cluster-node1 11322 node1
 
-wait_for_node() {
-  local name=$1
-  # 60 iterations, not the 30 ci/infinispan-tls/setup.sh uses for a
-  # single node: two nodes need to boot and also find each other over
-  # JGroups DNS_PING before either is ready, and a shared CI runner can
-  # be slower than this sandbox, where both came up in a few seconds.
-  for i in $(seq 1 60); do
-    if docker logs "$name" 2>&1 | grep -q "ISPN080001"; then
-      return 0
-    fi
-    sleep 2
-  done
-  echo "$name did not come up in time"
-  docker logs "$name" 2>&1
-  return 1
-}
-
-wait_for_node infinispan-cluster-node0
-wait_for_node infinispan-cluster-node1
+# 60 iterations, not the 30 ci/infinispan-tls/setup.sh uses for a
+# single node: two nodes need to boot and also find each other over
+# JGroups DNS_PING before either is ready, and a shared CI runner can
+# be slower than this sandbox, where both came up in a few seconds.
+wait_for_infinispan infinispan-cluster-node0 60
+wait_for_infinispan infinispan-cluster-node1 60
 
 echo "Infinispan cluster up: 127.0.0.1:11222 (node0), 127.0.0.1:11322 (node1)"
 echo "Matches cluster_seed_addrs()'s default in tests/live_server.rs, so no INFINISPAN_CLUSTER_ADDRS override is needed."
