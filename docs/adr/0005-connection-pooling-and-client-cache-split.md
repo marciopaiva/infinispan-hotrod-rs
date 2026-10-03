@@ -207,3 +207,19 @@ no stable release yet that a migration would need to bridge.
   once this lands: concurrent dispatch across nodes is exactly the
   behavior that fixture needs to verify under a real cluster, not just
   unit tests against local TCP listeners.
+* **Known, accepted race: `record_topology_update`'s eviction can be
+  narrowly undone by a request already in flight.** If a node leaves the
+  topology at the same moment a request that resolved that node as a
+  key's owner under the *previous* topology is opening a connection to
+  it, the eviction (which closes and drops that node's pools) can finish
+  first, and the in-flight request's `open_and_authenticate` then
+  inserts a fresh pool for that same now-gone address right after,
+  resurrecting it. This is self-healing: the next topology update
+  reconciles it the same way, so the worst case is one address staying
+  pooled one update cycle longer than it should, not a permanent leak or
+  a wrong answer. Found during this PR's own review, alongside the bugs
+  above; fixing it properly needs tagging each pool (or each resolved
+  address) with the topology generation it was opened under and
+  comparing that at eviction time, which is a bigger change than the
+  bug it prevents justifies on its own. Revisit if #78 (or production
+  use) ever actually observes this rather than just being able to.

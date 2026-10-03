@@ -328,13 +328,20 @@ impl RemoteCache {
     /// failover), or straight to `failover_and_retry` if the owner
     /// already was the seed. Any other error, or a failure with nowhere
     /// left to retry, is returned as is.
+    ///
+    /// `checkout` itself failing (the owner refuses the connection
+    /// outright, rather than a request on an already-open one timing
+    /// out) goes through this same retry decision, not a bare `?`: an
+    /// earlier version propagated a `checkout` failure immediately,
+    /// skipping failover whenever a node could not even be connected to,
+    /// which is exactly the case failover exists for.
     async fn call(&self, key: &[u8], op: Operation) -> Result<OperationResult> {
         let (addr, origin) = self.client.owner_addr(key).await?;
-        let outcome = {
-            let mut guard = self.client.checkout(addr, &self.cache_name, origin).await?;
-            run_operation(&mut guard, &op).await.inspect(|_| {
+        let outcome = match self.client.checkout(addr, &self.cache_name, origin).await {
+            Ok(mut guard) => run_operation(&mut guard, &op).await.inspect(|_| {
                 self.client.record_topology_update(&mut guard);
-            })
+            }),
+            Err(err) => Err(err),
         };
         let err = match outcome {
             Ok(value) => return Ok(value),
@@ -359,14 +366,17 @@ impl RemoteCache {
     /// Shared by `call_seed` and `call`'s owner-to-seed retry: runs `op`
     /// against a connection to the seed, for this cache. On
     /// `Error::Io`/`Error::Timeout`, hands off to `failover_and_retry`.
-    /// Any other error is returned as is.
+    /// Any other error is returned as is. Like `call`, a `checkout`
+    /// failure goes through the same retry decision as a failed `op`,
+    /// not a bare `?`, so failover still triggers when the seed refuses
+    /// the connection outright.
     async fn run_seed_op(&self, op: &Operation) -> Result<OperationResult> {
         let seed = self.active_seed_addr();
-        let attempt = {
-            let mut guard = self.client.checkout(seed, &self.cache_name, None).await?;
-            run_operation(&mut guard, op).await.inspect(|_| {
+        let attempt = match self.client.checkout(seed, &self.cache_name, None).await {
+            Ok(mut guard) => run_operation(&mut guard, op).await.inspect(|_| {
                 self.client.record_topology_update(&mut guard);
-            })
+            }),
+            Err(err) => Err(err),
         };
         match attempt {
             Ok(value) => Ok(value),
@@ -405,7 +415,12 @@ impl RemoteCache {
     }
 
     fn active_seed_addr(&self) -> std::net::SocketAddr {
-        *self.client.inner().active_seed_addr.read().unwrap()
+        *self
+            .client
+            .inner()
+            .active_seed_addr
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -425,7 +440,6 @@ mod tests {
         unreachable_addr,
     };
     use crate::client::{AuthMethod, ClientInner, ClusterTopology, HotRodClient};
-    use crate::connection::DEFAULT_TOPOLOGY_ID;
     use crate::topology::TopologyServer;
     use crate::varint::{read_vint, write_vint};
     use crate::wire::read_array;
@@ -442,7 +456,6 @@ mod tests {
         HotRodClient::from_inner(ClientInner {
             seed_addrs,
             active_seed_addr: RwLock::new(active_seed_addr),
-            topology_id: RwLock::new(DEFAULT_TOPOLOGY_ID),
             topology: RwLock::new(None),
             node_origin: RwLock::new(StdHashMap::new()),
             pools: RwLock::new(StdHashMap::new()),
@@ -478,6 +491,7 @@ mod tests {
         set_topology(
             &client,
             ClusterTopology {
+                topology_id: 9,
                 servers: vec![TopologyServer {
                     host: owner_addr.ip().to_string(),
                     port: owner_addr.port(),
@@ -522,6 +536,45 @@ mod tests {
             .expect("get should fail over to the other seed");
 
         assert_eq!(result, None);
+        assert_eq!(*client.inner().active_seed_addr.read().unwrap(), other_addr);
+
+        other_task.await.unwrap();
+    }
+
+    /// Same shape as `seed_failure_fails_over_to_the_next_seed_address`,
+    /// but the active seed refuses the TCP connection outright instead of
+    /// accepting it and then going quiet: `checkout` itself fails
+    /// (`Error::Io`) before `run_operation` ever runs. An earlier version
+    /// propagated that failure with a bare `?` in `call`/`run_seed_op`,
+    /// skipping failover entirely whenever a node could not even be
+    /// connected to, the exact case failover exists for; this is the
+    /// regression test the review that caught it asked for.
+    #[tokio::test]
+    async fn seed_failure_fails_over_when_the_seed_refuses_the_connection() {
+        let dead_seed_addr = unreachable_addr().await;
+
+        let other_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other_listener.local_addr().unwrap();
+        let other_task = tokio::spawn(async move {
+            let (mut stream, _) = other_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x17, "expected a Ping request");
+            let mut resp = response_header(id, 0x18, 0x00);
+            resp.push(0);
+            resp.push(0);
+            resp.push(41);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![dead_seed_addr, other_addr], dead_seed_addr);
+
+        client
+            .cache("my-cache")
+            .ping()
+            .await
+            .expect("ping should fail over when the seed refuses the connection outright");
+
         assert_eq!(*client.inner().active_seed_addr.read().unwrap(), other_addr);
 
         other_task.await.unwrap();
@@ -581,6 +634,7 @@ mod tests {
         set_topology(
             &client,
             ClusterTopology {
+                topology_id: 9,
                 servers: vec![TopologyServer {
                     host: owner_addr.ip().to_string(),
                     port: owner_addr.port(),
@@ -634,6 +688,7 @@ mod tests {
         set_topology(
             &client,
             ClusterTopology {
+                topology_id: 9,
                 servers: vec![TopologyServer {
                     host: owner_addr.ip().to_string(),
                     port: owner_addr.port(),
@@ -699,6 +754,7 @@ mod tests {
         set_topology(
             &client,
             ClusterTopology {
+                topology_id: 9,
                 servers: vec![TopologyServer {
                     host: owner_addr.ip().to_string(),
                     port: owner_addr.port(),
@@ -765,6 +821,7 @@ mod tests {
         set_topology(
             &client,
             ClusterTopology {
+                topology_id: 9,
                 servers: vec![TopologyServer {
                     host: unreachable.ip().to_string(),
                     port: unreachable.port(),
@@ -825,6 +882,7 @@ mod tests {
         set_topology(
             &client,
             ClusterTopology {
+                topology_id: 9,
                 servers: vec![TopologyServer {
                     host: unreachable.ip().to_string(),
                     port: unreachable.port(),

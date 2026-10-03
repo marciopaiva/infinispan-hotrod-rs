@@ -114,8 +114,13 @@ impl ConnectionPool {
     /// Returns the slot a checkout took, as a reusable connection if it
     /// is healthy and this pool has not since closed, as an empty slot
     /// otherwise. Exactly one call per `checkout` keeps the total slot
-    /// count fixed at `max_size`.
-    fn return_slot(&self, conn: Option<HotRodConnection>) {
+    /// count fixed at `max_size`. `pub(crate)`, not just used by
+    /// `PooledGuard::drop`: `HotRodClient::checkout` also calls this
+    /// directly with `None` when it took a `Checkout::NeedsNew` slot but
+    /// failed (or was cancelled by its own outer timeout) before ever
+    /// producing a connection to wrap in a `PooledGuard`, so that slot is
+    /// never otherwise returned. See `PendingSlot` in `client.rs`.
+    pub(crate) fn return_slot(&self, conn: Option<HotRodConnection>) {
         let slot = match conn {
             Some(conn) if !conn.is_poisoned() && !self.is_closed() => {
                 Slot::Connection(Box::new(conn))
@@ -154,6 +159,19 @@ impl ConnectionPool {
     /// semaphore needs no adjustment here.
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        self.invalidate_idle();
+    }
+
+    /// Drops every connection idle in this pool right now, replacing each
+    /// with an empty slot, without closing the pool itself: a later
+    /// checkout still opens a fresh connection for one of these slots
+    /// instead of failing outright. Used by `HotRodClient::authenticate_with`
+    /// so an already-pooled connection authenticated with a credential
+    /// that was just replaced (a token refresh, a changed password) is
+    /// not handed to a later caller still carrying the old one; a
+    /// connection currently checked out is unaffected; it was opened
+    /// with whatever credential was current then, same as always.
+    pub(crate) fn invalidate_idle(&self) {
         for slot in self
             .slots
             .lock()

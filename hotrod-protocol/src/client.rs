@@ -28,6 +28,15 @@
 //! before returning a connection to its idle list, evicting it instead,
 //! the same safeguard `HotRodCluster::ensure_connection_impl` used to
 //! provide for the single connection it kept per node.
+//!
+//! Every `RwLock` here recovers from poisoning (`unwrap_or_else(|p|
+//! p.into_inner())`) rather than panicking the whole client if one task
+//! panics while holding a write lock: `HotRodClient` is `Clone`d and
+//! shared across tasks specifically so independent operations can run
+//! concurrently, and one task's unrelated bug should not brick every
+//! `RemoteCache` built from the same client by poisoning shared state
+//! they all read. `pool.rs`'s own `Mutex` already followed this rule;
+//! this PR's review caught that `ClientInner`'s locks had not.
 
 use std::collections::HashMap;
 use std::io;
@@ -101,7 +110,13 @@ impl AuthMethod {
     }
 }
 
-/// The routing data from the most recently applied topology update.
+/// The routing data from the most recently applied topology update, plus
+/// the topology id that came with it: the two are always read and
+/// written together as one `Arc`, never as two separate locks, so a
+/// concurrent reader can never observe one half updated and the other
+/// still stale (a torn read this PR's review caught in an earlier
+/// version that kept `topology_id` in its own `RwLock` next to this one).
+///
 /// Always held behind an `Arc` in `ClientInner::topology`: `owner_addr`
 /// clones the `Arc` under a brief read lock, then resolves and caches a
 /// DNS lookup against its own `resolved_addrs` without holding that lock.
@@ -110,6 +125,7 @@ impl AuthMethod {
 /// reader is done with it; nothing reads a cache entry attributed to the
 /// wrong topology.
 pub(crate) struct ClusterTopology {
+    pub(crate) topology_id: i32,
     pub(crate) servers: Vec<TopologyServer>,
     pub(crate) hash_function_version: u8,
     /// Index `n` is segment `n`'s owners, as indices into `servers`,
@@ -133,7 +149,6 @@ pub(crate) struct ClientInner {
     /// the last resort every retry falls back to. Can change at runtime:
     /// see `failover_seed`.
     pub(crate) active_seed_addr: RwLock<SocketAddr>,
-    pub(crate) topology_id: RwLock<i32>,
     pub(crate) topology: RwLock<Option<Arc<ClusterTopology>>>,
     /// The topology server a pooled address was resolved from, if any:
     /// `None` for the seed, `Some` for a node discovered through a
@@ -168,6 +183,43 @@ pub(crate) struct ClientInner {
 /// hold its own copy without the caller managing an `Arc` by hand.
 #[derive(Clone)]
 pub struct HotRodClient(pub(crate) Arc<ClientInner>);
+
+/// Guards a slot `ConnectionPool::checkout` already popped as
+/// `Checkout::NeedsNew` while this client opens and authenticates a real
+/// connection for it. Returns the slot as empty on drop unless `fulfill`
+/// ran first, so neither a failed open nor this whole `checkout` call
+/// being cancelled by its own outer timeout mid-open leaks the slot:
+/// found by this PR's own review, reproduced by checking out from a pool
+/// of capacity 1 against an address that always refuses to connect,
+/// twice in a row. Without this guard, the first failed open never gave
+/// its slot back, so the second checkout hung forever waiting on a slot
+/// that could never become available again.
+struct PendingSlot {
+    pool: Arc<ConnectionPool>,
+    fulfilled: bool,
+}
+
+impl PendingSlot {
+    fn new(pool: Arc<ConnectionPool>) -> Self {
+        Self {
+            pool,
+            fulfilled: false,
+        }
+    }
+
+    fn fulfill(mut self, conn: HotRodConnection) -> PooledGuard {
+        self.fulfilled = true;
+        PooledGuard::new(self.pool.clone(), conn)
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        if !self.fulfilled {
+            self.pool.return_slot(None);
+        }
+    }
+}
 
 impl HotRodClient {
     /// Builds a client directly from its shared state. `pub(crate)` only:
@@ -272,7 +324,6 @@ impl HotRodClient {
                     return Ok(Self(Arc::new(ClientInner {
                         seed_addrs: seed_addrs.to_vec(),
                         active_seed_addr: RwLock::new(addr),
-                        topology_id: RwLock::new(DEFAULT_TOPOLOGY_ID),
                         topology: RwLock::new(None),
                         node_origin: RwLock::new(HashMap::new()),
                         pools: RwLock::new(HashMap::new()),
@@ -311,7 +362,7 @@ impl HotRodClient {
     /// The timeout currently bounding every operation on this instance's
     /// pooled connections.
     pub fn timeout(&self) -> Duration {
-        *self.0.timeout.read().unwrap()
+        *self.0.timeout.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Overrides the timeout used from this call onward, in place of the
@@ -320,8 +371,14 @@ impl HotRodClient {
     /// connection checked out by another task at this moment keeps its
     /// old timeout until it is returned and later checked out again.
     pub fn set_timeout(&self, timeout: Duration) {
-        *self.0.timeout.write().unwrap() = timeout;
-        for pool in self.0.pools.read().unwrap().values() {
+        *self.0.timeout.write().unwrap_or_else(|p| p.into_inner()) = timeout;
+        for pool in self
+            .0
+            .pools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
             pool.set_idle_timeouts(timeout);
         }
     }
@@ -377,13 +434,29 @@ impl HotRodClient {
     /// exchange succeeds. The connection itself is not pooled: SASL
     /// requests always use an empty cache name regardless of what the
     /// connection was opened with (`HotRodConnection::run_sasl`), so it
-    /// cannot usefully serve a later `RemoteCache` operation anyway. Every
-    /// connection any pool opens afterward replays the stored method
-    /// through `open_and_authenticate`.
+    /// cannot usefully serve a later `RemoteCache` operation anyway.
+    ///
+    /// Every connection any pool opens afterward replays the stored
+    /// method through `open_and_authenticate`, but a connection already
+    /// idle in a pool from before this call was authenticated
+    /// differently; it is not reachable here to re-authenticate in
+    /// place. Instead, every pool's idle connections are invalidated once
+    /// `method` is stored, so the next checkout for each opens a fresh
+    /// one that replays the new credentials rather than handing out a
+    /// connection still carrying the old ones. A connection already
+    /// checked out by another task when this runs keeps whatever
+    /// credential it was opened with until it is next evicted; this
+    /// narrower gap (an in-flight connection outliving a credential
+    /// refresh) also existed on the single pooled seed connection
+    /// `HotRodCluster` used to keep.
     async fn authenticate_with(&self, method: AuthMethod) -> Result<()> {
-        let seed = *self.0.active_seed_addr.read().unwrap();
-        let topology_id = *self.0.topology_id.read().unwrap();
-        let timeout = *self.0.timeout.read().unwrap();
+        let seed = *self
+            .0
+            .active_seed_addr
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let topology_id = self.current_topology_id();
+        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
         let mut conn = HotRodConnection::connect_hash_aware(
             seed,
             "",
@@ -394,8 +467,31 @@ impl HotRodClient {
         )
         .await?;
         method.authenticate(&mut conn).await?;
-        *self.0.auth.write().unwrap() = Some(method);
+        *self.0.auth.write().unwrap_or_else(|p| p.into_inner()) = Some(method);
+        for pool in self
+            .0
+            .pools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
+            pool.invalidate_idle();
+        }
         Ok(())
+    }
+
+    /// The topology id to send on the next request: the one carried by
+    /// the current topology, or `DEFAULT_TOPOLOGY_ID` before any topology
+    /// update has arrived. Reads `topology_id` out of the same `Arc` as
+    /// `servers`/`segment_owners`, never a separately locked field, so it
+    /// can never be stale relative to them (see `ClusterTopology`'s docs).
+    fn current_topology_id(&self) -> i32 {
+        self.0
+            .topology
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(DEFAULT_TOPOLOGY_ID, |topology| topology.topology_id)
     }
 
     /// The address to route `key` to, and the topology server it came
@@ -405,8 +501,17 @@ impl HotRodClient {
         &self,
         key: &[u8],
     ) -> Result<(SocketAddr, Option<TopologyServer>)> {
-        let active_seed = *self.0.active_seed_addr.read().unwrap();
-        let topology = self.0.topology.read().unwrap().clone();
+        let active_seed = *self
+            .0
+            .active_seed_addr
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let topology = self
+            .0
+            .topology
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let Some(topology) = topology else {
             return Ok((active_seed, None));
         };
@@ -424,27 +529,38 @@ impl HotRodClient {
         // Safe: `topology::read_topology_update` rejects any owner index
         // that is out of range for `servers` before this type is built.
         let server = topology.servers[primary as usize].clone();
-        if let Some(&addr) = topology.resolved_addrs.read().unwrap().get(&primary) {
+        if let Some(&addr) = topology
+            .resolved_addrs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&primary)
+        {
             return Ok((addr, Some(server)));
         }
         let addr = resolve_server_addr(&server).await?;
         topology
             .resolved_addrs
             .write()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(primary, addr);
         Ok((addr, Some(server)))
     }
 
     fn pool_for(&self, addr: SocketAddr, cache_name: &str) -> Arc<ConnectionPool> {
         let key = (addr, cache_name.to_string());
-        if let Some(pool) = self.0.pools.read().unwrap().get(&key) {
+        if let Some(pool) = self
+            .0
+            .pools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+        {
             return pool.clone();
         }
         self.0
             .pools
             .write()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .entry(key)
             .or_insert_with(|| Arc::new(ConnectionPool::new(DEFAULT_MAX_CONNECTIONS_PER_NODE)))
             .clone()
@@ -453,11 +569,19 @@ impl HotRodClient {
     /// Checks out a connection to `addr` for `cache_name`, opening and
     /// authenticating a new one if the pool has none idle and room for
     /// one more. `origin` is the topology server `addr` was resolved
-    /// from (see `owner_addr`); pass `None` for the seed. Bounded by this
-    /// client's timeout: waiting for a free pool slot is a new way to
-    /// block that did not exist when each node had exactly one
-    /// connection, so it needs the same bound every other operation here
-    /// already has.
+    /// from (see `owner_addr`); pass `None` for the seed.
+    ///
+    /// The whole call, slot wait and any new connect-and-authenticate
+    /// together, is bounded by this client's timeout, not just the slot
+    /// wait: an earlier version only wrapped the wait, so a call that
+    /// spent close to the full timeout waiting for a slot and then opened
+    /// a slow new connection could take close to twice the timeout a
+    /// caller would reasonably expect as a liveness bound, a compounding
+    /// effect that could not happen when `HotRodCluster` kept exactly one
+    /// connection per node. If this is cancelled (by that outer timeout,
+    /// or a failed open) after `pool.checkout()` already returned a
+    /// `Checkout::NeedsNew`, `PendingSlot` returns that slot as empty
+    /// instead of leaking it.
     pub(crate) async fn checkout(
         &self,
         addr: SocketAddr,
@@ -465,17 +589,19 @@ impl HotRodClient {
         origin: Option<TopologyServer>,
     ) -> Result<PooledGuard> {
         let pool = self.pool_for(addr, cache_name);
-        let timeout = *self.0.timeout.read().unwrap();
-        let checkout = tokio::time::timeout(timeout, pool.checkout())
-            .await
-            .map_err(|_elapsed| Error::Timeout(timeout))?;
-        match checkout {
-            Checkout::Idle(conn) => Ok(PooledGuard::new(pool, *conn)),
-            Checkout::NeedsNew => {
-                let conn = self.open_and_authenticate(addr, cache_name, origin).await?;
-                Ok(PooledGuard::new(pool, conn))
+        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
+        tokio::time::timeout(timeout, async {
+            match pool.checkout().await {
+                Checkout::Idle(conn) => Ok(PooledGuard::new(pool.clone(), *conn)),
+                Checkout::NeedsNew => {
+                    let pending = PendingSlot::new(pool.clone());
+                    let conn = self.open_and_authenticate(addr, cache_name, origin).await?;
+                    Ok(pending.fulfill(conn))
+                }
             }
-        }
+        })
+        .await
+        .map_err(|_elapsed| Error::Timeout(timeout))?
     }
 
     /// Opens and authenticates a new connection to `addr` for
@@ -487,8 +613,8 @@ impl HotRodClient {
         cache_name: &str,
         origin: Option<TopologyServer>,
     ) -> Result<HotRodConnection> {
-        let topology_id = *self.0.topology_id.read().unwrap();
-        let timeout = *self.0.timeout.read().unwrap();
+        let topology_id = self.current_topology_id();
+        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
         let mut conn = HotRodConnection::connect_hash_aware(
             addr,
             cache_name,
@@ -498,11 +624,20 @@ impl HotRodClient {
             origin.is_none(),
         )
         .await?;
-        let auth = self.0.auth.read().unwrap().clone();
+        let auth = self
+            .0
+            .auth
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         if let Some(auth) = auth {
             auth.authenticate(&mut conn).await?;
         }
-        self.0.node_origin.write().unwrap().insert(addr, origin);
+        self.0
+            .node_origin
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(addr, origin);
         Ok(conn)
     }
 
@@ -511,14 +646,24 @@ impl HotRodClient {
     /// and, if credentials were set, authenticates. The first to succeed
     /// is pushed into its `(addr, cache_name)` pool as an idle connection
     /// (so the caller's immediate retry finds it ready instead of dialing
-    /// a third time) and promoted to `active_seed_addr`. Returns the last
-    /// error seen if every other seed also fails, or a generic error if
-    /// there was no other seed to try in the first place.
+    /// a third time, bounded by this client's timeout like every other
+    /// wait on a pool slot) and promoted to `active_seed_addr`. Returns
+    /// the last error seen if every other seed also fails, or a generic
+    /// error if there was no other seed to try in the first place.
     pub(crate) async fn failover_seed(&self, cache_name: &str) -> Result<SocketAddr> {
-        let previous = *self.0.active_seed_addr.read().unwrap();
-        let topology_id = *self.0.topology_id.read().unwrap();
-        let timeout = *self.0.timeout.read().unwrap();
-        let auth = self.0.auth.read().unwrap().clone();
+        let previous = *self
+            .0
+            .active_seed_addr
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let topology_id = self.current_topology_id();
+        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
+        let auth = self
+            .0
+            .auth
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let mut last_err: Option<Error> = None;
         for &addr in &self.0.seed_addrs {
             if addr == previous {
@@ -546,10 +691,24 @@ impl HotRodClient {
                     continue;
                 }
             }
-            self.0.node_origin.write().unwrap().insert(addr, None);
+            self.0
+                .node_origin
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(addr, None);
             let pool = self.pool_for(addr, cache_name);
-            pool.seed_idle(conn).await;
-            *self.0.active_seed_addr.write().unwrap() = addr;
+            if tokio::time::timeout(timeout, pool.seed_idle(conn))
+                .await
+                .is_err()
+            {
+                last_err = Some(Error::Timeout(timeout));
+                continue;
+            }
+            *self
+                .0
+                .active_seed_addr
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) = addr;
             return Ok(addr);
         }
         Err(last_err.unwrap_or_else(|| {
@@ -571,18 +730,26 @@ impl HotRodClient {
         let Some(update) = conn.take_pending_topology_update() else {
             return;
         };
-        *self.0.topology_id.write().unwrap() = update.topology_id as i32;
 
         let new_topology = Arc::new(ClusterTopology {
+            topology_id: update.topology_id as i32,
             servers: update.servers,
             hash_function_version: update.hash_function_version,
             segment_owners: update.segment_owners,
             resolved_addrs: RwLock::new(HashMap::new()),
         });
-        *self.0.topology.write().unwrap() = Some(new_topology.clone());
+        *self.0.topology.write().unwrap_or_else(|p| p.into_inner()) = Some(new_topology.clone());
 
-        let active_seed = *self.0.active_seed_addr.read().unwrap();
-        let mut node_origin = self.0.node_origin.write().unwrap();
+        let active_seed = *self
+            .0
+            .active_seed_addr
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut node_origin = self
+            .0
+            .node_origin
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let stale_addrs: Vec<SocketAddr> = node_origin
             .iter()
             .filter(|(&addr, origin)| {
@@ -601,7 +768,7 @@ impl HotRodClient {
         }
         drop(node_origin);
 
-        let mut pools = self.0.pools.write().unwrap();
+        let mut pools = self.0.pools.write().unwrap_or_else(|p| p.into_inner());
         pools.retain(|(pool_addr, _cache_name), pool| {
             if stale_addrs.contains(pool_addr) {
                 pool.close();
@@ -740,6 +907,7 @@ pub(crate) mod tests {
             .expect("connect to seed");
 
         *client.0.topology.write().unwrap() = Some(Arc::new(ClusterTopology {
+            topology_id: 9,
             servers: vec![TopologyServer {
                 host: addr.ip().to_string(),
                 port: addr.port(),
@@ -760,6 +928,7 @@ pub(crate) mod tests {
         let mut broken_servers = topology.servers.clone();
         broken_servers[0].host = "this-hostname-does-not-resolve.invalid".to_string();
         *client.0.topology.write().unwrap() = Some(Arc::new(ClusterTopology {
+            topology_id: topology.topology_id,
             servers: broken_servers,
             hash_function_version: topology.hash_function_version,
             segment_owners: topology.segment_owners.clone(),
@@ -784,6 +953,7 @@ pub(crate) mod tests {
             .expect("connect to seed");
 
         *client.0.topology.write().unwrap() = Some(Arc::new(ClusterTopology {
+            topology_id: 9,
             servers: vec![TopologyServer {
                 host: "this-hostname-does-not-resolve.invalid".to_string(),
                 port: 7000,
@@ -820,7 +990,6 @@ pub(crate) mod tests {
         let client = HotRodClient::from_inner(ClientInner {
             seed_addrs: vec![seed_addr],
             active_seed_addr: RwLock::new(seed_addr),
-            topology_id: RwLock::new(DEFAULT_TOPOLOGY_ID),
             topology: RwLock::new(None),
             node_origin: RwLock::new(HashMap::new()),
             pools: RwLock::new(HashMap::new()),
@@ -840,6 +1009,127 @@ pub(crate) mod tests {
             .expect("authenticate with the new credentials, without replaying the old ones");
 
         seed_task.await.unwrap();
+    }
+
+    /// A connection pooled before `authenticate_plain` is called again
+    /// with new credentials must not be handed to a later caller: it was
+    /// opened under the old credentials, and nothing re-authenticates it
+    /// in place.
+    #[tokio::test]
+    async fn authenticate_with_invalidates_already_pooled_connections() {
+        let old_response = b"\0user\0old-pass".to_vec();
+        let new_response = b"\0user\0new-pass".to_vec();
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let expected_old = old_response.clone();
+        let expected_new = new_response.clone();
+        let seed_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            async fn serve_ping(stream: &mut TcpStream) {
+                let (id, opcode) = read_request_opcode(stream).await;
+                assert_eq!(opcode, 0x17, "expected a Ping request");
+                let mut resp = response_header(id, 0x18, 0x00);
+                resp.push(0);
+                resp.push(0);
+                resp.push(41);
+                write_vint(&mut resp, 0);
+                stream.write_all(&resp).await.unwrap();
+            }
+
+            // `authenticate_plain("old-pass")` dials its own throwaway
+            // connection for the SASL exchange alone (see
+            // `HotRodClient::authenticate_with`'s docs); it is never
+            // reused, so no Ping follows here.
+            let (mut probe, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut probe, &expected_old).await;
+
+            // The first `ping` opens its own connection, authenticated
+            // (again) under the old creds, and pools it once answered.
+            let (mut first, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut first, &expected_old).await;
+            serve_ping(&mut first).await;
+
+            // `authenticate_plain("new-pass")`'s own throwaway probe.
+            let (mut probe, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut probe, &expected_new).await;
+
+            // The second `ping`, after re-authenticating, must open a
+            // fresh connection under the new creds instead of reusing the
+            // invalidated one from above.
+            let (mut second, _) = seed_listener.accept().await.unwrap();
+            serve_plain_auth(&mut second, &expected_new).await;
+            serve_ping(&mut second).await;
+        });
+
+        let client = HotRodClient::from_inner(ClientInner {
+            seed_addrs: vec![seed_addr],
+            active_seed_addr: RwLock::new(seed_addr),
+            topology: RwLock::new(None),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(None),
+            tls: None,
+            timeout: RwLock::new(Duration::from_secs(5)),
+        });
+
+        client
+            .authenticate_plain("", "user", "old-pass")
+            .await
+            .expect("authenticate with the old credentials");
+        client
+            .cache("my-cache")
+            .ping()
+            .await
+            .expect("ping pools a connection authenticated with the old credentials");
+
+        client
+            .authenticate_plain("", "user", "new-pass")
+            .await
+            .expect("authenticate with the new credentials");
+        client
+            .cache("my-cache")
+            .ping()
+            .await
+            .expect("ping should open a fresh connection, not reuse the invalidated one");
+
+        seed_task.await.unwrap();
+    }
+
+    /// Reproduces the review finding on `checkout`/`PendingSlot`: before
+    /// `PendingSlot` existed, a failed `open_and_authenticate` left the
+    /// slot `pool.checkout()` had already handed out neither returned nor
+    /// reusable, so repeated failed checkouts against the same pool
+    /// permanently shrank its capacity. With the fix, every one of these
+    /// fails fast with `Error::Io`, never `Error::Timeout`: a `Timeout`
+    /// here would mean an earlier failure had leaked a slot and this one
+    /// is stuck waiting on the pool's semaphore instead of even attempting
+    /// a connection.
+    #[tokio::test]
+    async fn checkout_does_not_leak_pool_capacity_when_open_fails() {
+        let dead_addr = unreachable_addr().await;
+        let client = HotRodClient::from_inner(ClientInner {
+            seed_addrs: vec![dead_addr],
+            active_seed_addr: RwLock::new(dead_addr),
+            topology: RwLock::new(None),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(None),
+            tls: None,
+            timeout: RwLock::new(Duration::from_millis(200)),
+        });
+
+        // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed
+        // checkouts against the pool's single address would, under the
+        // leak, exhaust its capacity well before the last attempt.
+        for attempt in 0..16 {
+            let result = client.checkout(dead_addr, "my-cache", None).await;
+            assert!(
+                matches!(result, Err(Error::Io(_))),
+                "attempt {attempt} should fail fast with Io, not hang into Timeout"
+            );
+        }
     }
 
     /// Reads one request's fixed header fields far enough to identify the
