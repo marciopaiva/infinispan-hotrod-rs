@@ -1,11 +1,16 @@
 //! Integration test against a real Infinispan server.
 //!
 //! Ignored by default so `cargo test` stays offline. Run explicitly with
-//! `cargo test --test live_server -- --ignored` against a server configured
-//! like `ci/infinispan/infinispan.xml` (PLAIN SASL, a `default` cache). The
-//! release workflow does this against a server it starts itself: this same
-//! put/get/remove sequence is what caught the ERROR_RESPONSE opcode bug
-//! during manual testing, which byte buffers built in unit tests could not.
+//! `cargo test --test live_server -- --ignored --skip cluster_ --skip tls_`
+//! against a server configured like `ci/infinispan/infinispan.xml` (PLAIN
+//! SASL, a `default` cache), started with `ci/infinispan/setup.sh` and
+//! torn down with `ci/infinispan/teardown.sh`. Wired into CI as the
+//! `live-test` job in `.github/workflows/ci.yml` on every push to `main`
+//! and every PR; the release workflow runs the same selection again
+//! against a server it starts itself, as a release-time confidence check
+//! rather than the only place it runs. This same put/get/remove sequence
+//! is what caught the ERROR_RESPONSE opcode bug during manual testing,
+//! which byte buffers built in unit tests could not.
 //!
 //! Connection details come from environment variables so the test can also
 //! be pointed at a local server, with defaults matching the CI fixture.
@@ -16,7 +21,15 @@
 //! Runs as the `tls-test` job in `.github/workflows/ci.yml` on every push
 //! to `main` and every PR (issue #83); run the same two scripts by hand
 //! for local iteration. The release workflow explicitly skips these
-//! (`--skip tls_`): its single-node fixture is plain TCP, not TLS.
+//! (`--skip tls_`): its single-node fixture is plain TCP, not TLS. Besides
+//! the basic put/get/remove roundtrip and certificate rejection, a couple
+//! of `tls_*` tests cover the two places a second layer opens its own
+//! connection rather than going through the one `HotRodConnection`/
+//! `HotRodClient` already authenticate over TLS: SASL running inside the
+//! TLS tunnel, and the client listener's (#4) own dedicated connection.
+//! Every other feature (bulk operations, versioned operations, ...) sits
+//! entirely above the transport layer either way, so it is covered once,
+//! under plain TCP, rather than duplicated here.
 //!
 //! The `cluster_*` tests need a two-node cluster instead, started with
 //! `ci/infinispan-cluster/setup.sh` and torn down with
@@ -152,23 +165,66 @@ fn tls_ca_certificate() -> Vec<u8> {
     })
 }
 
+/// The `TlsConfig` every `connect_tls*` helper below needs, factored out
+/// since it is otherwise identical in each one.
+fn tls_config() -> TlsConfig {
+    TlsConfig {
+        server_name: env_or("INFINISPAN_TLS_SERVER_NAME", "localhost"),
+        ca_certificate: Some(tls_ca_certificate()),
+        client_identity: None,
+    }
+}
+
 async fn connect_tls() -> HotRodConnection {
     let addr = env_or("INFINISPAN_TLS_ADDR", "127.0.0.1:21222");
     let user = env_or("INFINISPAN_USER", "testuser");
     let pass = env_or("INFINISPAN_PASS", "testpass");
-    let tls = TlsConfig {
-        server_name: env_or("INFINISPAN_TLS_SERVER_NAME", "localhost"),
-        ca_certificate: Some(tls_ca_certificate()),
-        client_identity: None,
-    };
 
-    let mut conn = HotRodConnection::connect_tls(&addr, "", &tls)
+    let mut conn = HotRodConnection::connect_tls(&addr, "", &tls_config())
         .await
         .expect("connect_tls");
     conn.authenticate_plain("", &user, &pass)
         .await
         .expect("authenticate");
     conn
+}
+
+/// Same as `connect_tls`, but with SCRAM-SHA-512 instead of PLAIN:
+/// confirms SASL negotiation works the same way inside a TLS tunnel as
+/// it does over plain TCP (`connect_with_scram`), rather than assuming
+/// it because the two layers are independent.
+async fn connect_tls_with_scram() -> HotRodConnection {
+    let addr = env_or("INFINISPAN_TLS_ADDR", "127.0.0.1:21222");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let mut conn = HotRodConnection::connect_tls(&addr, "", &tls_config())
+        .await
+        .expect("connect_tls");
+    conn.authenticate_scram(&user, &pass)
+        .await
+        .expect("authenticate with SCRAM-SHA-512 over TLS");
+    conn
+}
+
+/// Same as `connect_client`, but over TLS: a `HotRodClient`/`RemoteCache`
+/// pair instead of a bare `HotRodConnection`, needed for `listen`/
+/// `listen_with`, which only exist on `RemoteCache`.
+async fn connect_client_tls() -> RemoteCache {
+    let addr: SocketAddr = env_or("INFINISPAN_TLS_ADDR", "127.0.0.1:21222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect_tls(&[addr], tls_config())
+        .await
+        .expect("connect_tls");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+    client.cache("")
 }
 
 /// Seed addresses for a multi-node cluster, needed only by the
@@ -385,6 +441,71 @@ async fn tls_connect_rejects_a_server_certificate_signed_by_an_untrusted_ca() {
 
     let result = HotRodConnection::connect_tls(&addr, "", &tls).await;
     assert!(result.is_err());
+}
+
+/// SASL negotiation (SCRAM-SHA-512 here) running inside a TLS tunnel: a
+/// real combined deployment configuration, not just the PLAIN/TLS
+/// combination `tls_put_get_remove_roundtrip` already covers.
+#[tokio::test]
+#[ignore]
+async fn tls_scram_authenticated_connection_can_put_get_remove() {
+    let _guard = lock_live_server();
+    let mut conn = connect_tls_with_scram().await;
+
+    conn.put(
+        b"ci-tls-scram-key",
+        b"value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+
+    let value = conn.get(b"ci-tls-scram-key").await.expect("get");
+    assert_eq!(value, Some(b"value".to_vec()));
+
+    let removed = conn.remove(b"ci-tls-scram-key").await.expect("remove");
+    assert!(removed);
+}
+
+/// Same shape as `listener_receives_created_and_removed_events_in_order`,
+/// over TLS instead: `RemoteCache::listen_with` opens its own connection
+/// (see `listener.rs`'s module docs), a separate code path from the one
+/// `tls_put_get_remove_roundtrip` already exercises, so it is worth
+/// confirming directly that it also honors the client's TLS config
+/// rather than assuming it from `open_and_authenticate` passing `tls`
+/// through uniformly.
+#[tokio::test]
+#[ignore]
+async fn tls_listener_receives_created_and_removed_events_in_order() {
+    let _guard = lock_live_server();
+    let cache = connect_client_tls().await;
+    let mut conn = connect_tls().await;
+
+    conn.remove(b"ci-tls-listener-key").await.expect("cleanup");
+
+    let mut listener = cache.listen().await.expect("listen");
+
+    conn.put(
+        b"ci-tls-listener-key",
+        b"value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+    conn.remove(b"ci-tls-listener-key").await.expect("remove");
+
+    match listener.next().await.expect("created event").expect("ok") {
+        CacheEvent::Created { key, .. } => assert_eq!(key, b"ci-tls-listener-key"),
+        other => panic!("expected Created, got {other:?}"),
+    }
+    match listener.next().await.expect("removed event").expect("ok") {
+        CacheEvent::Removed { key, .. } => assert_eq!(key, b"ci-tls-listener-key"),
+        other => panic!("expected Removed, got {other:?}"),
+    }
+
+    listener.close().await.expect("close");
 }
 
 #[tokio::test]

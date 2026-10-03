@@ -26,6 +26,30 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
+  live-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Infinispan
+        run: ci/infinispan/setup.sh
+
+      - name: Live-server tests
+        run: cargo test --test live_server -- --ignored --skip cluster_ --skip tls_
+        env:
+          INFINISPAN_ADDR: 127.0.0.1:11222
+          INFINISPAN_USER: testuser
+          INFINISPAN_PASS: testpass
+
+      - name: Stop Infinispan
+        if: always()
+        run: ci/infinispan/teardown.sh
+
   cluster-test:
     needs: test
     runs-on: ubuntu-latest

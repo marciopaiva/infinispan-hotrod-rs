@@ -27,31 +27,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Start Infinispan
-        run: |
-          docker run -d --name infinispan \
-            -p 11222:11222 \
-            -e USER=unused \
-            -e PASS=unused-but-required \
-            -v "$PWD/ci/infinispan/infinispan.xml:/opt/infinispan/server/conf/infinispan.xml:ro" \
-            -v "$PWD/ci/infinispan/users.properties:/opt/infinispan/server/conf/users.properties:ro" \
-            -v "$PWD/ci/infinispan/groups.properties:/opt/infinispan/server/conf/groups.properties:ro" \
-            infinispan/server:15.1
-
-      - name: Wait for Infinispan
-        run: |
-          # The port accepts connections before the server has finished
-          # starting, so a raw TCP check is not enough: wait for the
-          # startup-complete log line instead (ISPN080001).
-          for i in $(seq 1 30); do
-            if docker logs infinispan 2>&1 | grep -q "ISPN080001"; then
-              echo "Infinispan is up"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Infinispan did not come up in time"
-          docker logs infinispan
-          exit 1
+        run: ci/infinispan/setup.sh
 
       - name: Integration test
         # The cluster_* tests need a real multi-node cluster with a
@@ -59,7 +35,11 @@ jobs:
         # the tls_* tests need a TLS-enabled server
         # (ci/infinispan-tls/setup.sh); this single-node, plain-TCP fixture
         # is neither, so both run instead as their own jobs in ci.yml
-        # (cluster-test, tls-test) rather than here.
+        # (cluster-test, tls-test) rather than here. This same selection
+        # already runs on every push and PR too, as the live-test job in
+        # ci.yml; running it again here is a release-time confidence
+        # check against a freshly started server, not the only place it
+        # runs.
         run: cargo test --test live_server -- --ignored --skip cluster_ --skip tls_
         env:
           INFINISPAN_ADDR: 127.0.0.1:11222
@@ -68,4 +48,4 @@ jobs:
 
       - name: Stop Infinispan
         if: always()
-        run: docker rm -f infinispan
+        run: ci/infinispan/teardown.sh
