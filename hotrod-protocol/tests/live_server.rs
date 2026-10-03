@@ -14,8 +14,9 @@
 //! with `ci/infinispan-tls/setup.sh` (which also generates the throwaway CA
 //! and keystore it uses) and torn down with `ci/infinispan-tls/teardown.sh`.
 //! Runs as the `tls-test` job in `.github/workflows/ci.yml` on every push
-//! and PR (issue #83); run the same two scripts by hand for local
-//! iteration.
+//! to `main` and every PR (issue #83); run the same two scripts by hand
+//! for local iteration. The release workflow explicitly skips these
+//! (`--skip tls_`): its single-node fixture is plain TCP, not TLS.
 //!
 //! The `cluster_*` tests need a two-node cluster instead, started with
 //! `ci/infinispan-cluster/setup.sh` and torn down with
