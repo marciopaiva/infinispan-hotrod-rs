@@ -163,3 +163,37 @@ from the wrapped `RemoteCache` unmodified.
 * Bloom-filter support (`addNearCacheListener`'s traffic optimization)
   is explicitly out of scope, left as a future, independent proposal
   if invalidation traffic turns out to matter in practice.
+* No per-entry lifespan or `max_idle`. A local hit never reaches the
+  server, so an entry that is read often never refreshes its
+  `max_idle` timer there either, and one past its `lifespan` can keep
+  being served locally until an `Expired` event or capacity pressure
+  removes it. `get_with_version`/`VersionedValue` already carry this
+  metadata, so a future revision could fetch and track it instead of
+  a bare value; this phase does not, and `near_cache.rs`'s module docs
+  call this out directly rather than leave it to be discovered by
+  surprise.
+* `get` snapshots `LruStore`'s generation counter before fetching from
+  the remote cache, and only inserts the result if that counter is
+  still the same afterward. Caught by this PR's own review: without
+  it, an invalidating event for a key not yet cached (a no-op besides
+  the counter bump) could land while a `get` for that same key was
+  still in flight, and the fetch would then cache a value the event
+  had no way to know to invalidate, since it was never in the store to
+  begin with. The same counter closes an equivalent race against
+  `clear`.
+* `put`, `remove` and `clear` now invalidate their local state
+  unconditionally, before inspecting whether the remote call
+  succeeded, rather than only on `Ok`. Also caught by review: a write
+  whose response is lost to a timeout or a connection error may still
+  have landed server-side, and skipping the local invalidation in
+  that case left the stale pre-write value cached with nothing left to
+  correct it (the listener's own event for that write depends on the
+  write having been seen by the server, which this client cannot
+  distinguish from "lost entirely" by the response alone). Invalidating
+  unconditionally only costs a future cache miss when the write in
+  fact never landed.
+* The "any write through any path still invalidates this cache"
+  framing in an earlier draft of this ADR and of `near_cache.rs`'s own
+  doc comments overstated `clear`: fixed to call out `clear` as the
+  one exception the listener cannot help with regardless of which
+  handle performs it, not just a slower path to the same guarantee.

@@ -4,15 +4,26 @@
 //! implements).
 //!
 //! This adds no wire surface beyond what `listener.rs` (#4) already
-//! has: a `NearCachedCache` is a `RemoteCache` plus an ordinary client
-//! listener, interested only in `Modified`/`Removed`/`Expired` (a
-//! freshly created entry was never locally cached, so there is nothing
-//! to invalidate). If that listener's connection drops, this client
-//! does not reconnect it (the same decision `listener.rs` already made
-//! for `CacheListener` itself): the near cache instead clears itself
-//! and stops serving from the local store, falling back to plain
-//! passthrough rather than risk serving data no invalidation feed can
-//! ever correct again.
+//! has. A `NearCachedCache` is a `RemoteCache` plus an ordinary client
+//! listener, interested only in `Modified`/`Removed`/`Expired`. A
+//! freshly created entry was never locally cached, so there is
+//! nothing to invalidate.
+//!
+//! If the listener's connection drops, this client does not reconnect
+//! it, the same decision `listener.rs` already made for
+//! `CacheListener` itself. The near cache instead clears itself and
+//! stops serving from the local store. Every `get` falls back to
+//! plain passthrough from then on, rather than risk serving data no
+//! invalidation feed can ever correct again.
+//!
+//! Does not track per-entry lifespan or max idle. A local hit never
+//! reaches the server, so it never refreshes a `max_idle` timer there
+//! either; an entry can also outlive its own `lifespan` locally until
+//! an `Expired` event (or capacity pressure) removes it. Honoring
+//! either would need fetching entry metadata, not just a value (see
+//! `connection::VersionedValue`), which this phase leaves out. Treat
+//! near caching as an optimization for data that does not depend on
+//! either expiration to be observed promptly.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
@@ -49,16 +60,30 @@ impl Default for NearCacheOptions {
 /// used one. This crate forbids `unsafe`, which rules out the usual
 /// O(1) LRU (an index-linked list); a near cache's typical size does
 /// not call for that complexity anyway.
+///
+/// `generation` counts every call to `invalidate`/`clear`, whether or
+/// not the key they name is actually present. `insert_if_current`
+/// checks it to close a race `get` would otherwise have: a value
+/// fetched from the remote cache can be stale by the time the fetch
+/// returns, if an invalidating event for that same key arrived while
+/// the fetch was still in flight and found nothing yet to invalidate.
+/// Comparing generations (checked and advanced under the same lock
+/// that guards every other mutation) catches that case even though
+/// the key itself was never in `entries` to begin with.
 struct LruStore {
+    max_entries: usize,
     tick: u64,
+    generation: u64,
     entries: HashMap<Vec<u8>, (Vec<u8>, u64)>,
     order: BTreeMap<u64, Vec<u8>>,
 }
 
 impl LruStore {
-    fn new() -> Self {
+    fn new(max_entries: usize) -> Self {
         Self {
+            max_entries,
             tick: 0,
+            generation: 0,
             entries: HashMap::new(),
             order: BTreeMap::new(),
         }
@@ -69,41 +94,64 @@ impl LruStore {
         self.tick
     }
 
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        let (value, old_tick) = self.entries.get(key)?.clone();
+        let old_tick = self.entries.get(key)?.1;
         self.order.remove(&old_tick);
         let new_tick = self.next_tick();
         self.order.insert(new_tick, key.to_vec());
-        self.entries.insert(key.to_vec(), (value.clone(), new_tick));
-        Some(value)
+        let entry = self
+            .entries
+            .get_mut(key)
+            .expect("just confirmed present above");
+        entry.1 = new_tick;
+        Some(entry.0.clone())
     }
 
-    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>, max_entries: usize) {
+    /// Inserts `key`/`value`, but only if `generation` still matches:
+    /// otherwise some invalidation landed since the caller fetched
+    /// this value, and inserting it now could resurrect a value an
+    /// event already tried to invalidate. See the struct docs.
+    fn insert_if_current(&mut self, key: Vec<u8>, value: Vec<u8>, generation: u64) {
+        if generation != self.generation {
+            return;
+        }
         if let Some((_, old_tick)) = self.entries.get(&key) {
             self.order.remove(old_tick);
         }
         let new_tick = self.next_tick();
         self.order.insert(new_tick, key.clone());
         self.entries.insert(key, (value, new_tick));
-        while self.entries.len() > max_entries {
-            let Some((&oldest_tick, _)) = self.order.iter().next() else {
+        while self.entries.len() > self.max_entries {
+            let Some((_, oldest_key)) = self.order.pop_first() else {
                 break;
             };
-            if let Some(oldest_key) = self.order.remove(&oldest_tick) {
-                self.entries.remove(&oldest_key);
-            }
+            self.entries.remove(&oldest_key);
         }
     }
 
     fn invalidate(&mut self, key: &[u8]) {
+        self.generation = self.generation.wrapping_add(1);
         if let Some((_, tick)) = self.entries.remove(key) {
             self.order.remove(&tick);
         }
     }
 
     fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.entries.clear();
         self.order.clear();
+    }
+
+    /// `insert_if_current` unconditionally, for tests that do not care
+    /// about the generation check itself.
+    #[cfg(test)]
+    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        let generation = self.generation;
+        self.insert_if_current(key, value, generation);
     }
 }
 
@@ -112,7 +160,6 @@ impl LruStore {
 /// never held across an `.await`: every operation on `LruStore` is a
 /// plain, non-blocking map access.
 struct NearCacheState {
-    max_entries: usize,
     alive: AtomicBool,
     store: Mutex<LruStore>,
 }
@@ -120,9 +167,8 @@ struct NearCacheState {
 impl NearCacheState {
     fn new(max_entries: usize) -> Self {
         Self {
-            max_entries,
             alive: AtomicBool::new(true),
-            store: Mutex::new(LruStore::new()),
+            store: Mutex::new(LruStore::new(max_entries)),
         }
     }
 
@@ -130,29 +176,28 @@ impl NearCacheState {
         self.alive.load(Ordering::Acquire)
     }
 
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(key)
+    fn lock(&self) -> std::sync::MutexGuard<'_, LruStore> {
+        self.store.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn insert(&self, key: Vec<u8>, value: Vec<u8>) {
-        self.store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key, value, self.max_entries);
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.lock().get(key)
+    }
+
+    fn generation(&self) -> u64 {
+        self.lock().generation()
+    }
+
+    fn insert_if_current(&self, key: Vec<u8>, value: Vec<u8>, generation: u64) {
+        self.lock().insert_if_current(key, value, generation);
     }
 
     fn invalidate(&self, key: &[u8]) {
-        self.store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .invalidate(key);
+        self.lock().invalidate(key);
     }
 
     fn clear(&self) {
-        self.store.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.lock().clear();
     }
 
     /// The invalidation feed is gone for good (no reconnection, see the
@@ -166,14 +211,30 @@ impl NearCacheState {
 }
 
 /// A `RemoteCache` wrapped with a bounded, listener-invalidated local
-/// cache for `get`, obtained from `RemoteCache::near_cache`. Every
-/// operation `RemoteCache` has beyond `get`/`put`/`remove`/`clear` is
-/// reached through `Deref`, unmodified: a write through any of those,
-/// through a plain `RemoteCache` bypassing this wrapper entirely, or
-/// from another client altogether, still invalidates this cache's
-/// local entry, because the listener this type runs in the background
-/// receives that event regardless of which API caused it. Not
-/// `Clone`: wrap it in an `Arc` to share it across tasks.
+/// cache for `get`, obtained from `RemoteCache::near_cache`.
+///
+/// `put` and `remove` invalidate their key locally right away, on top
+/// of the background listener. A `put` or `remove` reaching this cache
+/// through any other path, a plain `RemoteCache` handle bypassing this
+/// wrapper entirely, or another client altogether, is still caught,
+/// just on the listener's own asynchronous delay instead of
+/// immediately: it generates the same event, and the background
+/// listener receives it regardless of which API caused it. `replace`,
+/// `put_if_absent`, the versioned operations, and `get_all`/`put_all`
+/// are not overridden at all (see `Deref` below): they stay correct
+/// the same asynchronous way, just without the immediate, synchronous
+/// invalidation `put`/`remove` add on top.
+///
+/// `clear` is the one write the listener cannot catch on its own: the
+/// protocol sends no per-key event for it, so only
+/// `NearCachedCache::clear` itself keeps the local cache in sync with
+/// a `clear` through this handle. A `clear` through any other handle
+/// leaves this cache's local entries stale with nothing to correct
+/// them.
+///
+/// Every operation `RemoteCache` has beyond `get`/`put`/`remove`/
+/// `clear` is reached through `Deref`, unmodified. Not `Clone`: wrap
+/// it in an `Arc` to share it across tasks.
 pub struct NearCachedCache {
     cache: RemoteCache,
     state: Arc<NearCacheState>,
@@ -236,25 +297,35 @@ impl NearCachedCache {
     /// Returns `key`'s value from the local cache if present and the
     /// invalidation feed is still alive; otherwise fetches it from the
     /// remote cache and, on a hit, stores it locally for next time.
+    /// The local store is not updated if an invalidation for this key
+    /// (or a `clear`) happened while the fetch was in flight: see
+    /// `LruStore`'s docs for why that matters.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if self.state.is_alive() {
             if let Some(value) = self.state.get(key) {
                 return Ok(Some(value));
             }
         }
+        let generation = self.state.generation();
         let value = self.cache.get(key).await?;
         if self.state.is_alive() {
             if let Some(value) = &value {
-                self.state.insert(key.to_vec(), value.clone());
+                self.state
+                    .insert_if_current(key.to_vec(), value.clone(), generation);
             }
         }
         Ok(value)
     }
 
     /// Writes through to the remote cache, then invalidates the local
-    /// entry: the listener will invalidate it too once its event
-    /// arrives, but only after a round trip this closes immediately for
-    /// the caller's own writes.
+    /// entry regardless of whether that write succeeded: a write whose
+    /// response was lost to a timeout or a connection error may still
+    /// have landed server-side, and invalidating a key that in fact
+    /// never changed only costs a future cache miss, while not
+    /// invalidating one that did risks the local entry never getting
+    /// corrected at all. The listener invalidates the same key too,
+    /// once its event arrives; this closes the gap immediately instead
+    /// of waiting on that round trip.
     pub async fn put(
         &self,
         key: &[u8],
@@ -262,26 +333,28 @@ impl NearCachedCache {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
-        self.cache.put(key, value, lifespan, max_idle).await?;
+        let result = self.cache.put(key, value, lifespan, max_idle).await;
         self.state.invalidate(key);
-        Ok(())
+        result
     }
 
-    /// Same reasoning as `put`: remove through to the remote cache
-    /// first, then drop the local entry immediately.
+    /// Same reasoning as `put`: invalidate the local entry whether or
+    /// not the remote removal itself succeeded.
     pub async fn remove(&self, key: &[u8]) -> Result<bool> {
-        let removed = self.cache.remove(key).await?;
+        let result = self.cache.remove(key).await;
         self.state.invalidate(key);
-        Ok(removed)
+        result
     }
 
-    /// Clears the remote cache, then the local one: the listener does
-    /// not get a per-key event for every entry a `clear` removes, so
-    /// this is the only way the local cache would learn about it.
+    /// Clears the remote cache, then the local one, regardless of
+    /// whether the remote clear succeeded: the same reasoning as
+    /// `put`. The listener cannot help here either way, successful or
+    /// not: it gets no per-key event for a `clear`, so this is the
+    /// only way the local cache ever learns about one.
     pub async fn clear(&self) -> Result<()> {
-        self.cache.clear().await?;
+        let result = self.cache.clear().await;
         self.state.clear();
-        Ok(())
+        result
     }
 }
 
@@ -289,28 +362,24 @@ impl NearCachedCache {
 mod tests {
     use super::*;
 
-    fn store_with_capacity(max_entries: usize) -> (LruStore, usize) {
-        (LruStore::new(), max_entries)
-    }
-
     #[test]
     fn get_returns_none_for_a_missing_key() {
-        let (mut store, _) = store_with_capacity(10);
+        let mut store = LruStore::new(10);
         assert_eq!(store.get(b"missing"), None);
     }
 
     #[test]
     fn insert_then_get_round_trips_the_value() {
-        let (mut store, cap) = store_with_capacity(10);
-        store.insert(b"key".to_vec(), b"value".to_vec(), cap);
+        let mut store = LruStore::new(10);
+        store.insert(b"key".to_vec(), b"value".to_vec());
         assert_eq!(store.get(b"key"), Some(b"value".to_vec()));
     }
 
     #[test]
     fn insert_overwrites_an_existing_key_without_growing() {
-        let (mut store, cap) = store_with_capacity(10);
-        store.insert(b"key".to_vec(), b"first".to_vec(), cap);
-        store.insert(b"key".to_vec(), b"second".to_vec(), cap);
+        let mut store = LruStore::new(10);
+        store.insert(b"key".to_vec(), b"first".to_vec());
+        store.insert(b"key".to_vec(), b"second".to_vec());
         assert_eq!(store.get(b"key"), Some(b"second".to_vec()));
         assert_eq!(store.entries.len(), 1);
         assert_eq!(store.order.len(), 1);
@@ -318,24 +387,24 @@ mod tests {
 
     #[test]
     fn invalidate_removes_the_entry() {
-        let (mut store, cap) = store_with_capacity(10);
-        store.insert(b"key".to_vec(), b"value".to_vec(), cap);
+        let mut store = LruStore::new(10);
+        store.insert(b"key".to_vec(), b"value".to_vec());
         store.invalidate(b"key");
         assert_eq!(store.get(b"key"), None);
     }
 
     #[test]
     fn invalidate_on_a_missing_key_is_a_no_op() {
-        let (mut store, _) = store_with_capacity(10);
+        let mut store = LruStore::new(10);
         store.invalidate(b"missing");
         assert_eq!(store.entries.len(), 0);
     }
 
     #[test]
     fn clear_empties_the_store() {
-        let (mut store, cap) = store_with_capacity(10);
-        store.insert(b"a".to_vec(), b"1".to_vec(), cap);
-        store.insert(b"b".to_vec(), b"2".to_vec(), cap);
+        let mut store = LruStore::new(10);
+        store.insert(b"a".to_vec(), b"1".to_vec());
+        store.insert(b"b".to_vec(), b"2".to_vec());
         store.clear();
         assert_eq!(store.get(b"a"), None);
         assert_eq!(store.get(b"b"), None);
@@ -344,11 +413,52 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_bumps_the_generation_even_for_a_missing_key() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        store.invalidate(b"never-cached");
+        assert_ne!(store.generation(), generation);
+    }
+
+    #[test]
+    fn clear_bumps_the_generation() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        store.clear();
+        assert_ne!(store.generation(), generation);
+    }
+
+    /// The race `insert_if_current` exists to close: a `get` snapshots
+    /// the generation before fetching from the remote cache, and an
+    /// invalidation for that same key can land while the fetch is
+    /// still in flight, before the key was ever in the store to
+    /// invalidate. Skipping the insert once the generation has moved
+    /// on, rather than inserting unconditionally, is what keeps that
+    /// fetch from resurrecting a value the invalidation already meant
+    /// to discard.
+    #[test]
+    fn insert_if_current_is_skipped_once_the_generation_moved_on() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        store.invalidate(b"key"); // not cached yet: a no-op besides the bump
+        store.insert_if_current(b"key".to_vec(), b"stale".to_vec(), generation);
+        assert_eq!(store.get(b"key"), None);
+    }
+
+    #[test]
+    fn insert_if_current_succeeds_when_the_generation_is_unchanged() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation);
+        assert_eq!(store.get(b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
     fn insert_past_capacity_evicts_the_least_recently_used_entry() {
-        let (mut store, cap) = store_with_capacity(2);
-        store.insert(b"a".to_vec(), b"1".to_vec(), cap);
-        store.insert(b"b".to_vec(), b"2".to_vec(), cap);
-        store.insert(b"c".to_vec(), b"3".to_vec(), cap);
+        let mut store = LruStore::new(2);
+        store.insert(b"a".to_vec(), b"1".to_vec());
+        store.insert(b"b".to_vec(), b"2".to_vec());
+        store.insert(b"c".to_vec(), b"3".to_vec());
 
         assert_eq!(store.get(b"a"), None, "a was the least recently used");
         assert_eq!(store.get(b"b"), Some(b"2".to_vec()));
@@ -357,12 +467,12 @@ mod tests {
 
     #[test]
     fn get_refreshes_recency_so_it_survives_the_next_eviction() {
-        let (mut store, cap) = store_with_capacity(2);
-        store.insert(b"a".to_vec(), b"1".to_vec(), cap);
-        store.insert(b"b".to_vec(), b"2".to_vec(), cap);
+        let mut store = LruStore::new(2);
+        store.insert(b"a".to_vec(), b"1".to_vec());
+        store.insert(b"b".to_vec(), b"2".to_vec());
         // Touch "a" so "b" becomes the least recently used instead.
         store.get(b"a");
-        store.insert(b"c".to_vec(), b"3".to_vec(), cap);
+        store.insert(b"c".to_vec(), b"3".to_vec());
 
         assert_eq!(store.get(b"a"), Some(b"1".to_vec()));
         assert_eq!(store.get(b"b"), None, "b was the least recently used");
@@ -389,7 +499,7 @@ mod tests {
         use crate::listener::tests::{event_frame, read_listener_id};
         use crate::wire::{read_array, write_array};
 
-        fn client_with_seed(seed_addr: SocketAddr) -> HotRodClient {
+        fn client_with_seed_and_timeout(seed_addr: SocketAddr, timeout: Duration) -> HotRodClient {
             HotRodClient::from_inner(ClientInner {
                 seed_addrs: vec![seed_addr],
                 active_seed_addr: RwLock::new(seed_addr),
@@ -398,8 +508,12 @@ mod tests {
                 pools: RwLock::new(StdHashMap::new()),
                 auth: RwLock::new(None),
                 tls: None,
-                timeout: RwLock::new(Duration::from_secs(5)),
+                timeout: RwLock::new(timeout),
             })
+        }
+
+        fn client_with_seed(seed_addr: SocketAddr) -> HotRodClient {
+            client_with_seed_and_timeout(seed_addr, Duration::from_secs(5))
         }
 
         /// Polls `near.get(key)` until it returns `expected` or `attempts`
@@ -567,6 +681,140 @@ mod tests {
             assert_eq!(after_death, b"value-after-death");
 
             server.await.unwrap();
+        }
+
+        /// `put`'s write times out (the server never responds), yet the
+        /// local entry is still invalidated: the timed-out connection is
+        /// not returned to the pool, so the next `get` opens a new one.
+        #[tokio::test]
+        async fn put_invalidates_the_local_entry_even_when_the_write_times_out() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (mut listen_sock, _) = tcp.accept().await.unwrap();
+                let (id, _listener_id) = read_listener_id(&mut listen_sock).await;
+                listen_sock
+                    .write_all(&response_header(id, 0x26, 0x00))
+                    .await
+                    .unwrap();
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                let (id, opcode) = read_request_opcode(&mut op_sock).await;
+                assert_eq!(opcode, 0x03, "expected the first Get request");
+                let _key = read_array(&mut op_sock).await.unwrap();
+                let mut resp = response_header(id, 0x04, 0x00);
+                write_array(&mut resp, b"value");
+                op_sock.write_all(&resp).await.unwrap();
+
+                // A Put that never gets a response.
+                let (_id, opcode) = read_request_opcode(&mut op_sock).await;
+                assert_eq!(opcode, 0x01, "expected a Put request");
+
+                let (mut retry_sock, _) = tcp.accept().await.unwrap();
+                let (id, opcode) = read_request_opcode(&mut retry_sock).await;
+                assert_eq!(opcode, 0x03, "expected a second Get on a new connection");
+                let _key = read_array(&mut retry_sock).await.unwrap();
+                let mut resp = response_header(id, 0x04, 0x00);
+                write_array(&mut resp, b"value-after-timeout");
+                retry_sock.write_all(&resp).await.unwrap();
+
+                listen_sock
+            });
+
+            let client = client_with_seed_and_timeout(addr, Duration::from_millis(200));
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            let put_result = near
+                .put(
+                    b"key",
+                    b"new-value",
+                    Expiration::Default,
+                    Expiration::Default,
+                )
+                .await;
+            assert!(
+                matches!(put_result, Err(crate::error::Error::Timeout(_))),
+                "expected the put itself to time out, got {put_result:?}"
+            );
+
+            // The local entry must already be gone: no polling needed,
+            // `put` invalidates before returning, successful or not.
+            assert_eq!(
+                near.get(b"key").await.unwrap(),
+                Some(b"value-after-timeout".to_vec())
+            );
+
+            drop(server.await.unwrap());
+        }
+
+        /// Same reasoning as the `put` test above, for `clear`: the
+        /// remote clear times out, but the local cache is wiped anyway.
+        #[tokio::test]
+        async fn clear_invalidates_the_local_cache_even_when_it_times_out() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (mut listen_sock, _) = tcp.accept().await.unwrap();
+                let (id, _listener_id) = read_listener_id(&mut listen_sock).await;
+                listen_sock
+                    .write_all(&response_header(id, 0x26, 0x00))
+                    .await
+                    .unwrap();
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                let (id, opcode) = read_request_opcode(&mut op_sock).await;
+                assert_eq!(opcode, 0x03, "expected the first Get request");
+                let _key = read_array(&mut op_sock).await.unwrap();
+                let mut resp = response_header(id, 0x04, 0x00);
+                write_array(&mut resp, b"value");
+                op_sock.write_all(&resp).await.unwrap();
+
+                // A Clear that never gets a response.
+                let (_id, opcode) = read_request_opcode(&mut op_sock).await;
+                assert_eq!(opcode, 0x13, "expected a Clear request");
+
+                let (mut retry_sock, _) = tcp.accept().await.unwrap();
+                let (id, opcode) = read_request_opcode(&mut retry_sock).await;
+                assert_eq!(opcode, 0x03, "expected a second Get on a new connection");
+                let _key = read_array(&mut retry_sock).await.unwrap();
+                let mut resp = response_header(id, 0x04, 0x00);
+                write_array(&mut resp, b"value-after-timeout");
+                retry_sock.write_all(&resp).await.unwrap();
+
+                listen_sock
+            });
+
+            let client = client_with_seed_and_timeout(addr, Duration::from_millis(200));
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            let clear_result = near.clear().await;
+            assert!(
+                matches!(clear_result, Err(crate::error::Error::Timeout(_))),
+                "expected the clear itself to time out, got {clear_result:?}"
+            );
+
+            // No polling needed: `clear` invalidates before returning,
+            // successful or not.
+            assert_eq!(
+                near.get(b"key").await.unwrap(),
+                Some(b"value-after-timeout".to_vec())
+            );
+
+            drop(server.await.unwrap());
         }
     }
 }
