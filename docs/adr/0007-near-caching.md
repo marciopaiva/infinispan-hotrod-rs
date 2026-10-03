@@ -173,6 +173,14 @@ from the wrapped `RemoteCache` unmodified.
 * Bloom-filter support (`addNearCacheListener`'s traffic optimization)
   is explicitly out of scope, left as a future, independent proposal
   if invalidation traffic turns out to matter in practice.
+* No in-flight request coalescing: concurrent `get` calls that each
+  miss on the same key each run their own independent network fetch,
+  rather than one caller's fetch being shared by the others. Flagged
+  by review as worth naming explicitly rather than leaving as an
+  implicit gap: deliberately out of scope for the same reason as the
+  bloom filter, a traffic optimization with its own complexity
+  (tracking in-flight fetches per key, deciding how late a waiter can
+  still join one), not a correctness requirement this phase needs.
 * No per-entry lifespan or `max_idle`. A local hit never reaches the
   server, so an entry that is read often never refreshes its
   `max_idle` timer there either, and one past its `lifespan` can keep
