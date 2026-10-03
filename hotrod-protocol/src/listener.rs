@@ -376,7 +376,7 @@ async fn read_event_after_magic<R: AsyncRead + Unpin>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
@@ -386,7 +386,7 @@ mod tests {
     use crate::varint::write_vlong;
     use crate::wire::write_array;
 
-    fn event_frame(
+    pub(crate) fn event_frame(
         message_id: u64,
         opcode: u8,
         listener_id: &[u8],
@@ -415,7 +415,7 @@ mod tests {
     /// listener id it carries (the one piece a test needs to echo back in
     /// synthetic event frames), trusting the rest of the body's shape is
     /// already covered by `register_sends_well_formed_add_client_listener_request`.
-    async fn read_listener_id(stream: &mut TcpStream) -> (u64, Vec<u8>) {
+    pub(crate) async fn read_listener_id(stream: &mut TcpStream) -> (u64, Vec<u8>) {
         let (id, opcode) = read_request_opcode(stream).await;
         assert_eq!(opcode, 0x25, "expected an AddClientListener request");
         let listener_id = read_array(stream).await.unwrap();

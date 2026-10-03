@@ -24,7 +24,7 @@ for release notes.
 | TLS and mutual TLS | Yes | Yes |
 | Cluster topology tracking, hash-aware routing | Yes | Yes |
 | Client listeners (cache events) | Yes | Yes |
-| Near caching | Yes | No ([#5](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/5)) |
+| Near caching | Yes | Yes |
 | Transactions | Yes | No |
 | Multimap cache | Yes | No |
 | Counters | Yes | No |
@@ -84,6 +84,21 @@ while let Some(event) = listener.next().await {
         _ => {}
     }
 }
+```
+
+`near_cache` wraps a `RemoteCache` with a bounded local cache for `get`,
+invalidated through a listener running in the background. Everything
+besides `get`/`put`/`remove`/`clear` is still reached straight through
+to the underlying `RemoteCache`:
+
+```rust
+use hotrod_protocol::NearCacheOptions;
+
+let near = cache.near_cache(NearCacheOptions::default()).await?;
+near.put(b"key", b"value", Expiration::Default, Expiration::Default)
+    .await?;
+let value = near.get(b"key").await?; // served from the network once, cached after
+let count = near.size().await?; // reached through to the underlying RemoteCache
 ```
 
 ## License

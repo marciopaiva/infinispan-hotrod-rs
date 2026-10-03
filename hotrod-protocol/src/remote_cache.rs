@@ -15,6 +15,7 @@ use crate::client::HotRodClient;
 use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
 use crate::error::{Error, Result};
 use crate::listener::{CacheListener, ListenOptions};
+use crate::near_cache::{NearCacheOptions, NearCachedCache};
 use crate::wire::Expiration;
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -349,6 +350,15 @@ impl RemoteCache {
         .await
     }
 
+    /// Wraps this cache with a bounded, listener-invalidated local cache
+    /// for `get` (phase 5 of ADR 0001, see
+    /// `docs/adr/0007-near-caching.md`). Internally registers a listener
+    /// the same way `listen_with` does, interested only in
+    /// `Modified`/`Removed`/`Expired`.
+    pub async fn near_cache(&self, options: NearCacheOptions) -> Result<NearCachedCache> {
+        NearCachedCache::register(self.clone(), options).await
+    }
+
     /// Routes `key` to its computed owner, checking out a connection for
     /// this cache (opening and authenticating one first if needed) and
     /// running `op` against it. On an I/O or timeout error, the checked
@@ -456,7 +466,7 @@ impl RemoteCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::net::SocketAddr;
@@ -479,10 +489,13 @@ mod tests {
     /// `connect`: several tests need `seed_addrs` to include an address
     /// never dialed during construction (a second seed to fail over to),
     /// which `connect` has no way to express since it always dials every
-    /// seed up front.
-    fn client_with_seeds(
+    /// seed up front. Shared with `near_cache.rs`'s own tests via
+    /// `client_with_seeds_and_timeout`, rather than each rebuilding the
+    /// same `ClientInner` literal.
+    pub(crate) fn client_with_seeds_and_timeout(
         seed_addrs: Vec<SocketAddr>,
         active_seed_addr: SocketAddr,
+        timeout: Duration,
     ) -> HotRodClient {
         HotRodClient::from_inner(ClientInner {
             seed_addrs,
@@ -492,8 +505,15 @@ mod tests {
             pools: RwLock::new(StdHashMap::new()),
             auth: RwLock::new(None),
             tls: None,
-            timeout: RwLock::new(Duration::from_millis(100)),
+            timeout: RwLock::new(timeout),
         })
+    }
+
+    fn client_with_seeds(
+        seed_addrs: Vec<SocketAddr>,
+        active_seed_addr: SocketAddr,
+    ) -> HotRodClient {
+        client_with_seeds_and_timeout(seed_addrs, active_seed_addr, Duration::from_millis(100))
     }
 
     fn set_topology(client: &HotRodClient, topology: ClusterTopology) {

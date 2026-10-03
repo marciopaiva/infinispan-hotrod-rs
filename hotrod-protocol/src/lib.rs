@@ -21,7 +21,9 @@
 //! `RemoteCache::listen`/`listen_with` (phase 4, see
 //! `docs/adr/0006-client-listeners.md`) register a client listener on its
 //! own dedicated connection, returning a `CacheListener` to pull
-//! `CacheEvent`s from. No near caching yet.
+//! `CacheEvent`s from. `RemoteCache::near_cache` (phase 5, see
+//! `docs/adr/0007-near-caching.md`) builds on that listener to keep a
+//! bounded, invalidated local cache of recently read entries.
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +34,7 @@ mod error;
 mod hash;
 mod header;
 mod listener;
+mod near_cache;
 mod pool;
 mod remote_cache;
 mod sasl;
@@ -46,6 +49,7 @@ pub use client::HotRodClient;
 pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT};
 pub use error::{Error, Result};
 pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions, ServerFactory};
+pub use near_cache::{NearCacheOptions, NearCachedCache};
 pub use remote_cache::RemoteCache;
 pub use tls::TlsConfig;
 pub use wire::Expiration;
