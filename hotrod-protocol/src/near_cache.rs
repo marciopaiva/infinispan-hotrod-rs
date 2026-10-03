@@ -106,10 +106,7 @@ impl LruStore {
         self.order.remove(&old_tick);
         let new_tick = self.next_tick();
         self.order.insert(new_tick, key.to_vec());
-        let entry = self
-            .entries
-            .get_mut(key)
-            .expect("just confirmed present above");
+        let entry = self.entries.get_mut(key)?;
         entry.1 = new_tick;
         Some(entry.0.clone())
     }
@@ -488,9 +485,7 @@ mod tests {
     /// itself is exhaustively covered above without any I/O; these
     /// exercise the wiring around it instead.
     mod wiring {
-        use std::collections::HashMap as StdHashMap;
         use std::net::SocketAddr;
-        use std::sync::RwLock;
         use std::time::Duration;
 
         use tokio::io::AsyncWriteExt;
@@ -498,21 +493,13 @@ mod tests {
 
         use super::*;
         use crate::client::tests::{read_request_opcode, response_header};
-        use crate::client::{ClientInner, HotRodClient};
+        use crate::client::HotRodClient;
         use crate::listener::tests::{event_frame, read_listener_id};
+        use crate::remote_cache::tests::client_with_seeds_and_timeout;
         use crate::wire::{read_array, write_array};
 
         fn client_with_seed_and_timeout(seed_addr: SocketAddr, timeout: Duration) -> HotRodClient {
-            HotRodClient::from_inner(ClientInner {
-                seed_addrs: vec![seed_addr],
-                active_seed_addr: RwLock::new(seed_addr),
-                topology: RwLock::new(None),
-                node_origin: RwLock::new(StdHashMap::new()),
-                pools: RwLock::new(StdHashMap::new()),
-                auth: RwLock::new(None),
-                tls: None,
-                timeout: RwLock::new(timeout),
-            })
+            client_with_seeds_and_timeout(vec![seed_addr], seed_addr, timeout)
         }
 
         fn client_with_seed(seed_addr: SocketAddr) -> HotRodClient {

@@ -466,7 +466,7 @@ impl RemoteCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::net::SocketAddr;
@@ -489,10 +489,13 @@ mod tests {
     /// `connect`: several tests need `seed_addrs` to include an address
     /// never dialed during construction (a second seed to fail over to),
     /// which `connect` has no way to express since it always dials every
-    /// seed up front.
-    fn client_with_seeds(
+    /// seed up front. Shared with `near_cache.rs`'s own tests via
+    /// `client_with_seeds_and_timeout`, rather than each rebuilding the
+    /// same `ClientInner` literal.
+    pub(crate) fn client_with_seeds_and_timeout(
         seed_addrs: Vec<SocketAddr>,
         active_seed_addr: SocketAddr,
+        timeout: Duration,
     ) -> HotRodClient {
         HotRodClient::from_inner(ClientInner {
             seed_addrs,
@@ -502,8 +505,15 @@ mod tests {
             pools: RwLock::new(StdHashMap::new()),
             auth: RwLock::new(None),
             tls: None,
-            timeout: RwLock::new(Duration::from_millis(100)),
+            timeout: RwLock::new(timeout),
         })
+    }
+
+    fn client_with_seeds(
+        seed_addrs: Vec<SocketAddr>,
+        active_seed_addr: SocketAddr,
+    ) -> HotRodClient {
+        client_with_seeds_and_timeout(seed_addrs, active_seed_addr, Duration::from_millis(100))
     }
 
     fn set_topology(client: &HotRodClient, topology: ClusterTopology) {
