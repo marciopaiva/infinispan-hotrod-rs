@@ -145,8 +145,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   and rejection of a server certificate signed by an untrusted CA. Unlike
   the `cluster_*` tests, this fixture needs its own server, started with
   the new `ci/infinispan-tls/setup.sh` and torn down with
-  `ci/infinispan-tls/teardown.sh`; like `cluster_*`, it stays out of every
-  CI workflow and is meant to be run by hand (see the ADR for why).
+  `ci/infinispan-tls/teardown.sh`; like `cluster_*` at the time, it
+  stayed out of every CI workflow and was meant to be run by hand (wired
+  in later by #83, the same way #78 did for `cluster_*`).
 
 ## [0.3.0] - 2026-09-29
 
