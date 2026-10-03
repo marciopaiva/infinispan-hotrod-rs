@@ -11,7 +11,10 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Near caching: `RemoteCache::near_cache` wraps a cache with a bounded,
   listener-invalidated local cache for `get`, per
   `docs/adr/0007-near-caching.md` (#5). `NearCacheOptions` sets how many
-  entries it keeps (`max_entries`, least-recently-used eviction).
+  entries it keeps (`max_entries`, least-recently-used eviction). The
+  returned `NearCachedCache` is cheap to clone and share across tasks,
+  like `RemoteCache` itself: every clone shares the same local cache
+  and background listener.
   `put`/`remove`/`clear` write through and invalidate the local entry
   immediately; everything else (`replace`, bulk operations, ...) is
   reached straight through to the wrapped `RemoteCache`, still kept

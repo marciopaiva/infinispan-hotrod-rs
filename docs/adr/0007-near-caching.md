@@ -124,12 +124,22 @@ reason: the protocol does not emit a per-key event for every entry a
 `clear` removes, so without it the local cache would have no way to
 learn a `clear` happened at all.
 
-**`NearCachedCache` is not `Clone`.** It holds the `JoinHandle` for its
-background task directly and aborts it on `Drop`, which drops the
-`CacheListener` inside that task and closes its connection, the same
-clean-up a bare `CacheListener` drop already does (ADR 0006). A caller
-that wants to share one across tasks wraps it in an `Arc`; the type
-itself does not need to track "last clone dropped."
+**`NearCachedCache` is `Clone`, like `RemoteCache` and `HotRodClient`.**
+The original decision here was the opposite: no `Clone`, caller wraps
+it in an `Arc` to share it, so the type itself never has to track
+"last clone dropped." Review caught why that does not actually hold:
+`NearCachedCache` derefs to `RemoteCache` (see below), and
+`RemoteCache` is `Clone`, so `.clone()` on a `NearCachedCache` compiled
+regardless of the type's own intent, resolving through `Deref` to
+`RemoteCache::clone` and silently handing back a bare `RemoteCache`,
+with no local cache or listener at all, instead of a second handle
+onto this one. The only way to close that off within the type system
+is to give `NearCachedCache` a real `Clone` of its own, which then
+wins resolution before `Deref` is ever consulted. The background
+task's `JoinHandle` now lives behind `AbortOnDrop`, itself behind an
+`Arc` every clone shares, so it aborts once, when the last clone (or
+the original) drops, the same point a single-owner type would have
+aborted at.
 
 **Everything else reached through `Deref<Target = RemoteCache>`.**
 `NearCachedCache` only has its own `get`/`put`/`remove`/`clear`;
@@ -140,8 +150,8 @@ from the wrapped `RemoteCache` unmodified.
 
 * New public API: `RemoteCache::near_cache`, `NearCacheOptions`
   (`max_entries`), `NearCachedCache` (`get`, `put`, `remove`, `clear`,
-  `Deref<Target = RemoteCache>`). Additive: nothing existing changes
-  shape.
+  `Clone`, `Deref<Target = RemoteCache>`). Additive: nothing existing
+  changes shape.
 * No new dependency and no `unsafe`, consistent with every prior
   phase.
 * No new wire opcode: `near_cache` is built entirely on `listen_with`
@@ -213,3 +223,30 @@ from the wrapped `RemoteCache` unmodified.
   doc comments overstated `clear`: fixed to call out `clear` as the
   one exception the listener cannot help with regardless of which
   handle performs it, not just a slower path to the same guarantee.
+* `NearCachedCache` is now `Clone` after all, for the reason given
+  above under "Decision": confirmed with a standalone `rustc` repro
+  before fixing it, since it is easy to assume a type without its own
+  `Clone` simply cannot be cloned, when a blanket `Deref` to a `Clone`
+  target means it can, just not usefully.
+* `put`, `remove` and `clear` share one `invalidate_after` helper,
+  which also closes a cancellation gap review caught: invalidating
+  only after `op.await` resolved skipped it entirely if the caller's
+  own future was dropped first (a `select!` losing a race, or an
+  external timeout around the call), since nothing placed after an
+  abandoned `.await` never runs. `invalidate_after` now invalidates
+  from a guard's `Drop` instead, which still fires when the enclosing
+  future (and the guard inside it) is dropped mid-poll, not only on
+  normal return.
+* `near_cache` itself is one more method reachable through
+  `NearCachedCache`'s `Deref` to `RemoteCache`: calling it on an
+  existing `NearCachedCache` builds a second, independent wrapper (its
+  own listener, its own local store) rather than composing with the
+  one already there. Still correct, just redundant; documented on the
+  type rather than blocked, since blocking it would mean auditing
+  every `RemoteCache` method reachable the same way for whether it
+  "makes sense" on top of an existing wrapper, not just this one.
+* `get` locks the store once on a miss (`NearCacheState::
+  get_or_generation`) instead of twice (a separate `get` call followed
+  by a separate `generation` call for the same logical step). Caught
+  by review as an unnecessary doubling of lock/unlock overhead on
+  every miss, not a correctness issue.

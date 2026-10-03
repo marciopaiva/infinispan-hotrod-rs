@@ -185,12 +185,29 @@ impl NearCacheState {
         self.store.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Only used by tests directly against `NearCacheState`:
+    /// `NearCachedCache::get` goes through `get_or_generation` instead,
+    /// to lock the store once rather than twice.
+    #[cfg(test)]
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.lock().get(key)
     }
 
+    #[cfg(test)]
     fn generation(&self) -> u64 {
         self.lock().generation()
+    }
+
+    /// `get`, but on a miss, also returns the current generation
+    /// (`Err`) under the same lock acquisition, instead of a
+    /// `get`/`generation` pair that would each lock and unlock in
+    /// turn for what `NearCachedCache::get` treats as one step.
+    fn get_or_generation(&self, key: &[u8]) -> std::result::Result<Vec<u8>, u64> {
+        let mut store = self.lock();
+        match store.get(key) {
+            Some(value) => Ok(value),
+            None => Err(store.generation()),
+        }
     }
 
     fn insert_if_current(&self, key: Vec<u8>, value: Vec<u8>, generation: u64) {
@@ -228,8 +245,34 @@ impl Drop for MarkDeadOnDrop {
     }
 }
 
+/// Aborts the wrapped task when the last `Arc` around it drops: a
+/// plain `JoinHandle` only detaches on drop (the task keeps running),
+/// so `NearCachedCache::drop` cannot just rely on that. Wrapping this,
+/// not the handle itself, in the `Arc` every clone shares is what
+/// makes aborting happen exactly once, when the last owner (clone or
+/// original) goes away, the same point a non-`Clone`, single-owner
+/// type would have aborted at.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        // Aborting drops the task's `CacheListener` with it, which
+        // closes its connection; the server clears the listener
+        // registration once it notices, same as a bare `CacheListener`
+        // drop (see `listener.rs`'s module docs).
+        self.0.abort();
+    }
+}
+
 /// A `RemoteCache` wrapped with a bounded, listener-invalidated local
-/// cache for `get`, obtained from `RemoteCache::near_cache`.
+/// cache for `get`, obtained from `RemoteCache::near_cache`. `Clone`,
+/// like `RemoteCache` and `HotRodClient`: every clone shares the same
+/// local store and the same background listener, so cloning this is
+/// how to share one near cache across tasks (not a derived `Clone`,
+/// deliberately: see `AbortOnDrop`'s docs for why the listener's task
+/// needs to be reference-counted right alongside the state it
+/// invalidates, rather than aborted by whichever clone happens to drop
+/// first).
 ///
 /// `put` and `remove` invalidate their key locally right away, on top
 /// of the background listener. A `put` or `remove` reaching this cache
@@ -251,12 +294,20 @@ impl Drop for MarkDeadOnDrop {
 /// them.
 ///
 /// Every operation `RemoteCache` has beyond `get`/`put`/`remove`/
-/// `clear` is reached through `Deref`, unmodified. Not `Clone`: wrap
-/// it in an `Arc` to share it across tasks.
+/// `clear` is reached through `Deref`, unmodified, **including**
+/// `near_cache` itself: calling `.near_cache(...)` on one of these
+/// derefs straight to the wrapped `RemoteCache` and builds a second,
+/// independent wrapper (its own listener, its own local store), not a
+/// handle onto this one. Still correct on its own terms, just
+/// redundant; nest knowingly, not by accident.
+#[derive(Clone)]
 pub struct NearCachedCache {
     cache: RemoteCache,
     state: Arc<NearCacheState>,
-    invalidation_task: JoinHandle<()>,
+    // Never read: held only so every clone shares the same `AbortOnDrop`,
+    // aborting the invalidation task once the last one drops.
+    #[allow(dead_code)]
+    invalidation_task: Arc<AbortOnDrop>,
 }
 
 impl Deref for NearCachedCache {
@@ -264,16 +315,6 @@ impl Deref for NearCachedCache {
 
     fn deref(&self) -> &RemoteCache {
         &self.cache
-    }
-}
-
-impl Drop for NearCachedCache {
-    fn drop(&mut self) {
-        // Aborting drops the task's `CacheListener` with it, which
-        // closes its connection; the server clears the listener
-        // registration once it notices, same as a bare `CacheListener`
-        // drop (see `listener.rs`'s module docs).
-        self.invalidation_task.abort();
     }
 }
 
@@ -314,7 +355,7 @@ impl NearCachedCache {
         Ok(Self {
             cache,
             state,
-            invalidation_task,
+            invalidation_task: Arc::new(AbortOnDrop(invalidation_task)),
         })
     }
 
@@ -327,12 +368,15 @@ impl NearCachedCache {
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // No generation snapshot, and so no later insert, once the feed
         // is already dead: it would only be thrown away, and computing
-        // it still means locking the store for nothing.
+        // it still means locking the store for nothing. On a live miss,
+        // one lock gets both the lookup and (if it was a miss) the
+        // generation, instead of two separate calls each locking it in
+        // turn for what is logically one critical section.
         let generation = if self.state.is_alive() {
-            if let Some(value) = self.state.get(key) {
-                return Ok(Some(value));
+            match self.state.get_or_generation(key) {
+                Ok(value) => return Ok(Some(value)),
+                Err(generation) => Some(generation),
             }
-            Some(self.state.generation())
         } else {
             None
         };
@@ -345,21 +389,37 @@ impl NearCachedCache {
     }
 
     /// Runs `op` against the remote cache, then invalidates local state
-    /// via `invalidate` regardless of whether `op` succeeded: a write
-    /// whose response was lost to a timeout or a connection error may
-    /// still have landed server-side, and invalidating state that in
-    /// fact never changed only costs a future cache miss, while not
-    /// invalidating state that did risks it never getting corrected at
-    /// all. Shared by `put`, `remove` and `clear` so this reasoning
-    /// lives in one place rather than three.
+    /// via `invalidate` no matter how `op` ends: it completing (`Ok` or
+    /// `Err`), or this call's own future being dropped before `op`
+    /// resolves (a caller racing it in `select!`, or wrapping it in a
+    /// timeout). A plain `let result = op.await; invalidate(...);
+    /// result` would skip `invalidate` entirely in that last case,
+    /// since nothing placed after an abandoned `.await` ever runs; a
+    /// guard whose `Drop` performs it instead still fires then, because
+    /// dropping this call's own suspended state drops the guard right
+    /// along with it. Shared by `put`, `remove` and `clear` so this
+    /// reasoning lives in one place rather than three.
     async fn invalidate_after<T>(
         &self,
         op: impl Future<Output = Result<T>>,
         invalidate: impl FnOnce(&NearCacheState),
     ) -> Result<T> {
-        let result = op.await;
-        invalidate(&self.state);
-        result
+        struct InvalidateOnDrop<'a, F: FnOnce(&NearCacheState)> {
+            state: &'a NearCacheState,
+            invalidate: Option<F>,
+        }
+        impl<F: FnOnce(&NearCacheState)> Drop for InvalidateOnDrop<'_, F> {
+            fn drop(&mut self) {
+                if let Some(invalidate) = self.invalidate.take() {
+                    invalidate(self.state);
+                }
+            }
+        }
+        let _guard = InvalidateOnDrop {
+            state: &self.state,
+            invalidate: Some(invalidate),
+        };
+        op.await
     }
 
     /// Writes through to the remote cache, then invalidates the local
@@ -819,6 +879,152 @@ mod tests {
             assert_eq!(
                 near.get(b"key").await.unwrap(),
                 Some(b"value-after-timeout".to_vec())
+            );
+
+            drop(server.await.unwrap());
+        }
+
+        /// Regression test for the `Deref`-leaked `.clone()` bug a
+        /// review caught: `NearCachedCache` has no `Clone` of its own,
+        /// and derefs to `RemoteCache`, which does, so `.clone()`
+        /// compiled even before this type derived `Clone` for real; it
+        /// just silently returned a bare `RemoteCache` with no local
+        /// cache or listener at all, not a second handle onto this
+        /// one. With a real `Clone`, the clone must share the same
+        /// local store and background listener.
+        #[tokio::test]
+        async fn clone_shares_the_same_local_cache_and_background_task() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
+
+                listen_sock
+            });
+
+            let client = client_with_seed(addr);
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+            let near_clone = near.clone();
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+            // The clone must see the cached value without touching the
+            // network: the fake server never accepts a third connection
+            // or reads a second request, so this would hang if the
+            // clone had its own, separate, empty local cache instead.
+            assert_eq!(
+                near_clone.get(b"key").await.unwrap(),
+                Some(b"value".to_vec())
+            );
+
+            drop(server.await.unwrap());
+        }
+
+        /// A plain `JoinHandle` only detaches on drop, so if
+        /// `NearCachedCache` aborted it directly rather than through a
+        /// reference-counted `AbortOnDrop`, dropping the first of two
+        /// clones would abort the background task both still depend
+        /// on. Confirms the second clone keeps working, local cache
+        /// and all, once the first is dropped.
+        #[tokio::test]
+        async fn background_task_only_aborts_once_every_clone_is_dropped() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
+
+                listen_sock
+            });
+
+            let client = client_with_seed(addr);
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+            let near_clone = near.clone();
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            drop(near);
+
+            // If dropping just one clone had aborted the shared
+            // background task, its fail-safe would have fired, clearing
+            // the local cache and routing this through the network
+            // instead, where the fake server (which never accepts a
+            // third connection) would make it hang.
+            assert_eq!(
+                near_clone.get(b"key").await.unwrap(),
+                Some(b"value".to_vec())
+            );
+
+            drop(server.await.unwrap());
+        }
+
+        /// Regression test for a cancellation-safety gap a review
+        /// caught: `invalidate_after` used to invalidate only after
+        /// `op.await` resolved, which a cancelled caller (a `select!`
+        /// losing a race, or an external timeout) skips entirely, since
+        /// nothing placed after an abandoned `.await` ever runs. Drives
+        /// that exact cancellation deliberately, racing `put` against a
+        /// timer far shorter than the connection ever responds within.
+        #[tokio::test]
+        async fn put_invalidates_the_local_entry_even_if_its_own_future_is_cancelled() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
+
+                // A Put the test cancels before this ever responds.
+                let (_id, opcode) = read_request_opcode(&mut op_sock).await;
+                assert_eq!(opcode, 0x01, "expected a Put request");
+
+                let (mut retry_sock, _) = tcp.accept().await.unwrap();
+                serve_get(&mut retry_sock, b"value-after-cancel").await;
+
+                listen_sock
+            });
+
+            // A long client timeout: cancellation, not a timeout, is
+            // what ends the `put` call below.
+            let client = client_with_seed(addr);
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            tokio::select! {
+                _ = near.put(b"key", b"new-value", Expiration::Default, Expiration::Default) => {
+                    panic!("expected put's own future to still be pending when the timer below fires first");
+                }
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+
+            // `put`'s own future was dropped mid-flight above; the
+            // local entry must be gone anyway, so this reaches the
+            // network on a new connection instead of serving the stale
+            // cached value.
+            assert_eq!(
+                near.get(b"key").await.unwrap(),
+                Some(b"value-after-cancel".to_vec())
             );
 
             drop(server.await.unwrap());
