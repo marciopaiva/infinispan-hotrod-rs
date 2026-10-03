@@ -4,5 +4,6 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+source ../lib.sh
 
-docker rm -f infinispan-live-test >/dev/null 2>&1 || true
+rm_containers infinispan-live-test

@@ -15,8 +15,9 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+source ../lib.sh
 
-docker rm -f infinispan-live-test >/dev/null 2>&1 || true
+rm_containers infinispan-live-test
 docker run -d --name infinispan-live-test \
   -p 11222:11222 \
   -e USER=unused \
@@ -26,14 +27,5 @@ docker run -d --name infinispan-live-test \
   -v "$PWD/groups.properties:/opt/infinispan/server/conf/groups.properties:ro" \
   infinispan/server:15.1
 
-for i in $(seq 1 30); do
-  if docker logs infinispan-live-test 2>&1 | grep -q "ISPN080001"; then
-    echo "Infinispan is up on 127.0.0.1:11222"
-    exit 0
-  fi
-  sleep 2
-done
-
-echo "Infinispan did not come up in time"
-docker logs infinispan-live-test
-exit 1
+wait_for_infinispan infinispan-live-test
+echo "Infinispan is up on 127.0.0.1:11222"

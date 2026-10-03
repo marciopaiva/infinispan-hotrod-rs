@@ -6,8 +6,9 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+source ../lib.sh
 
-docker rm -f infinispan-tls-test >/dev/null 2>&1 || true
+rm_containers infinispan-tls-test
 
 if [ "${1:-}" = "--clean" ]; then
   rm -rf generated

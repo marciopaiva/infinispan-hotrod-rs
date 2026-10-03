@@ -12,6 +12,7 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+source ../lib.sh
 
 mkdir -p generated
 cd generated
@@ -35,7 +36,7 @@ fi
 
 cd ..
 
-docker rm -f infinispan-tls-test >/dev/null 2>&1 || true
+rm_containers infinispan-tls-test
 docker run -d --name infinispan-tls-test \
   -p 21222:11222 \
   -e USER=unused \
@@ -46,14 +47,5 @@ docker run -d --name infinispan-tls-test \
   -v "$PWD/generated/keystore.p12:/opt/infinispan/server/conf/keystore.p12:ro" \
   infinispan/server:15.1
 
-for i in $(seq 1 30); do
-  if docker logs infinispan-tls-test 2>&1 | grep -q "ISPN080001"; then
-    echo "Infinispan is up on 127.0.0.1:21222, CA cert at $PWD/generated/ca-cert.pem"
-    exit 0
-  fi
-  sleep 2
-done
-
-echo "Infinispan did not come up in time"
-docker logs infinispan-tls-test
-exit 1
+wait_for_infinispan infinispan-tls-test
+echo "Infinispan is up on 127.0.0.1:21222, CA cert at $PWD/generated/ca-cert.pem"
