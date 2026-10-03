@@ -4,7 +4,7 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-03
 
 ### Added
 
