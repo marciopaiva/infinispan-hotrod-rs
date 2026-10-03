@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Starts a real Infinispan server with TLS enabled, for the tls_* tests in
-# hotrod-protocol/tests/live_server.rs. Not part of any CI workflow: run it
-# by hand, run the tests, then run teardown.sh (see docs/adr/0004-tls-support.md
-# on why this stays manual rather than becoming a permanent fixture).
+# hotrod-protocol/tests/live_server.rs. Not part of any CI workflow yet:
+# run it by hand, run the tests, then run teardown.sh. See issue #83 for
+# wiring this into ci.yml the way ci/infinispan-cluster/ already is (#78).
 #
 # Usage:
 #   ci/infinispan-tls/setup.sh

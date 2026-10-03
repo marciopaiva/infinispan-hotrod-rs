@@ -13,8 +13,9 @@
 //! The `tls_*` tests need a separate, TLS-enabled server instead, started
 //! with `ci/infinispan-tls/setup.sh` (which also generates the throwaway CA
 //! and keystore it uses) and torn down with `ci/infinispan-tls/teardown.sh`.
-//! This fixture is not part of any CI workflow: see
-//! `docs/adr/0004-tls-support.md` for why.
+//! This fixture is not part of any CI workflow yet: see issue #83, not
+//! `docs/adr/0004-tls-support.md` (which covers the `rustls` choice and
+//! verification rules, never CI).
 //!
 //! The `cluster_*` tests need a two-node cluster instead, started with
 //! `ci/infinispan-cluster/setup.sh` and torn down with
