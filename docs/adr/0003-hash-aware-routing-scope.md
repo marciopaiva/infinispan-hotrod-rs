@@ -70,3 +70,8 @@ inputs, and those outputs become fixed-vector unit tests.
   routing is wanted later; until then, correctness rests on unit tests
   with real-server-derived fixed vectors plus manual live validation
   before each commit lands.
+* That follow-up issue was #78: a permanent two-node Docker fixture
+  (`ci/infinispan-cluster/`) and a `cluster-test` job in `ci.yml`,
+  running on every push and PR. The question this ADR left open is
+  answered; the historical record above (no fixture at the time this
+  phase shipped) stays as written.
