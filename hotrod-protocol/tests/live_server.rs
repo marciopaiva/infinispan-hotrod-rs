@@ -37,7 +37,8 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use hotrod_protocol::{
-    CacheEvent, Expiration, HotRodClient, HotRodConnection, RemoteCache, TlsConfig, VersionedResult,
+    CacheEvent, Expiration, HotRodClient, HotRodConnection, NearCacheOptions, RemoteCache,
+    TlsConfig, VersionedResult,
 };
 
 /// Serializes every test in this file against the same live server. Most
@@ -909,4 +910,61 @@ async fn listener_receives_created_and_removed_events_in_order() {
     }
 
     listener.close().await.expect("close");
+}
+
+/// Builds a near cache, reads a key once to populate it, then changes
+/// that same key through a separate, ordinary connection (not through
+/// the near cache at all), and confirms a later `get` through the near
+/// cache eventually sees the new value instead of the one it cached,
+/// once the invalidation event for the other connection's write lands.
+/// This exercises the asynchronous, listener-driven invalidation path;
+/// the fake-server unit tests in `near_cache.rs` already cover the
+/// synchronous invalidation `NearCachedCache::put`/`remove` do for the
+/// caller's own writes.
+#[tokio::test]
+#[ignore]
+async fn near_cache_sees_a_remote_write_once_its_invalidation_event_lands() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+    let mut conn = connect().await;
+
+    conn.put(
+        b"ci-near-cache-key",
+        b"first",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+
+    let near = cache
+        .near_cache(NearCacheOptions::default())
+        .await
+        .expect("near_cache");
+
+    assert_eq!(
+        near.get(b"ci-near-cache-key").await.expect("get"),
+        Some(b"first".to_vec())
+    );
+
+    conn.put(
+        b"ci-near-cache-key",
+        b"second",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put from a separate connection");
+
+    let mut observed = near.get(b"ci-near-cache-key").await.expect("get");
+    for _ in 0..100 {
+        if observed.as_deref() == Some(b"second".as_slice()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        observed = near.get(b"ci-near-cache-key").await.expect("get");
+    }
+    assert_eq!(observed, Some(b"second".to_vec()));
+
+    conn.remove(b"ci-near-cache-key").await.expect("cleanup");
 }

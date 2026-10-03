@@ -15,6 +15,7 @@ use crate::client::HotRodClient;
 use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
 use crate::error::{Error, Result};
 use crate::listener::{CacheListener, ListenOptions};
+use crate::near_cache::{NearCacheOptions, NearCachedCache};
 use crate::wire::Expiration;
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -347,6 +348,15 @@ impl RemoteCache {
             options,
         )
         .await
+    }
+
+    /// Wraps this cache with a bounded, listener-invalidated local cache
+    /// for `get` (phase 5 of ADR 0001, see
+    /// `docs/adr/0007-near-caching.md`). Internally registers a listener
+    /// the same way `listen_with` does, interested only in
+    /// `Modified`/`Removed`/`Expired`.
+    pub async fn near_cache(&self, options: NearCacheOptions) -> Result<NearCachedCache> {
+        NearCachedCache::register(self.clone(), options).await
     }
 
     /// Routes `key` to its computed owner, checking out a connection for

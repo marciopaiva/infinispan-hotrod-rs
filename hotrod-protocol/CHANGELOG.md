@@ -8,6 +8,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Near caching: `RemoteCache::near_cache` wraps a cache with a bounded,
+  listener-invalidated local cache for `get`, per
+  `docs/adr/0007-near-caching.md` (#5). `NearCacheOptions` sets how many
+  entries it keeps (`max_entries`, least-recently-used eviction).
+  `put`/`remove`/`clear` write through and invalidate the local entry
+  immediately; everything else (`replace`, bulk operations, ...) is
+  reached straight through to the wrapped `RemoteCache`, still kept
+  correct by the same background listener, just on its ordinary
+  asynchronous delay. If that listener's connection drops, the local
+  cache is cleared and stops being used at all: every `get` goes to the
+  network from then on rather than risk serving data no invalidation
+  feed can ever correct again.
 - Client listeners: `RemoteCache::listen`/`listen_with` register a
   listener on its own dedicated connection and return a `CacheListener`
   to pull `CacheEvent`s (`Created`/`Modified`/`Removed`/`Expired`/
