@@ -45,3 +45,23 @@ jobs:
       - name: Stop Infinispan cluster
         if: always()
         run: ci/infinispan-cluster/teardown.sh
+
+  tls-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start TLS-enabled Infinispan
+        run: ci/infinispan-tls/setup.sh
+
+      - name: TLS tests
+        run: cargo test --test live_server tls_ -- --ignored
+
+      - name: Stop TLS-enabled Infinispan
+        if: always()
+        run: ci/infinispan-tls/teardown.sh

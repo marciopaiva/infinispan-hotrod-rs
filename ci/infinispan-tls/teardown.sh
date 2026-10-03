@@ -7,7 +7,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-podman rm -f infinispan-tls-test >/dev/null 2>&1 || true
+docker rm -f infinispan-tls-test >/dev/null 2>&1 || true
 
 if [ "${1:-}" = "--clean" ]; then
   rm -rf generated

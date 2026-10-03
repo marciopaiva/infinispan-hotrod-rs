@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Starts a real Infinispan server with TLS enabled, for the tls_* tests in
-# hotrod-protocol/tests/live_server.rs. Not part of any CI workflow yet:
-# run it by hand, run the tests, then run teardown.sh. See issue #83 for
-# wiring this into ci.yml the way ci/infinispan-cluster/ already is (#78).
+# hotrod-protocol/tests/live_server.rs. Also runs as the tls-test job in
+# ci.yml on every push and PR (issue #83); run it by hand the same way
+# for local iteration, then run teardown.sh.
 #
 # Usage:
 #   ci/infinispan-tls/setup.sh
@@ -35,19 +35,19 @@ fi
 
 cd ..
 
-podman rm -f infinispan-tls-test >/dev/null 2>&1 || true
-podman run -d --name infinispan-tls-test \
+docker rm -f infinispan-tls-test >/dev/null 2>&1 || true
+docker run -d --name infinispan-tls-test \
   -p 21222:11222 \
   -e USER=unused \
   -e PASS=unused-but-required \
-  -v "$PWD/infinispan.xml:/opt/infinispan/server/conf/infinispan.xml:ro,Z" \
-  -v "$PWD/users.properties:/opt/infinispan/server/conf/users.properties:ro,Z" \
-  -v "$PWD/groups.properties:/opt/infinispan/server/conf/groups.properties:ro,Z" \
-  -v "$PWD/generated/keystore.p12:/opt/infinispan/server/conf/keystore.p12:ro,Z" \
+  -v "$PWD/infinispan.xml:/opt/infinispan/server/conf/infinispan.xml:ro" \
+  -v "$PWD/users.properties:/opt/infinispan/server/conf/users.properties:ro" \
+  -v "$PWD/groups.properties:/opt/infinispan/server/conf/groups.properties:ro" \
+  -v "$PWD/generated/keystore.p12:/opt/infinispan/server/conf/keystore.p12:ro" \
   infinispan/server:15.1
 
 for i in $(seq 1 30); do
-  if podman logs infinispan-tls-test 2>&1 | grep -q "ISPN080001"; then
+  if docker logs infinispan-tls-test 2>&1 | grep -q "ISPN080001"; then
     echo "Infinispan is up on 127.0.0.1:21222, CA cert at $PWD/generated/ca-cert.pem"
     exit 0
   fi
@@ -55,5 +55,5 @@ for i in $(seq 1 30); do
 done
 
 echo "Infinispan did not come up in time"
-podman logs infinispan-tls-test
+docker logs infinispan-tls-test
 exit 1
