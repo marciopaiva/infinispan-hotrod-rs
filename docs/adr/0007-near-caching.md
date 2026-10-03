@@ -184,13 +184,19 @@ from the wrapped `RemoteCache` unmodified.
 * That generation counter is store-wide, not per key: an invalidation
   for any key bumps it, so a concurrent `get` miss on an unrelated key
   discards its fetch too, not just one racing an invalidation for the
-  same key it is fetching. A per-key counter would avoid that, at the
-  cost of also having to remember a "last invalidated" tick for keys
-  no longer cached (otherwise the same race just reopens for them),
-  which trades a simple, bounded structure for one with its own
-  unbounded-growth question to answer. Under heavy concurrent writes
-  to a shared cache, this can noticeably lower the local hit rate;
-  revisit with a per-key scheme if that cost shows up in practice.
+  same key it is fetching. Under heavy, steady writes to a busy shared
+  cache this can push the local hit rate well below the "noticeably
+  lower" this ADR originally estimated, toward never successfully
+  caching anything while writes keep arriving. A per-key scheme needs
+  its own tombstone of "last invalidated tick" for keys no longer
+  cached, so the same race does not just reopen for them; that
+  tombstone set could itself be bounded with the same LRU eviction
+  `LruStore` already has for cached entries, rather than growing
+  without bound, so the complexity this ADR originally raised against
+  a per-key scheme is a real but solvable cost, not a blocking one.
+  Still deferred for this phase: v1 keeps one structure to reason
+  about, not two: revisit with a bounded per-key scheme if the hit
+  rate under real write-heavy load turns out to need it.
 * `put`, `remove` and `clear` now invalidate their local state
   unconditionally, before inspecting whether the remote call
   succeeded, rather than only on `Ok`. Also caught by review: a write

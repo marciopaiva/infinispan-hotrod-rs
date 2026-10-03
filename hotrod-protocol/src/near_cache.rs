@@ -26,6 +26,7 @@
 //! either expiration to be observed promptly.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +38,10 @@ use crate::listener::{CacheEvent, CacheEventInterests, ListenOptions};
 use crate::remote_cache::RemoteCache;
 use crate::wire::Expiration;
 
-/// Options for `RemoteCache::near_cache`.
+/// Options for `RemoteCache::near_cache`, kept as its own type so a
+/// future option (a bloom filter, a TTL override, see
+/// `docs/adr/0007-near-caching.md`) can be added without breaking a
+/// caller that builds this with `..Default::default()`.
 #[derive(Debug, Clone, Copy)]
 pub struct NearCacheOptions {
     /// How many entries the local cache keeps before evicting the least
@@ -102,13 +106,14 @@ impl LruStore {
     }
 
     fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        let old_tick = self.entries.get(key)?.1;
-        self.order.remove(&old_tick);
         let new_tick = self.next_tick();
-        self.order.insert(new_tick, key.to_vec());
         let entry = self.entries.get_mut(key)?;
+        let old_tick = entry.1;
         entry.1 = new_tick;
-        Some(entry.0.clone())
+        let value = entry.0.clone();
+        self.order.remove(&old_tick);
+        self.order.insert(new_tick, key.to_vec());
+        Some(value)
     }
 
     /// Inserts `key`/`value`, but only if `generation` still matches:
@@ -210,6 +215,19 @@ impl NearCacheState {
     }
 }
 
+/// Marks a `NearCacheState` dead when dropped, whether that happens
+/// because the invalidation task's loop exited normally or because a
+/// panic unwound through it: either way, this is the only place that
+/// task's exit is observable, so it is the only place that can be
+/// trusted to run the fail-safe.
+struct MarkDeadOnDrop(Arc<NearCacheState>);
+
+impl Drop for MarkDeadOnDrop {
+    fn drop(&mut self) {
+        self.0.mark_dead();
+    }
+}
+
 /// A `RemoteCache` wrapped with a bounded, listener-invalidated local
 /// cache for `get`, obtained from `RemoteCache::near_cache`.
 ///
@@ -274,6 +292,13 @@ impl NearCachedCache {
         let state = Arc::new(NearCacheState::new(options.max_entries));
         let task_state = state.clone();
         let invalidation_task = tokio::spawn(async move {
+            // Marks the feed dead no matter how this task ends: normal
+            // loop exit, or a panic unwinding through it. Without this
+            // guard, a panic (say, inside a future bug in `invalidate`)
+            // would skip the explicit `mark_dead` call entirely, leaving
+            // `alive` stuck `true` with no invalidation feed left to
+            // keep it honest.
+            let _mark_dead_on_exit = MarkDeadOnDrop(task_state.clone());
             loop {
                 match listener.next().await {
                     Some(Ok(
@@ -285,7 +310,6 @@ impl NearCachedCache {
                     None | Some(Err(_)) => break,
                 }
             }
-            task_state.mark_dead();
         });
         Ok(Self {
             cache,
@@ -301,31 +325,47 @@ impl NearCachedCache {
     /// (or a `clear`) happened while the fetch was in flight: see
     /// `LruStore`'s docs for why that matters.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.state.is_alive() {
+        // No generation snapshot, and so no later insert, once the feed
+        // is already dead: it would only be thrown away, and computing
+        // it still means locking the store for nothing.
+        let generation = if self.state.is_alive() {
             if let Some(value) = self.state.get(key) {
                 return Ok(Some(value));
             }
-        }
-        let generation = self.state.generation();
+            Some(self.state.generation())
+        } else {
+            None
+        };
         let value = self.cache.get(key).await?;
-        if self.state.is_alive() {
-            if let Some(value) = &value {
-                self.state
-                    .insert_if_current(key.to_vec(), value.clone(), generation);
-            }
+        if let (Some(generation), Some(value)) = (generation, value.as_ref()) {
+            self.state
+                .insert_if_current(key.to_vec(), value.clone(), generation);
         }
         Ok(value)
     }
 
+    /// Runs `op` against the remote cache, then invalidates local state
+    /// via `invalidate` regardless of whether `op` succeeded: a write
+    /// whose response was lost to a timeout or a connection error may
+    /// still have landed server-side, and invalidating state that in
+    /// fact never changed only costs a future cache miss, while not
+    /// invalidating state that did risks it never getting corrected at
+    /// all. Shared by `put`, `remove` and `clear` so this reasoning
+    /// lives in one place rather than three.
+    async fn invalidate_after<T>(
+        &self,
+        op: impl Future<Output = Result<T>>,
+        invalidate: impl FnOnce(&NearCacheState),
+    ) -> Result<T> {
+        let result = op.await;
+        invalidate(&self.state);
+        result
+    }
+
     /// Writes through to the remote cache, then invalidates the local
-    /// entry regardless of whether that write succeeded: a write whose
-    /// response was lost to a timeout or a connection error may still
-    /// have landed server-side, and invalidating a key that in fact
-    /// never changed only costs a future cache miss, while not
-    /// invalidating one that did risks the local entry never getting
-    /// corrected at all. The listener invalidates the same key too,
-    /// once its event arrives; this closes the gap immediately instead
-    /// of waiting on that round trip.
+    /// entry: the listener invalidates the same key too, once its event
+    /// arrives, but this closes the gap immediately instead of waiting
+    /// on that round trip.
     pub async fn put(
         &self,
         key: &[u8],
@@ -333,28 +373,24 @@ impl NearCachedCache {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
-        let result = self.cache.put(key, value, lifespan, max_idle).await;
-        self.state.invalidate(key);
-        result
+        self.invalidate_after(self.cache.put(key, value, lifespan, max_idle), |state| {
+            state.invalidate(key)
+        })
+        .await
     }
 
-    /// Same reasoning as `put`: invalidate the local entry whether or
-    /// not the remote removal itself succeeded.
+    /// Same reasoning as `put`.
     pub async fn remove(&self, key: &[u8]) -> Result<bool> {
-        let result = self.cache.remove(key).await;
-        self.state.invalidate(key);
-        result
+        self.invalidate_after(self.cache.remove(key), |state| state.invalidate(key))
+            .await
     }
 
-    /// Clears the remote cache, then the local one, regardless of
-    /// whether the remote clear succeeded: the same reasoning as
-    /// `put`. The listener cannot help here either way, successful or
-    /// not: it gets no per-key event for a `clear`, so this is the
-    /// only way the local cache ever learns about one.
+    /// Clears the remote cache, then the local one. The listener cannot
+    /// help here: it gets no per-key event for a `clear`, so this is
+    /// the only way the local cache ever learns about one.
     pub async fn clear(&self) -> Result<()> {
-        let result = self.cache.clear().await;
-        self.state.clear();
-        result
+        self.invalidate_after(self.cache.clear(), |state| state.clear())
+            .await
     }
 }
 
@@ -451,6 +487,30 @@ mod tests {
         let generation = store.generation();
         store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation);
         assert_eq!(store.get(b"key"), Some(b"value".to_vec()));
+    }
+
+    /// `register`'s background task relies on `MarkDeadOnDrop` to call
+    /// `mark_dead` no matter how the task ends, specifically including a
+    /// panic unwinding through it, not just its normal loop exit: a
+    /// panic skips every statement after it, so if `mark_dead` were only
+    /// called explicitly after the loop (as it once was), a panic would
+    /// leave `alive` stuck `true` forever with no invalidation feed left
+    /// to keep it honest.
+    #[test]
+    fn mark_dead_on_drop_runs_even_if_the_owning_scope_panics() {
+        let state = Arc::new(NearCacheState::new(10));
+        state.insert_if_current(b"key".to_vec(), b"value".to_vec(), state.generation());
+        assert!(state.is_alive());
+
+        let guard_state = state.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = MarkDeadOnDrop(guard_state);
+            panic!("simulated panic inside the invalidation task");
+        }));
+        assert!(result.is_err());
+
+        assert!(!state.is_alive());
+        assert_eq!(state.get(b"key"), None);
     }
 
     #[test]
