@@ -181,6 +181,16 @@ from the wrapped `RemoteCache` unmodified.
   had no way to know to invalidate, since it was never in the store to
   begin with. The same counter closes an equivalent race against
   `clear`.
+* That generation counter is store-wide, not per key: an invalidation
+  for any key bumps it, so a concurrent `get` miss on an unrelated key
+  discards its fetch too, not just one racing an invalidation for the
+  same key it is fetching. A per-key counter would avoid that, at the
+  cost of also having to remember a "last invalidated" tick for keys
+  no longer cached (otherwise the same race just reopens for them),
+  which trades a simple, bounded structure for one with its own
+  unbounded-growth question to answer. Under heavy concurrent writes
+  to a shared cache, this can noticeably lower the local hit rate;
+  revisit with a per-key scheme if that cost shows up in practice.
 * `put`, `remove` and `clear` now invalidate their local state
   unconditionally, before inspecting whether the remote call
   succeeded, rather than only on `Ok`. Also caught by review: a write

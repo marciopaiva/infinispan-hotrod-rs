@@ -41,7 +41,10 @@ use crate::wire::Expiration;
 #[derive(Debug, Clone, Copy)]
 pub struct NearCacheOptions {
     /// How many entries the local cache keeps before evicting the least
-    /// recently used one.
+    /// recently used one. `0` is a valid, if unusual, choice: every
+    /// entry is evicted as soon as it is inserted, so `get` always
+    /// reaches the network. Not an error, since nothing about this
+    /// type requires caching anything to be correct.
     pub max_entries: usize,
 }
 
@@ -491,7 +494,7 @@ mod tests {
         use std::time::Duration;
 
         use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
+        use tokio::net::{TcpListener, TcpStream};
 
         use super::*;
         use crate::client::tests::{read_request_opcode, response_header};
@@ -514,6 +517,32 @@ mod tests {
 
         fn client_with_seed(seed_addr: SocketAddr) -> HotRodClient {
             client_with_seed_and_timeout(seed_addr, Duration::from_secs(5))
+        }
+
+        /// Accepts the first connection on `tcp` and completes an
+        /// `AddClientListener` registration on it: every wiring test below
+        /// needs this before doing anything test-specific, and they only
+        /// differ in what happens on the connection afterward.
+        async fn accept_and_register_listener(tcp: &TcpListener) -> (Vec<u8>, TcpStream) {
+            let (mut listen_sock, _) = tcp.accept().await.unwrap();
+            let (id, listener_id) = read_listener_id(&mut listen_sock).await;
+            listen_sock
+                .write_all(&response_header(id, 0x26, 0x00))
+                .await
+                .unwrap();
+            (listener_id, listen_sock)
+        }
+
+        /// Reads one Get request off `sock` and responds with `value`,
+        /// success. Shared by every wiring test below that needs the
+        /// server side of a Get round trip.
+        async fn serve_get(sock: &mut TcpStream, value: &[u8]) {
+            let (id, opcode) = read_request_opcode(sock).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(sock).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, value);
+            sock.write_all(&resp).await.unwrap();
         }
 
         /// Polls `near.get(key)` until it returns `expected` or `attempts`
@@ -539,20 +568,10 @@ mod tests {
             let addr = tcp.local_addr().unwrap();
 
             let server = tokio::spawn(async move {
-                let (mut listen_sock, _) = tcp.accept().await.unwrap();
-                let (id, _listener_id) = read_listener_id(&mut listen_sock).await;
-                listen_sock
-                    .write_all(&response_header(id, 0x26, 0x00))
-                    .await
-                    .unwrap();
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
 
                 let (mut op_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(opcode, 0x03, "expected a Get request");
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value");
-                op_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
 
                 // Kept alive until the test is done with it: dropping it
                 // early would close the listener connection and trip the
@@ -583,20 +602,10 @@ mod tests {
             let addr = tcp.local_addr().unwrap();
 
             let server = tokio::spawn(async move {
-                let (mut listen_sock, _) = tcp.accept().await.unwrap();
-                let (id, listener_id) = read_listener_id(&mut listen_sock).await;
-                listen_sock
-                    .write_all(&response_header(id, 0x26, 0x00))
-                    .await
-                    .unwrap();
+                let (listener_id, mut listen_sock) = accept_and_register_listener(&tcp).await;
 
                 let (mut op_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(opcode, 0x03, "expected the first Get request");
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value");
-                op_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
 
                 // Modified event for the same key: opcode 0x61, no
                 // `isCustom`, not a retry, with a version (see
@@ -604,15 +613,8 @@ mod tests {
                 let frame = event_frame(0, 0x61, &listener_id, 0, false, b"key", Some(7));
                 listen_sock.write_all(&frame).await.unwrap();
 
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(
-                    opcode, 0x03,
-                    "expected a second Get once the entry was invalidated"
-                );
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value-2");
-                op_sock.write_all(&resp).await.unwrap();
+                // A second Get, once the entry was invalidated.
+                serve_get(&mut op_sock, b"value-2").await;
 
                 listen_sock
             });
@@ -638,34 +640,18 @@ mod tests {
             let addr = tcp.local_addr().unwrap();
 
             let server = tokio::spawn(async move {
-                let (mut listen_sock, _) = tcp.accept().await.unwrap();
-                let (id, _listener_id) = read_listener_id(&mut listen_sock).await;
-                listen_sock
-                    .write_all(&response_header(id, 0x26, 0x00))
-                    .await
-                    .unwrap();
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
 
                 let (mut op_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(opcode, 0x03, "expected the first Get request");
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value");
-                op_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
 
                 // The listener connection dies: no reconnection, so the
                 // near cache must fall back to passthrough from here on.
                 drop(listen_sock);
 
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(
-                    opcode, 0x03,
-                    "expected a second Get once the feed died, bypassing any local cache"
-                );
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value-after-death");
-                op_sock.write_all(&resp).await.unwrap();
+                // A second Get, once the feed died, bypassing any local
+                // cache.
+                serve_get(&mut op_sock, b"value-after-death").await;
             });
 
             let client = client_with_seed(addr);
@@ -692,32 +678,19 @@ mod tests {
             let addr = tcp.local_addr().unwrap();
 
             let server = tokio::spawn(async move {
-                let (mut listen_sock, _) = tcp.accept().await.unwrap();
-                let (id, _listener_id) = read_listener_id(&mut listen_sock).await;
-                listen_sock
-                    .write_all(&response_header(id, 0x26, 0x00))
-                    .await
-                    .unwrap();
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
 
                 let (mut op_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(opcode, 0x03, "expected the first Get request");
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value");
-                op_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
 
                 // A Put that never gets a response.
                 let (_id, opcode) = read_request_opcode(&mut op_sock).await;
                 assert_eq!(opcode, 0x01, "expected a Put request");
 
+                // A new connection for the second Get: the timed-out one
+                // is not returned to the pool.
                 let (mut retry_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut retry_sock).await;
-                assert_eq!(opcode, 0x03, "expected a second Get on a new connection");
-                let _key = read_array(&mut retry_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value-after-timeout");
-                retry_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut retry_sock, b"value-after-timeout").await;
 
                 listen_sock
             });
@@ -762,32 +735,19 @@ mod tests {
             let addr = tcp.local_addr().unwrap();
 
             let server = tokio::spawn(async move {
-                let (mut listen_sock, _) = tcp.accept().await.unwrap();
-                let (id, _listener_id) = read_listener_id(&mut listen_sock).await;
-                listen_sock
-                    .write_all(&response_header(id, 0x26, 0x00))
-                    .await
-                    .unwrap();
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
 
                 let (mut op_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut op_sock).await;
-                assert_eq!(opcode, 0x03, "expected the first Get request");
-                let _key = read_array(&mut op_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value");
-                op_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
 
                 // A Clear that never gets a response.
                 let (_id, opcode) = read_request_opcode(&mut op_sock).await;
                 assert_eq!(opcode, 0x13, "expected a Clear request");
 
+                // A new connection for the second Get: the timed-out one
+                // is not returned to the pool.
                 let (mut retry_sock, _) = tcp.accept().await.unwrap();
-                let (id, opcode) = read_request_opcode(&mut retry_sock).await;
-                assert_eq!(opcode, 0x03, "expected a second Get on a new connection");
-                let _key = read_array(&mut retry_sock).await.unwrap();
-                let mut resp = response_header(id, 0x04, 0x00);
-                write_array(&mut resp, b"value-after-timeout");
-                retry_sock.write_all(&resp).await.unwrap();
+                serve_get(&mut retry_sock, b"value-after-timeout").await;
 
                 listen_sock
             });
