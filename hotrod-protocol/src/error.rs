@@ -40,6 +40,9 @@ pub enum Error {
     #[error("malformed SASL challenge: {0}")]
     MalformedChallenge(String),
 
+    #[error("malformed cache event: {0}")]
+    MalformedEvent(String),
+
     #[error("SCRAM server verification failed: the server's final signature did not match")]
     ScramServerVerificationFailed,
 

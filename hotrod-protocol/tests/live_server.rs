@@ -35,7 +35,7 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use hotrod_protocol::{
-    Expiration, HotRodClient, HotRodConnection, RemoteCache, TlsConfig, VersionedResult,
+    CacheEvent, Expiration, HotRodClient, HotRodConnection, RemoteCache, TlsConfig, VersionedResult,
 };
 
 /// Serializes every test in this file against the same live server. Most
@@ -67,6 +67,24 @@ async fn connect() -> HotRodConnection {
         .await
         .expect("authenticate");
     conn
+}
+
+/// Same server as `connect`, but as a `HotRodClient`/`RemoteCache` pair
+/// instead of a bare `HotRodConnection`: needed for `listen`/`listen_with`,
+/// which only exist on `RemoteCache`.
+async fn connect_client() -> RemoteCache {
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+    client.cache("")
 }
 
 async fn connect_with_scram() -> HotRodConnection {
@@ -851,4 +869,42 @@ async fn cluster_concurrent_gets_do_not_serialize() {
     for key in &keys {
         cluster.remove(key).await.expect("cleanup");
     }
+}
+
+/// Registers a listener, then does a put/remove through a separate,
+/// ordinary connection, and confirms the created/removed events arrive on
+/// the listener in the order the operations actually happened. The single
+/// `default` cache from `ci/infinispan/` works fine here: client listeners
+/// are not a clustering feature.
+#[tokio::test]
+#[ignore]
+async fn listener_receives_created_and_removed_events_in_order() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+    let mut conn = connect().await;
+
+    conn.remove(b"ci-listener-key").await.expect("cleanup");
+
+    let mut listener = cache.listen().await.expect("listen");
+
+    conn.put(
+        b"ci-listener-key",
+        b"value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put");
+    conn.remove(b"ci-listener-key").await.expect("remove");
+
+    match listener.next().await.expect("created event").expect("ok") {
+        CacheEvent::Created { key, .. } => assert_eq!(key, b"ci-listener-key"),
+        other => panic!("expected Created, got {other:?}"),
+    }
+    match listener.next().await.expect("removed event").expect("ok") {
+        CacheEvent::Removed { key, .. } => assert_eq!(key, b"ci-listener-key"),
+        other => panic!("expected Removed, got {other:?}"),
+    }
+
+    listener.close().await.expect("close");
 }

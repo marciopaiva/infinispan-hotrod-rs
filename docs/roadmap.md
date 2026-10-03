@@ -24,9 +24,10 @@ frames.
 The gap is everything a production deployment expects around that core:
 TLS was the first piece and is now done (`docs/adr/0004-tls-support.md`,
 #46). Connection pooling and concurrent dispatch is now done too
-(`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77).
-Events, near caching, streaming and typed serialization are still open;
-the PHP bridge still comes last.
+(`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77), and
+so are client listeners
+(`docs/adr/0006-client-listeners.md`, #4). Near caching, streaming and
+typed serialization are still open; the PHP bridge still comes last.
 
 ## The structural change that gated the rest (done, #77)
 
@@ -58,25 +59,26 @@ and multi-cluster failover all assume a client that can hold several
 live connections and dispatch to them concurrently, so this needed to
 land before those features, not alongside the last one that ran into it.
 
-## Next up, now that #77 and #78 have landed
+## Next up, now that #77, #78 and #4 have landed
 
-Both P0 items are done: the structural blocker (#77) and the CI
-coverage to catch regressions in it (#78). Every P1 item below is
-unblocked and can start whenever its own Propose step is ready; none
-of them has a further dependency on each other.
+Both P0 items are done (#77, #78), and the first P1 item (#4, client
+listeners) with them. #5 (near caching), the item #4 specifically
+unblocked, is the natural next pick; #52/#53 remain independent and
+available instead of, or alongside, it.
 
-* **#78's `cluster-test` job** (`.github/workflows/ci.yml`) runs two
-  plain `infinispan/server` containers on a dedicated Docker network
-  (`ci/infinispan-cluster/`, replacing the disposable `kind`-based
-  fixture #77 was validated against by hand, which existed only for
-  that one validation and was never wired into CI) and runs the
-  `cluster_*` tests from `hotrod-protocol/tests/live_server.rs` against
-  them on every push and PR, `--ignored` included.
-* **#4 (client listeners) is the next item to Propose**, per the
-  existing ordering: it is what #5 (near caching) depends on.
+* **#4 (client listeners)** shipped as `RemoteCache::listen`/`listen_with`
+  returning a `CacheListener`, on its own dedicated connection per
+  `docs/adr/0006-client-listeners.md`: no changes to `HotRodClient`'s
+  pool (#77) or to `HotRodConnection`'s synchronous request/response
+  model, and no automatic reconnection if that connection drops (a
+  documented limitation, not an oversight).
+* **#5 (near caching) is the next item to Propose**: a client-side
+  cache of recently accessed entries, invalidated through the
+  `Removed`/`Modified`/`Expired` events `CacheListener` now delivers.
 * #52 (streaming) and #53 (server-side iteration) remain independent of
-  #4/#5 and of each other; either can be picked up next instead of, or
-  alongside, listeners if that is a better fit for what is needed next.
+  #5 and of each other; either can be picked up next instead of, or
+  alongside, near caching if that is a better fit for what is needed
+  next.
 
 ## Proposed ordering
 
@@ -84,8 +86,8 @@ of them has a further dependency on each other.
 | --- | --- | --- | --- |
 | ~~P0~~ | ~~Connection pooling / concurrent operations~~ | #77 (done) | Structural blocker described above |
 | ~~P0~~ | ~~Multi-node CI fixture~~ | #78 (done) | The cluster code path used to be exercised only by `#[ignore]`d manual tests; now runs on every push via `ci/infinispan-cluster/` |
-| P1 | Client listeners (cache events) | #4 | Prerequisite for near caching; unblocked now, next to Propose |
-| P1 | Near caching | #5 | Large latency win once listeners exist, particularly for the PHP bridge |
+| ~~P1~~ | ~~Client listeners (cache events)~~ | #4 (done) | Prerequisite for near caching |
+| P1 | Near caching | #5 | Large latency win once listeners exist, particularly for the PHP bridge; unblocked now, next to Propose |
 | P1 | Streaming (GetStream/PutStream) | #52 | Values are currently always fully buffered in memory |
 | P1 | Server-side iteration | #53 | Only way to walk a cache without already knowing its keys |
 | P1 | Client statistics and telemetry | #54 | Needed before this is trusted in production, cheap to add once pooling exists |

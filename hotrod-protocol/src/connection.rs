@@ -30,12 +30,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncWriteExt, BufStream};
+use tokio::io::BufStream;
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
-use crate::header::{read_response_header, write_request_header, OpCode};
+use crate::header::OpCode;
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::tls::{self, TlsConfig, Transport};
@@ -304,6 +304,18 @@ impl HotRodConnection {
     /// `None` until another update arrives.
     pub(crate) fn take_pending_topology_update(&mut self) -> Option<TopologyUpdate> {
         self.pending_topology_update.take()
+    }
+
+    /// Consumes the connection and hands back its raw transport. Used by
+    /// `listener.rs` once `add_client_listener` has confirmed the server
+    /// accepted the registration: from that point on, the socket carries an
+    /// unbounded stream of event frames instead of one response per
+    /// request, which is not a shape `HotRodConnection`'s own
+    /// `write_and_read_header`/poisoning model was built for (see its
+    /// module docs). `CacheListener` reads directly off this transport
+    /// instead.
+    pub(crate) fn into_transport(self) -> BufStream<Transport> {
+        self.stream
     }
 
     /// The timeout currently bounding every operation and authentication
@@ -659,6 +671,26 @@ impl HotRodConnection {
         result
     }
 
+    /// Registers a client listener, `body` already encoded by
+    /// `listener.rs` (listener id, include-current-state flag,
+    /// filter/converter factory names and parameters, raw-data flag,
+    /// event interests). Confirms the server accepted it; the connection
+    /// is expected to be handed to `listener.rs` via `into_transport`
+    /// right after, not reused for further operations here.
+    pub(crate) async fn add_client_listener(&mut self, body: &[u8]) -> Result<()> {
+        self.begin_operation()?;
+        let timeout = self.timeout;
+        let result = with_timeout(timeout, async {
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::AddClientListener, body)
+                .await?;
+            Ok(())
+        })
+        .await;
+        self.end_operation(result.is_ok());
+        result
+    }
+
     /// Returns `true` if `key` exists in the cache.
     ///
     /// Mirrors `ContainsKeyOperation`: `is_success` and `!is_not_exist`
@@ -839,22 +871,16 @@ impl HotRodConnection {
         let message_id = self.next_message_id;
         self.next_message_id += 1;
 
-        let mut request = Vec::with_capacity(32 + body.len());
-        write_request_header(
-            &mut request,
+        let mut header = crate::header::write_and_read_header(
+            &mut self.stream,
             message_id,
             cache_name,
             opcode,
             self.intelligence,
             self.topology_id,
-        );
-        request.extend_from_slice(body);
-
-        self.stream.write_all(&request).await?;
-        self.stream.flush().await?;
-
-        let mut header =
-            read_response_header(&mut self.stream, message_id, opcode, self.intelligence).await?;
+            body,
+        )
+        .await?;
         if let Some(update) = &header.topology_update {
             self.topology_id = update.topology_id as i32;
         }

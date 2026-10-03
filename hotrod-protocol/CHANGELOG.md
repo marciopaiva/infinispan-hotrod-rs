@@ -6,6 +6,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Client listeners: `RemoteCache::listen`/`listen_with` register a
+  listener on its own dedicated connection and return a `CacheListener`
+  to pull `CacheEvent`s (`Created`/`Modified`/`Removed`/`Expired`/
+  `Custom`) from with `next()`, per
+  `docs/adr/0006-client-listeners.md` (#4). `ListenOptions` selects
+  event types (`CacheEventInterests`), whether to replay the cache's
+  current contents first, and an optional server-side filter or
+  converter factory (`ServerFactory`) already deployed on the server;
+  `hotrod-protocol` only transports the factory name and parameters, it
+  never evaluates filter/converter logic itself. No automatic
+  reconnection: a dropped connection ends the listener (`next` returns
+  `None` or a terminal `Err`), and registering a new one is the
+  caller's call to make.
+
 ### Changed
 
 - `HotRodCluster` is replaced by `HotRodClient` and `RemoteCache`, per

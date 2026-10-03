@@ -17,8 +17,11 @@
 //! Either `HotRodConnection` or `HotRodClient` also connects over TLS
 //! (`connect_tls`/`connect_tls_with_timeout`, see
 //! `docs/adr/0004-tls-support.md`). Every connect and operation on either
-//! type is bounded by a timeout (`DEFAULT_TIMEOUT` unless overridden). No
-//! listeners, no near caching yet.
+//! type is bounded by a timeout (`DEFAULT_TIMEOUT` unless overridden).
+//! `RemoteCache::listen`/`listen_with` (phase 4, see
+//! `docs/adr/0006-client-listeners.md`) register a client listener on its
+//! own dedicated connection, returning a `CacheListener` to pull
+//! `CacheEvent`s from. No near caching yet.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +31,7 @@ mod digest;
 mod error;
 mod hash;
 mod header;
+mod listener;
 mod pool;
 mod remote_cache;
 mod sasl;
@@ -41,6 +45,7 @@ mod wire;
 pub use client::HotRodClient;
 pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT};
 pub use error::{Error, Result};
+pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions, ServerFactory};
 pub use remote_cache::RemoteCache;
 pub use tls::TlsConfig;
 pub use wire::Expiration;

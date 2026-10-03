@@ -21,9 +21,9 @@ for release notes.
 | Full entry metadata (creation, last used, lifespan, max idle) | Yes | Yes |
 | Authentication: PLAIN, SCRAM-SHA-512, DIGEST-SHA-256, OAUTHBEARER | Yes | Yes |
 | Authentication: GSSAPI | Yes | No ([#9](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/9)) |
-| TLS and mutual TLS | Yes | No |
+| TLS and mutual TLS | Yes | Yes |
 | Cluster topology tracking, hash-aware routing | Yes | Yes |
-| Client listeners (cache events) | Yes | No ([#4](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/4)) |
+| Client listeners (cache events) | Yes | Yes |
 | Near caching | Yes | No ([#5](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/5)) |
 | Transactions | Yes | No |
 | Multimap cache | Yes | No |
@@ -70,6 +70,20 @@ cache
     .put(b"key", b"value", Expiration::Default, Expiration::Default)
     .await?;
 let value = cache.get(b"key").await?;
+```
+
+A `RemoteCache` can also register a client listener, delivered on its
+own dedicated connection as `CacheEvent`s pulled one at a time:
+
+```rust
+let mut listener = cache.listen().await?;
+while let Some(event) = listener.next().await {
+    match event? {
+        CacheEvent::Created { key, .. } => println!("created {key:?}"),
+        CacheEvent::Removed { key, .. } => println!("removed {key:?}"),
+        _ => {}
+    }
+}
 ```
 
 ## License

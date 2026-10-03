@@ -5,7 +5,7 @@
 //! appends the additional-parameters map introduced in protocol 4.0. Phase 1
 //! never sends additional parameters, so that map is always empty.
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 use crate::status::Status;
@@ -14,7 +14,7 @@ use crate::varint::{read_vlong, write_vint, write_vlong};
 use crate::wire::{read_string, write_array, write_no_media_type_pair};
 
 const REQUEST_MAGIC: u8 = 0xA0;
-const RESPONSE_MAGIC: u8 = 0xA1;
+pub(crate) const RESPONSE_MAGIC: u8 = 0xA1;
 
 /// Hot Rod protocol version 4.1, the version targeted by ADR 0001.
 const PROTOCOL_VERSION: u8 = 41;
@@ -35,6 +35,8 @@ pub(crate) enum OpCode {
     GetWithMetadata = 0x1B,
     AuthMechList = 0x21,
     Auth = 0x23,
+    AddClientListener = 0x25,
+    RemoveClientListener = 0x27,
     Size = 0x29,
     PutAll = 0x2D,
     GetAll = 0x2F,
@@ -143,6 +145,41 @@ pub(crate) async fn read_response_header<R: AsyncRead + Unpin>(
         status,
         topology_update,
     })
+}
+
+/// Writes one request and reads its response header: the combination
+/// `HotRodConnection::write_and_read_header` and
+/// `listener::CacheListener::close` both need, generic over the
+/// transport so either can call it directly instead of keeping two
+/// copies of the same write-then-read sequence to maintain. Does not
+/// track topology id or a pending topology update the way
+/// `HotRodConnection` does on top of this: a caller that cares about
+/// those (only `HotRodConnection` does) reads them off the returned
+/// `ResponseHeader` itself and updates its own state.
+pub(crate) async fn write_and_read_header<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    message_id: u64,
+    cache_name: &[u8],
+    opcode: OpCode,
+    intelligence: ClientIntelligence,
+    topology_id: i32,
+    body: &[u8],
+) -> Result<ResponseHeader> {
+    let mut request = Vec::with_capacity(32 + body.len());
+    write_request_header(
+        &mut request,
+        message_id,
+        cache_name,
+        opcode,
+        intelligence,
+        topology_id,
+    );
+    request.extend_from_slice(body);
+
+    stream.write_all(&request).await?;
+    stream.flush().await?;
+
+    read_response_header(stream, message_id, opcode, intelligence).await
 }
 
 #[cfg(test)]
