@@ -48,7 +48,7 @@ use crate::wire::{
 
 /// Sent on every request until the sender has topology awareness to report
 /// a real one: `HotRodConnection` always sends this, and it's also what
-/// `HotRodCluster` starts a fresh pooled connection with before its first
+/// `HotRodClient` starts a fresh pooled connection with before its first
 /// topology update arrives. Encoded as `u32::from_ne_bytes` would not do
 /// here: it must go through the same unsigned-vint path as any other
 /// topology id (see `varint` module docs).
@@ -74,7 +74,10 @@ pub const MAX_BULK_ENTRIES: usize = 100_000;
 
 /// Races `fut` against `timeout`, turning an elapsed deadline into
 /// `Error::Timeout` instead of leaving the caller to wait forever.
-async fn with_timeout<T>(timeout: Duration, fut: impl Future<Output = Result<T>>) -> Result<T> {
+pub(crate) async fn with_timeout<T>(
+    timeout: Duration,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
         Err(_elapsed) => Err(Error::Timeout(timeout)),
@@ -207,7 +210,7 @@ impl HotRodConnection {
     }
 
     /// Opens a TCP connection that advertises `HashDistributionAware`
-    /// intelligence, for use as one of `HotRodCluster`'s pooled per-node
+    /// intelligence, for use as one of `HotRodClient`'s pooled per-node
     /// connections. `topology_id` is the id already known to the cluster, so
     /// the server does not resend a topology update the client already has.
     ///
@@ -267,8 +270,8 @@ impl HotRodConnection {
 
     /// `true` once a prior operation left this connection with a possible
     /// partial frame in flight and every further operation is refusing to
-    /// run. `HotRodCluster` checks this before handing a pooled connection
-    /// to the next operation, instead of waiting to see whether that
+    /// run. `pool.rs`'s `PooledGuard` checks this before returning a
+    /// connection to its idle list, instead of waiting to see whether that
     /// operation happens to come back with an error.
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned

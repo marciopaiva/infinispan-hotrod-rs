@@ -17,34 +17,32 @@ failures, allocation limits on every server-declared length
 (`Error::DeclaredLengthTooLarge`, `MAX_BULK_ENTRIES`), bounded varint
 decoding (`Error::MalformedVarint`), and connection poisoning so a
 cancelled operation can never leave a later read misaligned with the
-wire. `HotRodCluster` adds real topology tracking and hash-aware
+wire. `HotRodClient` adds real topology tracking and hash-aware
 routing, not just a TCP client that happens to also parse Hot Rod
 frames.
 
 The gap is everything a production deployment expects around that core:
 TLS was the first piece and is now done (`docs/adr/0004-tls-support.md`,
-#46). Concurrency, pooling, events, near caching, streaming, typed
-serialization and the PHP bridge are still open.
+#46). Connection pooling and concurrent dispatch is now done too
+(`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77).
+Events, near caching, streaming and typed serialization are still open;
+the PHP bridge still comes last.
 
-## The one structural change that gates the rest
+## The structural change that gated the rest (done, #77)
 
-`HotRodCluster` methods take `&mut self`. One instance therefore
-serializes every operation, even ones that route to different nodes.
-Wrapping it in `Arc<Mutex<..>>` would not fix this, it would just move
-the serialization point. TLS, listeners, near caching, streaming and
-multi-cluster failover all assume a client that can hold several live
-connections and dispatch to them concurrently, so this needs to be
-addressed before those features, not alongside the last one that runs
-into it.
-
-The proposed shape, evolving out of the current `HotRodConnection` /
-`HotRodCluster` split rather than replacing it outright:
+`HotRodCluster` used to take `&mut self` on every method, so one
+instance serialized every operation, even ones that route to different
+nodes. `HotRodClient`/`RemoteCache` (ADR 0005) replaced it: the client
+holds a bounded pool of connections per `(node, cache)` pair and every
+`RemoteCache` operation takes `&self`, so independent operations,
+including ones against the same node, run concurrently. The shape that
+shipped:
 
 ```
 HotRodClient
     |
     +-- topology manager
-    +-- connection pools (one per node)
+    +-- connection pools (one per (node, cache) pair)
     +-- router (segment owner -> pool)
     +-- authentication, TLS config
     |
@@ -53,17 +51,19 @@ RemoteCache (one per named cache, borrowed from HotRodClient)
     +-- get / put / remove / bulk / ...
 ```
 
-`HotRodConnection` keeps its role as the single, sequential connection
+`HotRodConnection` kept its role as the single, sequential connection
 type; the pool holds several of them per node instead of `HotRodCluster`
-holding exactly one per node. This is its own ADR before implementation
-starts, since it changes the public API of `hotrod-protocol`.
+holding exactly one per node. TLS, listeners, near caching, streaming
+and multi-cluster failover all assume a client that can hold several
+live connections and dispatch to them concurrently, so this needed to
+land before those features, not alongside the last one that ran into it.
 
 ## Proposed ordering
 
 | Priority | Item | Issue | Why this order |
 | --- | --- | --- | --- |
-| P0 | Connection pooling / concurrent operations | (new, precedes the rest) | Structural blocker described above |
-| P0 | Multi-node CI fixture | (new) | The cluster code path is currently exercised only by `#[ignore]`d manual tests; failover and rebalance need a real multi-node run in CI |
+| ~~P0~~ | ~~Connection pooling / concurrent operations~~ | #77 (done) | Structural blocker described above |
+| P0 | Multi-node CI fixture | #78 | The cluster code path is currently exercised only by `#[ignore]`d manual tests; failover and rebalance need a real multi-node run in CI |
 | P1 | Client listeners (cache events) | #4 | Prerequisite for near caching |
 | P1 | Near caching | #5 | Large latency win once listeners exist, particularly for the PHP bridge |
 | P1 | Streaming (GetStream/PutStream) | #52 | Values are currently always fully buffered in memory |

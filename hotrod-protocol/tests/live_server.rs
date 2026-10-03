@@ -27,7 +27,9 @@
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-use hotrod_protocol::{Expiration, HotRodCluster, HotRodConnection, TlsConfig, VersionedResult};
+use hotrod_protocol::{
+    Expiration, HotRodClient, HotRodConnection, RemoteCache, TlsConfig, VersionedResult,
+};
 
 /// Serializes every test in this file against the same live server. Most
 /// tests only touch their own keys and would be fine running concurrently,
@@ -142,7 +144,7 @@ async fn connect_tls() -> HotRodConnection {
 }
 
 /// Seed addresses for a multi-node cluster, needed only by the
-/// `HotRodCluster` tests below: hash-aware routing has nothing to route to
+/// `cluster_*` tests below: hash-aware routing has nothing to route to
 /// on the single-node fixture the other tests in this file use. Point this
 /// at a local cluster with a `<distributed-cache>` (see
 /// `docs/adr/0003-hash-aware-routing-scope.md`).
@@ -160,25 +162,25 @@ fn cluster_cache_name() -> String {
     env_or("INFINISPAN_CLUSTER_CACHE", "distributed")
 }
 
-async fn connect_cluster() -> HotRodCluster {
+async fn connect_cluster() -> RemoteCache {
     let user = env_or("INFINISPAN_USER", "testuser");
     let pass = env_or("INFINISPAN_PASS", "testpass");
 
-    let mut cluster = HotRodCluster::connect(&cluster_seed_addrs(), &cluster_cache_name())
+    let client = HotRodClient::connect(&cluster_seed_addrs())
         .await
         .expect("connect");
-    cluster
+    client
         .authenticate_plain("", &user, &pass)
         .await
         .expect("authenticate");
-    cluster
+    client.cache(cluster_cache_name())
 }
 
 #[tokio::test]
 #[ignore]
 async fn cluster_put_get_remove_roundtrip() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
 
     cluster
         .put(
@@ -213,7 +215,7 @@ async fn cluster_put_get_remove_roundtrip() {
 #[ignore]
 async fn cluster_routes_many_keys_to_their_owners() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
 
     let keys: Vec<Vec<u8>> = (0..50)
         .map(|i| format!("ci-cluster-routing-{i}").into_bytes())
@@ -653,7 +655,7 @@ async fn get_all_and_put_all_roundtrip() {
 #[ignore]
 async fn cluster_contains_key_reflects_presence() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
     cluster
         .remove(b"ci-cluster-contains-key")
         .await
@@ -691,7 +693,7 @@ async fn cluster_contains_key_reflects_presence() {
 #[ignore]
 async fn cluster_ping_succeeds_against_the_seed() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
     cluster.ping().await.expect("ping");
 }
 
@@ -699,7 +701,7 @@ async fn cluster_ping_succeeds_against_the_seed() {
 #[ignore]
 async fn cluster_stats_returns_node_statistics() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
 
     let stats = cluster.stats().await.expect("stats");
     assert!(
@@ -708,7 +710,7 @@ async fn cluster_stats_returns_node_statistics() {
     );
 }
 
-/// `size`/`clear` on `HotRodCluster` always target the seed, but `clear` is
+/// `size`/`clear` on `RemoteCache` always target the seed, but `clear` is
 /// still cluster-wide: it wipes the same `distributed` cache
 /// `cluster_routes_many_keys_to_their_owners` uses, so this relies on
 /// `LIVE_SERVER_LOCK` the same as the non-cluster `size_and_clear` test does.
@@ -716,7 +718,7 @@ async fn cluster_stats_returns_node_statistics() {
 #[ignore]
 async fn cluster_size_and_clear_reflect_cache_contents() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
 
     cluster
         .put(
@@ -747,7 +749,7 @@ async fn cluster_size_and_clear_reflect_cache_contents() {
 #[ignore]
 async fn cluster_get_all_and_put_all_roundtrip() {
     let _guard = lock_live_server();
-    let mut cluster = connect_cluster().await;
+    let cluster = connect_cluster().await;
 
     let keys: Vec<Vec<u8>> = (0..5)
         .map(|i| format!("ci-cluster-bulk-{i}").into_bytes())
@@ -776,6 +778,68 @@ async fn cluster_get_all_and_put_all_roundtrip() {
     for (key, value) in &entries {
         assert_eq!(fetched.get(key), Some(value));
     }
+
+    for key in &keys {
+        cluster.remove(key).await.expect("cleanup");
+    }
+}
+
+/// `RemoteCache` methods take `&self` specifically so independent
+/// operations can run concurrently instead of queuing behind one
+/// `&mut self` borrow the way `HotRodCluster` used to force (ADR 0005,
+/// #77). This fires `n` concurrent `get`s through one shared `RemoteCache`
+/// and times that against the same `n` gets done one at a time: no hard
+/// speedup threshold is asserted, since this is a timing comparison on
+/// whatever machine happens to run it (`#[ignore]`d, manual-only, like
+/// every other `cluster_*` test here), but the two numbers are printed so
+/// a human can see a dispatch-serializing regression immediately instead
+/// of this test staying silently green. The concurrent run completing at
+/// all is the harder assertion: an earlier version of the connection pool
+/// deadlocked under exactly this load once concurrency exceeded the
+/// pool's per-node connection limit, hanging every excess request until
+/// its operation timeout; this test is what first caught that.
+#[tokio::test]
+#[ignore]
+async fn cluster_concurrent_gets_do_not_serialize() {
+    let _guard = lock_live_server();
+    let cluster = connect_cluster().await;
+
+    let n = 64;
+    let keys: Vec<Vec<u8>> = (0..n)
+        .map(|i| format!("ci-cluster-concurrent-{i}").into_bytes())
+        .collect();
+    for key in &keys {
+        cluster
+            .put(key, b"v", Expiration::Default, Expiration::Default)
+            .await
+            .unwrap_or_else(|err| panic!("put {key:?}: {err}"));
+    }
+
+    let sequential_start = std::time::Instant::now();
+    for key in &keys {
+        cluster
+            .get(key)
+            .await
+            .unwrap_or_else(|err| panic!("sequential get {key:?}: {err}"));
+    }
+    let sequential = sequential_start.elapsed();
+
+    let concurrent_start = std::time::Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
+    for key in keys.clone() {
+        let cluster = cluster.clone();
+        tasks.spawn(async move { cluster.get(&key).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result
+            .expect("task should not panic")
+            .expect("concurrent get should succeed, not hang until its own timeout");
+    }
+    let concurrent = concurrent_start.elapsed();
+
+    println!(
+        "cluster_concurrent_gets_do_not_serialize: sequential={sequential:?} concurrent={concurrent:?}"
+    );
 
     for key in &keys {
         cluster.remove(key).await.expect("cleanup");

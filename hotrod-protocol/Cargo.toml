@@ -8,7 +8,7 @@ repository = "https://github.com/marciopaiva/infinispan-hotrod-rs"
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time", "sync"] }
 thiserror = "2"
 sha2 = "0.10"
 hmac = "0.12"

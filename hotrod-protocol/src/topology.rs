@@ -23,7 +23,7 @@ pub(crate) enum ClientIntelligence {
     /// No cluster or hash information. What `HotRodConnection` always sends.
     Basic,
     /// Cluster membership plus per-segment hash ownership. What
-    /// `HotRodCluster`'s per-node connections send.
+    /// `HotRodClient`'s per-node connections send.
     HashDistributionAware,
 }
 
