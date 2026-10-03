@@ -8,10 +8,11 @@
    <!-- Same base as ci/infinispan/infinispan.xml, plus a distributed
         cache (cluster_cache_name()'s default "distributed") and
         external-host/external-port on the hotrod-connector, so a client
-        outside the kind cluster gets topology updates it can actually
-        route to instead of internal pod IPs. Each pod sets its own
+        outside the two containers gets topology updates it can actually
+        route to instead of each container's internal Docker network
+        address. Each container sets its own
         node-name/external-port/cluster-stack via CLI args (see
-        pod-node0.yaml/pod-node1.yaml); this file is shared by both. -->
+        setup.sh); this file is shared by both. -->
    <cache-container name="default" statistics="true">
       <transport cluster="${infinispan.cluster.name:cluster}" stack="${infinispan.cluster.stack:tcp}" node-name="${infinispan.node.name:}"/>
       <distributed-cache name="distributed" statistics="true"/>

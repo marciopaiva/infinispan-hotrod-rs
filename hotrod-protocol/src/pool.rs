@@ -29,8 +29,11 @@
 //! connection it travelled with), so that waiter could only ever be woken
 //! by an actual close, not by the connection it was waiting for becoming
 //! idle again. Caught by running the `cluster_*` live-server tests
-//! concurrently against a real two-node cluster under
-//! `ci/infinispan-kind/`: every checkout past the first `max_size` hung
+//! concurrently against a real two-node cluster under what was then
+//! `ci/infinispan-kind/` (a disposable `kind`-based fixture built for
+//! this one validation, since replaced by `ci/infinispan-cluster/` for
+//! issue #78's permanent CI coverage): every checkout past the first
+//! `max_size` hung
 //! until the operation timeout. A second attempt (a bounded `mpsc`
 //! channel of slots) fixed the hang but introduced a different bug: the
 //! channel's FIFO order meant a freshly returned, still-open connection

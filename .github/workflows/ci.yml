@@ -25,3 +25,23 @@ jobs:
 
       - name: Unit tests
         run: cargo test --workspace
+
+  cluster-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Infinispan cluster
+        run: ci/infinispan-cluster/setup.sh
+
+      - name: Cluster tests
+        run: cargo test --test live_server cluster_ -- --ignored
+
+      - name: Stop Infinispan cluster
+        if: always()
+        run: ci/infinispan-cluster/teardown.sh

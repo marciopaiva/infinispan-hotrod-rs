@@ -113,8 +113,10 @@ empty marker meaning "open one"), wrapped so that:
   constructors for a need that is still hypothetical.
 
 **This went through two wrong designs before landing on the one above**,
-caught by validating against a real two-node cluster
-(`ci/infinispan-kind/`) before this ADR's own implementation was
+caught by validating against a real two-node cluster (then
+`ci/infinispan-kind/`, a disposable `kind`-based fixture built for this
+one validation and since replaced by `ci/infinispan-cluster/` for issue
+#78's permanent CI coverage) before this ADR's own implementation was
 committed, not by the unit tests, which all used at most one concurrent
 checkout per pool and so never exercised the bug:
 
