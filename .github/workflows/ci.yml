@@ -27,6 +27,7 @@ jobs:
         run: cargo test --workspace
 
   cluster-test:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

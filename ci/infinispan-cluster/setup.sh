@@ -52,7 +52,11 @@ start_node infinispan-cluster-node1 11322 node1
 
 wait_for_node() {
   local name=$1
-  for i in $(seq 1 30); do
+  # 60 iterations, not the 30 ci/infinispan-tls/setup.sh uses for a
+  # single node: two nodes need to boot and also find each other over
+  # JGroups DNS_PING before either is ready, and a shared CI runner can
+  # be slower than this sandbox, where both came up in a few seconds.
+  for i in $(seq 1 60); do
     if docker logs "$name" 2>&1 | grep -q "ISPN080001"; then
       return 0
     fi
