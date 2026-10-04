@@ -67,11 +67,13 @@ land before those features, not alongside the last one that ran into it.
 
 Four P0/P1 items are done: pooling (#77), the multi-node CI fixture
 (#78), client listeners (#4) and near caching (#5), released together
-as v0.5.0. What is left groups into five themes. They are mostly
-independent of each other; within a theme, order matters more, since
+as v0.5.0. What is left groups into five themes. Large data access is
+next, ahead of the other four; those four are independent of each
+other and of large data access, so any of them can follow in whatever
+order is actually needed. Within a theme, order matters more, since
 later items there tend to build on earlier ones.
 
-### Large data access — next up
+### Large data access (next up)
 
 * **Streaming (#52, GetStream/PutStream).** Values are currently always
   fully buffered in memory; there is no way to read or write a value
@@ -97,6 +99,11 @@ later items there tend to build on earlier ones.
   issue filed yet. Worth proposing once #54 gives a concrete picture of
   what is actually failing in practice, rather than designing retry
   behavior against a guess.
+* Fuzzing the wire parsers (`read_vint`, `read_vlong`, `read_array`,
+  `read_topology_update`, the SASL challenge parsers) was already
+  planned before this rewrite and still has no issue filed; it belongs
+  here, since a parser that survives a fuzzer is exactly the kind of
+  reliability this theme is about.
 
 ### Typed data
 
