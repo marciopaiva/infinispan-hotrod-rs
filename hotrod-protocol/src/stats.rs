@@ -51,14 +51,31 @@ impl TimedCounter {
 /// holds one of for every cache name a `RemoteCache` has been
 /// obtained for. `RemoteCache::statistics`/`reset_statistics` are the
 /// only public way to read or reset one.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CacheStatisticsInner {
     hits: AtomicU64,
     misses: AtomicU64,
     reads: TimedCounter,
     stores: TimedCounter,
     removes: TimedCounter,
+    /// Always `Some` from construction onward: set here, not just in
+    /// `reset()`, so `time_since_reset` measures from this cache's
+    /// creation until the first real `reset_statistics()`, instead of
+    /// reading `Duration::ZERO` the entire time until then.
     reset_at: RwLock<Option<Instant>>,
+}
+
+impl Default for CacheStatisticsInner {
+    fn default() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            reads: TimedCounter::default(),
+            stores: TimedCounter::default(),
+            removes: TimedCounter::default(),
+            reset_at: RwLock::new(Some(Instant::now())),
+        }
+    }
 }
 
 impl CacheStatisticsInner {
@@ -88,7 +105,11 @@ impl CacheStatisticsInner {
     }
 
     pub(crate) fn snapshot(&self) -> ClientStatistics {
-        let reset_at = *self.reset_at.read().unwrap_or_else(|p| p.into_inner());
+        let reset_at = self
+            .reset_at
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("always Some from construction onward, see the field's doc comment");
         ClientStatistics {
             remote_hits: self.hits.load(Ordering::Relaxed),
             remote_misses: self.misses.load(Ordering::Relaxed),
@@ -97,7 +118,7 @@ impl CacheStatisticsInner {
             average_remote_store_time: self.stores.average(),
             remote_removes: self.removes.count(),
             average_remote_remove_time: self.removes.average(),
-            time_since_reset: reset_at.map_or(Duration::ZERO, |at| at.elapsed()),
+            time_since_reset: reset_at.elapsed(),
         }
     }
 
@@ -116,14 +137,38 @@ impl CacheStatisticsInner {
 /// `RemoteCache.clientStatistics()`, minus the near-cache fields:
 /// see `NearCacheStatistics` and the ADR for why those live on
 /// `NearCachedCache` instead.
+///
+/// `remote_stores`/`remote_removes` count every `put`/`put_if_absent`/
+/// `replace`/`replace_if_unmodified`/`put_all` or `remove`/
+/// `remove_if_unmodified` call that completed without error, even one
+/// that was a logical no-op on the server (`put_if_absent` on a key
+/// that already existed, `replace_if_unmodified` against a stale
+/// version, ...): this measures calls made, the same granularity the
+/// Java client's decorator wraps a whole operation in, not confirmed
+/// mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientStatistics {
+    /// Keys found by `get`/`get_with_version`/`get_all`. A bulk
+    /// `get_all` call contributes one hit per key it found, not one
+    /// hit for the call itself.
     pub remote_hits: u64,
+    /// Keys not found by `get`/`get_with_version`/`get_all`, counted
+    /// the same per-key way as `remote_hits`.
     pub remote_misses: u64,
+    /// Average wall-clock time of a read call, hits and misses alike.
     pub average_remote_read_time: Duration,
+    /// How many `put`/`put_if_absent`/`replace`/
+    /// `replace_if_unmodified`/`put_all` calls completed without
+    /// error; see the struct docs for what this does and does not
+    /// mean.
     pub remote_stores: u64,
+    /// Average wall-clock time of a store call.
     pub average_remote_store_time: Duration,
+    /// How many `remove`/`remove_if_unmodified` calls completed
+    /// without error; see the struct docs for what this does and does
+    /// not mean.
     pub remote_removes: u64,
+    /// Average wall-clock time of a remove call.
     pub average_remote_remove_time: Duration,
     /// How long it has been since the last `reset_statistics`, or
     /// since this cache's statistics were first created if that never
@@ -138,12 +183,25 @@ pub struct ClientStatistics {
 /// around, since a near cache's statistics only make sense for that
 /// specific wrapper (see the ADR for why this differs from the plain
 /// per-cache-name statistics above).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct NearCacheStatisticsInner {
     hits: AtomicU64,
     misses: AtomicU64,
     invalidations: AtomicU64,
+    /// Always `Some` from construction onward; see the identically
+    /// documented field on `CacheStatisticsInner`.
     reset_at: RwLock<Option<Instant>>,
+}
+
+impl Default for NearCacheStatisticsInner {
+    fn default() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
+            reset_at: RwLock::new(Some(Instant::now())),
+        }
+    }
 }
 
 impl NearCacheStatisticsInner {
@@ -160,13 +218,17 @@ impl NearCacheStatisticsInner {
     }
 
     pub(crate) fn snapshot(&self, size: usize) -> NearCacheStatistics {
-        let reset_at = *self.reset_at.read().unwrap_or_else(|p| p.into_inner());
+        let reset_at = self
+            .reset_at
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("always Some from construction onward, see the field's doc comment");
         NearCacheStatistics {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             invalidations: self.invalidations.load(Ordering::Relaxed),
             size,
-            time_since_reset: reset_at.map_or(Duration::ZERO, |at| at.elapsed()),
+            time_since_reset: reset_at.elapsed(),
         }
     }
 
@@ -182,13 +244,22 @@ impl NearCacheStatisticsInner {
 /// `NearCachedCache::statistics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NearCacheStatistics {
+    /// `get` calls served from the local store, no network round trip.
     pub hits: u64,
+    /// `get` calls that fell through to the network, either because
+    /// the key was not cached locally or because the invalidation
+    /// feed had already died (see the module docs on `NearCachedCache`).
     pub misses: u64,
+    /// How many invalidation events this near cache has processed:
+    /// one per key invalidated by the background listener, by `put`/
+    /// `remove`'s own immediate local invalidation, or by `clear`.
     pub invalidations: u64,
     /// How many entries are cached locally right now: a live read of
     /// `LruStore`'s current length, not a counter, so it is already
     /// correct without needing `reset_statistics` to touch it.
     pub size: usize,
+    /// How long it has been since the last `reset_near_cache_statistics`,
+    /// or since this near cache was created if that never happened.
     pub time_since_reset: Duration,
 }
 
@@ -197,10 +268,21 @@ pub struct NearCacheStatistics {
 /// the ADR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolStatistics {
+    /// The node this pool holds connections to.
     pub address: SocketAddr,
+    /// The cache name this pool was opened for: part of the pool key
+    /// alongside `address`, since a `HotRodConnection` binds to one
+    /// cache at connect time (see `docs/adr/0005-connection-pooling-and-client-cache-split.md`).
     pub cache_name: String,
+    /// Connections idle in this pool right now, ready to be checked
+    /// out without opening a new one. A snapshot: stale the instant
+    /// after this is read if another task checks one out or returns
+    /// one, same as any live count would be.
     pub idle_connections: usize,
+    /// Connections currently checked out of this pool.
     pub checked_out_connections: usize,
+    /// The fixed maximum number of connections, idle plus checked
+    /// out, this pool ever holds at once.
     pub max_connections: usize,
 }
 

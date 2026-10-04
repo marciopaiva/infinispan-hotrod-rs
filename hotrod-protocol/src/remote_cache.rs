@@ -660,8 +660,13 @@ impl RemoteCache {
                 stats.record_read(elapsed, value.is_some());
             }
             (Operation::GetAll(keys), OperationResult::GetAll(found)) => {
-                let hits = found.len() as u64;
-                let misses = (keys.len() as u64).saturating_sub(hits);
+                // Counted per requested key, not per unique key found:
+                // `found.len()` alone undercounts hits (and so
+                // overcounts misses) whenever `keys` repeats a key
+                // that was actually found, since a `HashMap` can only
+                // ever report it once.
+                let hits = keys.iter().filter(|key| found.contains_key(*key)).count() as u64;
+                let misses = keys.len() as u64 - hits;
                 stats.record_bulk_read(elapsed, hits, misses);
             }
             (
@@ -1269,6 +1274,50 @@ pub(crate) mod tests {
         seed_task.await.unwrap();
     }
 
+    /// Regression test for a review finding: `get_all` must count hits
+    /// and misses per *requested* key, not per unique key the server
+    /// found. Requesting the same existing key twice must record two
+    /// hits, not one hit and one miss, which `found.len()` alone would
+    /// have given (a `HashMap` only ever reports a key once).
+    #[tokio::test]
+    async fn statistics_counts_get_all_hits_per_requested_key_not_per_unique_key_found() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2F, "expected a GetAll request");
+            let count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(count, 2, "the duplicate key must still be sent twice");
+            for _ in 0..count {
+                read_array(&mut stream).await.unwrap();
+            }
+            let mut resp = response_header(id, 0x30, 0x00);
+            write_vint(&mut resp, 1); // one unique entry found
+            write_array(&mut resp, b"dup-key");
+            write_array(&mut resp, b"value");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+
+        cache
+            .get_all([b"dup-key".as_slice(), b"dup-key".as_slice()])
+            .await
+            .expect("get_all");
+
+        let stats = cache.statistics();
+        assert_eq!(
+            stats.remote_hits, 2,
+            "both requests for the found key must count"
+        );
+        assert_eq!(stats.remote_misses, 0);
+
+        seed_task.await.unwrap();
+    }
+
     /// `contains_key`/`ping`/`size`/`clear`/`stats` are explicitly not
     /// instrumented by the Java client either (see the ADR); confirms
     /// this client matches that exactly instead of silently
@@ -1322,8 +1371,18 @@ pub(crate) mod tests {
         cache.clear().await.expect("clear");
         cache.stats().await.expect("stats");
 
+        // Every counter must still be zero; `time_since_reset` is not
+        // compared against `ClientStatistics::default()` here, since
+        // it legitimately ticks up from this cache's first access
+        // onward, reset or not.
         let stats = cache.statistics();
-        assert_eq!(stats, ClientStatistics::default());
+        assert_eq!(stats.remote_hits, 0);
+        assert_eq!(stats.remote_misses, 0);
+        assert_eq!(stats.average_remote_read_time, Duration::ZERO);
+        assert_eq!(stats.remote_stores, 0);
+        assert_eq!(stats.average_remote_store_time, Duration::ZERO);
+        assert_eq!(stats.remote_removes, 0);
+        assert_eq!(stats.average_remote_remove_time, Duration::ZERO);
 
         seed_task.await.unwrap();
     }
@@ -1346,7 +1405,10 @@ pub(crate) mod tests {
         let result = cache.get(b"key").await;
         assert!(matches!(result, Err(Error::Timeout(_))));
 
-        assert_eq!(cache.statistics(), ClientStatistics::default());
+        let stats = cache.statistics();
+        assert_eq!(stats.remote_hits, 0);
+        assert_eq!(stats.remote_misses, 0);
+        assert_eq!(stats.average_remote_read_time, Duration::ZERO);
     }
 
     #[tokio::test]

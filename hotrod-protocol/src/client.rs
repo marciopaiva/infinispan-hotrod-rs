@@ -604,46 +604,18 @@ impl HotRodClient {
     }
 
     fn pool_for(&self, addr: SocketAddr, cache_name: &str) -> Arc<ConnectionPool> {
-        let key = (addr, cache_name.to_string());
-        if let Some(pool) = self
-            .0
-            .pools
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&key)
-        {
-            return pool.clone();
-        }
-        self.0
-            .pools
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(key)
-            .or_insert_with(|| Arc::new(ConnectionPool::new(DEFAULT_MAX_CONNECTIONS_PER_NODE)))
-            .clone()
+        get_or_insert_with(&self.0.pools, (addr, cache_name.to_string()), || {
+            Arc::new(ConnectionPool::new(DEFAULT_MAX_CONNECTIONS_PER_NODE))
+        })
     }
 
     /// The statistics counters for `cache_name`, created the first
     /// time this cache name is seen, by an operation or by
     /// `RemoteCache::statistics` itself. Same lazy-insert shape as
-    /// `pool_for`.
+    /// `pool_for`, sharing `get_or_insert_with` with it rather than
+    /// repeating the double-checked-locking pattern a second time.
     pub(crate) fn stats_for(&self, cache_name: &str) -> Arc<CacheStatisticsInner> {
-        if let Some(stats) = self
-            .0
-            .cache_stats
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(cache_name)
-        {
-            return stats.clone();
-        }
-        self.0
-            .cache_stats
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(cache_name.to_string())
-            .or_default()
-            .clone()
+        get_or_insert_with(&self.0.cache_stats, cache_name.to_string(), Arc::default)
     }
 
     /// A snapshot of every connection pool this client currently has,
@@ -656,12 +628,15 @@ impl HotRodClient {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .map(|((addr, cache_name), pool)| PoolStatistics {
-                address: *addr,
-                cache_name: cache_name.clone(),
-                idle_connections: pool.idle_count(),
-                checked_out_connections: pool.checked_out_count(),
-                max_connections: pool.max_size(),
+            .map(|((addr, cache_name), pool)| {
+                let counts = pool.slot_counts();
+                PoolStatistics {
+                    address: *addr,
+                    cache_name: cache_name.clone(),
+                    idle_connections: counts.idle,
+                    checked_out_connections: counts.checked_out,
+                    max_connections: pool.max_size(),
+                }
             })
             .collect()
     }
@@ -928,6 +903,26 @@ async fn resolve_cached_addr(topology: &ClusterTopology, primary: u32) -> Result
         .unwrap_or_else(|p| p.into_inner())
         .insert(primary, addr);
     Ok(addr)
+}
+
+/// `map`'s value for `key`, inserting `make()`'s result first if
+/// none exists yet. A read lock is tried first, so the common case
+/// (the key already exists) never takes the write lock at all.
+/// Shared by `pool_for` and `stats_for`, the only two places this
+/// client lazily creates a keyed, `Arc`-shared value this way.
+fn get_or_insert_with<K, V>(map: &RwLock<HashMap<K, V>>, key: K, make: impl FnOnce() -> V) -> V
+where
+    K: std::hash::Hash + Eq,
+    V: Clone,
+{
+    if let Some(value) = map.read().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return value.clone();
+    }
+    map.write()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key)
+        .or_insert_with(make)
+        .clone()
 }
 
 #[cfg(test)]
