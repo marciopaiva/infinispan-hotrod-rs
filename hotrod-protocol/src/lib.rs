@@ -28,7 +28,11 @@
 //! `replace_stream_with_version` (see `docs/adr/0008-streaming.md`)
 //! read or write a value in chunks instead of buffering it whole,
 //! returning a `GetStream`/`PutStream` pinned to the one pooled
-//! connection that opened it.
+//! connection that opened it. `RemoteCache::iter`/`iter_with` (see
+//! `docs/adr/0009-server-side-iteration.md`) walk every entry in a
+//! cache through a server-side `CacheIterator`, opening one cursor per
+//! node on a cluster instead of requiring the caller to already know
+//! every key.
 
 #![forbid(unsafe_code)]
 

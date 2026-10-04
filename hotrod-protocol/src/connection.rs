@@ -146,6 +146,11 @@ pub(crate) struct IterationBatch {
     pub entries: Vec<(Vec<u8>, VersionedValue)>,
 }
 
+/// A single sequential connection to one cache on a Hot Rod server. See
+/// the module docs above for the cancellation-safety and poisoning
+/// rules every operation on this type follows; `HotRodClient`
+/// (`client.rs`) is what most callers want instead, since it pools
+/// several of these per node and tracks cluster topology on top.
 pub struct HotRodConnection {
     stream: BufStream<Transport>,
     cache_name: Vec<u8>,
