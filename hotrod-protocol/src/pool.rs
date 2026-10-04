@@ -140,13 +140,35 @@ impl ConnectionPool {
     /// Used by `HotRodClient::failover_seed` to make a freshly opened and
     /// authenticated connection to a new seed available immediately,
     /// without a caller's next checkout having to open yet another one.
-    /// Takes whatever slot is available first (a brand new pool starts
-    /// full of empty ones) and returns the real connection in its place,
-    /// the same net effect on the slot count as one ordinary
-    /// `checkout`/return pair.
+    /// Evicts an empty slot if one exists (a brand new pool starts full
+    /// of them) and returns the real connection in its place, the same
+    /// net effect on the slot count as one ordinary `checkout`/return
+    /// pair. Only falls back to evicting a healthy idle connection when
+    /// every slot already holds one: an empty slot is preferred first,
+    /// rather than whichever slot a plain LIFO `checkout` would have
+    /// happened to pop, so this never throws away a good connection
+    /// while an empty slot was available to take instead.
     pub(crate) async fn seed_idle(&self, conn: HotRodConnection) {
-        let _ = self.checkout().await;
-        self.return_slot(Some(conn));
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("this pool's semaphore is never closed");
+        permit.forget();
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        match slots.iter().position(|slot| matches!(slot, Slot::Empty)) {
+            Some(index) => {
+                slots.remove(index);
+            }
+            None => {
+                slots.pop().expect(
+                    "the semaphore count equals slots.len(), so an acquired permit guarantees one",
+                );
+            }
+        }
+        slots.push(Slot::Connection(Box::new(conn)));
+        drop(slots);
+        self.semaphore.add_permits(1);
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -240,5 +262,63 @@ impl DerefMut for PooledGuard {
 impl Drop for PooledGuard {
     fn drop(&mut self) {
         self.pool.return_slot(self.conn.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Regression test for a review finding: `seed_idle` used to pop
+    /// whatever slot a plain LIFO `checkout` happened to return, which
+    /// could (and, depending on push/pop history, would) discard a
+    /// healthy idle connection even while an empty slot sat right next
+    /// to it. Sets up exactly that shape (one empty slot, one slot
+    /// holding a real connection) and confirms both connections are
+    /// still retrievable afterward, distinguished by a timeout each was
+    /// given before `seed_idle` ran.
+    #[tokio::test]
+    async fn seed_idle_prefers_evicting_an_empty_slot_over_a_healthy_connection() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener_a.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener_b.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut conn_a = HotRodConnection::connect(addr_a, "").await.unwrap();
+        conn_a.set_timeout(Duration::from_millis(111));
+        let mut conn_b = HotRodConnection::connect(addr_b, "").await.unwrap();
+        conn_b.set_timeout(Duration::from_millis(222));
+
+        let pool = ConnectionPool::new(2);
+        assert!(matches!(pool.checkout().await, Checkout::NeedsNew));
+        pool.return_slot(Some(conn_a)); // slots: [Empty, Connection(conn_a)]
+
+        pool.seed_idle(conn_b).await;
+
+        let mut timeouts = Vec::new();
+        for _ in 0..2 {
+            if let Checkout::Idle(conn) = pool.checkout().await {
+                timeouts.push(conn.timeout());
+            }
+        }
+        timeouts.sort();
+        assert_eq!(
+            timeouts,
+            vec![Duration::from_millis(111), Duration::from_millis(222)],
+            "seed_idle must not discard the healthy idle connection when an empty slot was available"
+        );
     }
 }
