@@ -79,10 +79,15 @@ impl GetStream {
 
     /// Ends the stream explicitly. Only needed if the caller stops
     /// before `next_chunk` reports the value exhausted on its own: the
-    /// server has already cleaned up a stream that reached that point,
-    /// so closing it too would just be a wasted round trip (`Drop`
-    /// knows this too, see its own docs below).
+    /// server has already cleaned up a stream that reached that point
+    /// (`Drop` knows this too, see its own docs below), so this is a
+    /// free no-op then, not just a wasted round trip: sending
+    /// `GetStreamEnd` for a `streamId` the server no longer tracks is
+    /// not something this client has verified is harmless.
     pub async fn close(mut self) -> Result<()> {
+        if self.complete {
+            return Ok(());
+        }
         let result = self.conn.get_stream_end(self.stream_id).await;
         self.complete = true;
         result
@@ -389,6 +394,66 @@ mod tests {
             .expect("entry exists");
         assert_eq!(stream.next_chunk().await.unwrap(), Some(b"first-".to_vec()));
         stream.close().await.expect("close");
+
+        cache
+            .ping()
+            .await
+            .expect("ping should reuse the connection");
+
+        server.await.unwrap();
+    }
+
+    /// Regression test for a review finding: `close` on an already
+    /// exhausted stream must be a true no-op, sending nothing, not
+    /// just an unnecessary-but-harmless `GetStreamEnd`. The fake server
+    /// below only ever serves `GetStreamStart` and then a `Ping`; a
+    /// `close` that sent `GetStreamEnd` anyway would read as an
+    /// unexpected opcode there and fail this test.
+    #[tokio::test]
+    async fn get_stream_close_after_exhaustion_sends_no_request() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = tcp.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(opcode, 0xE9, "expected a GetStreamStart request");
+            let _key = read_array(&mut sock).await.unwrap();
+            let _batch_size = crate::varint::read_vint(&mut sock).await.unwrap();
+            let mut resp = response_header(id, 0xE8, 0x00);
+            resp.extend_from_slice(&1i32.to_be_bytes());
+            resp.push(1); // complete: true, the whole value fit already
+            resp.push(0x03);
+            resp.extend_from_slice(&0u64.to_be_bytes());
+            write_array(&mut resp, b"whole-value");
+            sock.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(
+                opcode, 0x17,
+                "expected a Ping request directly, no GetStreamEnd in between"
+            );
+            let mut resp = response_header(id, 0x18, 0x00);
+            resp.push(0);
+            resp.push(0);
+            resp.push(41);
+            crate::varint::write_vint(&mut resp, 0);
+            sock.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seed(addr);
+        let cache = client.cache("my-cache");
+        let mut stream = cache
+            .get_stream(b"key", 64)
+            .await
+            .expect("get_stream")
+            .expect("entry exists");
+        assert_eq!(
+            stream.next_chunk().await.unwrap(),
+            Some(b"whole-value".to_vec())
+        );
+        assert_eq!(stream.next_chunk().await.unwrap(), None);
+        stream.close().await.expect("close should be a no-op here");
 
         cache
             .ping()
