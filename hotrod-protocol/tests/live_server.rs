@@ -54,6 +54,10 @@ use hotrod_protocol::{
     TlsConfig, VersionedResult,
 };
 
+/// Larger than any single chunk below, so a roundtrip exercises more
+/// than one `GetStreamNext`/`PutStreamNext` call each way.
+const STREAMING_CHUNK_SIZE: usize = 1024;
+
 /// Serializes every test in this file against the same live server. Most
 /// tests only touch their own keys and would be fine running concurrently,
 /// but `clear()` wipes the whole cache, and cargo's default parallel test
@@ -1088,4 +1092,51 @@ async fn near_cache_sees_a_remote_write_once_its_invalidation_event_lands() {
     assert_eq!(observed, Some(b"second".to_vec()));
 
     conn.remove(b"ci-near-cache-key").await.expect("cleanup");
+}
+
+/// Writes a value bigger than one chunk via `put_stream`, reads it
+/// back via `get_stream` forcing multiple `next_chunk` calls, and
+/// confirms the bytes round-trip exactly. Writes in a different chunk
+/// size than the stream's own flush threshold on purpose, to prove the
+/// client-side buffering logic does not depend on the two lining up.
+#[tokio::test]
+#[ignore]
+async fn streaming_put_and_get_roundtrip_a_value_larger_than_one_chunk() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+
+    cache.remove(b"ci-streaming-key").await.expect("cleanup");
+
+    let value: Vec<u8> = (0..STREAMING_CHUNK_SIZE * 3 + 17)
+        .map(|i| (i % 251) as u8)
+        .collect();
+
+    let mut put = cache
+        .put_stream(
+            b"ci-streaming-key",
+            Expiration::Default,
+            Expiration::Default,
+            STREAMING_CHUNK_SIZE,
+        )
+        .await
+        .expect("put_stream");
+    for chunk in value.chunks(513) {
+        put.write_chunk(chunk).await.expect("write_chunk");
+    }
+    put.finish().await.expect("finish");
+
+    let mut get = cache
+        .get_stream(b"ci-streaming-key", STREAMING_CHUNK_SIZE as u32)
+        .await
+        .expect("get_stream")
+        .expect("entry exists");
+
+    let mut read_back = Vec::new();
+    while let Some(chunk) = get.next_chunk().await.expect("next_chunk") {
+        read_back.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(read_back, value);
+
+    cache.remove(b"ci-streaming-key").await.expect("cleanup");
 }

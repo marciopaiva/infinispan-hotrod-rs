@@ -30,8 +30,9 @@ pooling and concurrent dispatch followed
 (`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77), then
 client listeners (`docs/adr/0006-client-listeners.md`, #4) and near
 caching (`docs/adr/0007-near-caching.md`, #5), released together as
-v0.5.0. Large-value streaming, server-side iteration, typed
-serialization and the PHP bridge are still open.
+v0.5.0. Streaming (`docs/adr/0008-streaming.md`, #52) is done too,
+unreleased. Server-side iteration, typed serialization and the PHP
+bridge are still open.
 
 ## The structural change that gated the rest (done, #77)
 
@@ -65,26 +66,27 @@ land before those features, not alongside the last one that ran into it.
 
 ## Themes
 
-Four P0/P1 items are done: pooling (#77), the multi-node CI fixture
-(#78), client listeners (#4) and near caching (#5), released together
-as v0.5.0. What is left groups into five themes. Large data access is
-next, ahead of the other four; those four are independent of each
-other and of large data access, so any of them can follow in whatever
-order is actually needed. Within a theme, order matters more, since
-later items there tend to build on earlier ones.
+Five P0/P1 items are done: pooling (#77), the multi-node CI fixture
+(#78), client listeners (#4), near caching (#5) and streaming (#52).
+What is left groups into four themes, each independent of the others,
+so any of them can go next in whatever order is actually needed.
+Within a theme, order matters more, since later items there tend to
+build on earlier ones.
 
-### Large data access (next up)
+### Large data access
 
-* **Streaming (#52, GetStream/PutStream).** Values are currently always
-  fully buffered in memory; there is no way to read or write a value
-  larger than a caller is willing to hold whole. The exact opcodes and
-  framing need pinning against the real Java client source before any
-  Propose step, the same discipline every prior phase used for
-  hash/SASL/listener wire details: nothing here is confirmed yet.
-* **Server-side iteration (#53).** Only way to walk a cache without
-  already knowing its keys; needed for export, migration and cache
-  inspection tooling. Independent of streaming, but both land before
-  the themes below, since neither needs more.
+* ~~Streaming (#52, GetStream/PutStream)~~ (done). Values no longer
+  have to be fully buffered in memory: `RemoteCache::get_stream`/
+  `put_stream`/`put_stream_if_absent`/`replace_stream_with_version`
+  read or write one in chunks, pinned to the one pooled connection
+  that opened the stream, per `docs/adr/0008-streaming.md`.
+* **Server-side iteration (#53), the next item in this theme.** Only
+  way to walk a cache without already knowing its keys; needed for
+  export, migration and cache inspection tooling. The opcodes and
+  framing still need pinning against the real Java client source
+  before any Propose step, the same discipline #52 and every prior
+  phase used for their own wire details: nothing here is confirmed
+  yet.
 
 ### Reliability and observability
 
@@ -216,10 +218,12 @@ once instead of re-discovering per phase:
   `.await` needs the same question asked of it: what does a future
   dropped mid-flight leave behind?
 * **Protocol details come from the real client source, not memory.**
-  Every phase so far (hash routing, SASL mechanisms, listener framing)
-  pinned its wire format against the Java client's actual source on
-  GitHub before writing a line of parsing code. Streaming and
-  iteration need the same treatment before their own Propose step.
+  Every phase so far (hash routing, SASL mechanisms, listener framing,
+  streaming) pinned its wire format against the Java client's actual
+  source on GitHub before writing a line of parsing code, which is
+  also how streaming caught that its own response opcodes break the
+  "request plus one" pattern every other operation follows. Iteration
+  needs the same treatment before its own Propose step.
 * **No new dependency without the Analyze/Propose step.** Demonstrated
   repeatedly: GSSAPI deferred partly over a system Kerberos dependency,
   `rustls` chosen over `native-tls` to avoid a C one, connection pooling
@@ -234,8 +238,7 @@ once instead of re-discovering per phase:
 ## Explicitly out of scope for now
 
 * A `hotrod-wire` / `hotrod-client` / `hotrod-php` crate split. Worth
-  reconsidering once streaming and typed data exist; premature before
-  that.
+  reconsidering once typed data exists too; premature before that.
 * Automatic PHP array to Protobuf/Java-object mapping. The PHP API
   should offer explicit `putBytes`/`putJson`/a configurable serializer,
   not implicit conversion.

@@ -24,6 +24,11 @@
 //! `CacheEvent`s from. `RemoteCache::near_cache` (phase 5, see
 //! `docs/adr/0007-near-caching.md`) builds on that listener to keep a
 //! bounded, invalidated local cache of recently read entries.
+//! `RemoteCache::get_stream`/`put_stream`/`put_stream_if_absent`/
+//! `replace_stream_with_version` (see `docs/adr/0008-streaming.md`)
+//! read or write a value in chunks instead of buffering it whole,
+//! returning a `GetStream`/`PutStream` pinned to the one pooled
+//! connection that opened it.
 
 #![forbid(unsafe_code)]
 
@@ -40,6 +45,7 @@ mod remote_cache;
 mod sasl;
 mod scram;
 mod status;
+mod streaming;
 mod tls;
 mod topology;
 mod varint;
@@ -51,5 +57,6 @@ pub use error::{Error, Result};
 pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions, ServerFactory};
 pub use near_cache::{NearCacheOptions, NearCachedCache};
 pub use remote_cache::RemoteCache;
+pub use streaming::{GetStream, PutStream};
 pub use tls::TlsConfig;
 pub use wire::Expiration;

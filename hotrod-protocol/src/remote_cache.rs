@@ -16,6 +16,7 @@ use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
 use crate::error::{Error, Result};
 use crate::listener::{CacheListener, ListenOptions};
 use crate::near_cache::{NearCacheOptions, NearCachedCache};
+use crate::streaming::{GetStream, PutStream};
 use crate::wire::Expiration;
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -357,6 +358,89 @@ impl RemoteCache {
     /// `Modified`/`Removed`/`Expired`.
     pub async fn near_cache(&self, options: NearCacheOptions) -> Result<NearCachedCache> {
         NearCachedCache::register(self.clone(), options).await
+    }
+
+    /// Opens a stream to read `key`'s value in chunks of up to
+    /// `batch_size` bytes, instead of buffering it whole like `get`.
+    /// `None` on a miss, the same as `get`. Routed to `key`'s computed
+    /// owner like any other keyed operation, but not retried or failed
+    /// over if that connection fails afterward: see
+    /// `docs/adr/0008-streaming.md`.
+    pub async fn get_stream(&self, key: &[u8], batch_size: u32) -> Result<Option<GetStream>> {
+        let (addr, origin) = self.client.owner_addr(key).await?;
+        let mut guard = self.client.checkout(addr, &self.cache_name, origin).await?;
+        match guard.get_stream_start(key, batch_size).await? {
+            Some(start) => {
+                self.client.record_topology_update(&mut guard);
+                Ok(Some(GetStream::new(guard, start)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Opens a stream to write `key`'s value in chunks of up to
+    /// `chunk_size` bytes, instead of buffering it whole like `put`.
+    /// Nothing is written server-side until `PutStream::finish` sends
+    /// the final chunk; see `docs/adr/0008-streaming.md`.
+    pub async fn put_stream(
+        &self,
+        key: &[u8],
+        lifespan: Expiration,
+        max_idle: Expiration,
+        chunk_size: usize,
+    ) -> Result<PutStream> {
+        self.open_put_stream(key, lifespan, max_idle, 0, chunk_size)
+            .await
+    }
+
+    /// Same as `put_stream`, but the write only commits if `key` does
+    /// not already exist, the same condition `put_if_absent` checks.
+    pub async fn put_stream_if_absent(
+        &self,
+        key: &[u8],
+        lifespan: Expiration,
+        max_idle: Expiration,
+        chunk_size: usize,
+    ) -> Result<PutStream> {
+        self.open_put_stream(key, lifespan, max_idle, -1, chunk_size)
+            .await
+    }
+
+    /// Same as `put_stream`, but the write only commits if the entry's
+    /// current version still matches `version` (from `get_with_version`),
+    /// the same condition `replace_if_unmodified` checks.
+    pub async fn replace_stream_with_version(
+        &self,
+        key: &[u8],
+        version: u64,
+        lifespan: Expiration,
+        max_idle: Expiration,
+        chunk_size: usize,
+    ) -> Result<PutStream> {
+        self.open_put_stream(key, lifespan, max_idle, version as i64, chunk_size)
+            .await
+    }
+
+    /// Shared by `put_stream`/`put_stream_if_absent`/
+    /// `replace_stream_with_version`: opens the connection and the
+    /// stream, differing only in which `version` sentinel
+    /// `put_stream_start` gets (`0` unconditional, `-1` if-absent, a
+    /// real version for a conditional replace).
+    async fn open_put_stream(
+        &self,
+        key: &[u8],
+        lifespan: Expiration,
+        max_idle: Expiration,
+        version: i64,
+        chunk_size: usize,
+    ) -> Result<PutStream> {
+        let (addr, origin) = self.client.owner_addr(key).await?;
+        let mut guard = self.client.checkout(addr, &self.cache_name, origin).await?;
+        let stream_id = guard
+            .put_stream_start(key, lifespan, max_idle, version)
+            .await?;
+        self.client.record_topology_update(&mut guard);
+        Ok(PutStream::new(guard, stream_id, chunk_size))
     }
 
     /// Routes `key` to its computed owner, checking out a connection for

@@ -4,6 +4,26 @@ All notable changes to `hotrod-protocol` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Streaming: `RemoteCache::get_stream`/`put_stream`/
+  `put_stream_if_absent`/`replace_stream_with_version` read or write a
+  value in chunks instead of buffering it whole, per
+  `docs/adr/0008-streaming.md` (#52). `GetStream::next_chunk` pulls
+  chunks one at a time (`None` once exhausted) and also carries the
+  same metadata `get_with_version` does (`version`, `created`,
+  `lifespan`, `last_used`, `max_idle`); `PutStream::write_chunk`
+  buffers and flushes at a caller-chosen chunk size, and nothing
+  commits server-side until `finish` sends the last one. Each stream
+  stays pinned to the one pooled connection that opened it for its
+  whole lifetime (the server scopes it that way), with no automatic
+  reconnection or failover if that connection fails midway. Dropping
+  either type without an explicit `close`/`finish`/`abandon` poisons
+  the connection first, so the pool never hands it to an unrelated
+  caller while the server still thinks a stream is open on it.
+
 ## [0.5.0] - 2026-10-03
 
 ### Added

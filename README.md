@@ -28,7 +28,7 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Counters | Yes | No ([#49](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/49)) |
 | Remote query (Protobuf / Ickle) | Yes | No ([#50](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/50)) |
 | Remote task execution | Yes | No ([#51](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/51)) |
-| Streaming for large values | Yes | No ([#52](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/52)) |
+| Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | No ([#53](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/53)) |
 | Stats and telemetry (metrics, tracing) | Yes | No ([#54](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/54)) |
 | Remote administration | Yes | No ([#55](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/55)) |

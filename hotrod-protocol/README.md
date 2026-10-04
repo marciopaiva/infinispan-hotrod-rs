@@ -30,7 +30,7 @@ for release notes.
 | Counters | Yes | No |
 | Remote query (Protobuf / Ickle) | Yes | No |
 | Remote task execution | Yes | No |
-| Streaming for large values | Yes | No |
+| Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | No |
 | Stats and telemetry (metrics, tracing) | Yes | No |
 | Remote administration | Yes | No |
@@ -99,6 +99,22 @@ near.put(b"key", b"value", Expiration::Default, Expiration::Default)
     .await?;
 let value = near.get(b"key").await?; // served from the network once, cached after
 let count = near.size().await?; // reached through to the underlying RemoteCache
+```
+
+`get_stream`/`put_stream` read or write a value in chunks instead of
+buffering it whole:
+
+```rust
+let mut put = cache
+    .put_stream(b"key", Expiration::Default, Expiration::Default, 8192)
+    .await?;
+put.write_chunk(&data).await?; // call as many times as needed
+put.finish().await?; // nothing is written until this commits it
+
+let mut get = cache.get_stream(b"key", 8192).await?.expect("entry exists");
+while let Some(chunk) = get.next_chunk().await? {
+    process(chunk);
+}
 ```
 
 ## License
