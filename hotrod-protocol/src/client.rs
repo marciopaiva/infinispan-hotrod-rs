@@ -529,20 +529,7 @@ impl HotRodClient {
         // Safe: `topology::read_topology_update` rejects any owner index
         // that is out of range for `servers` before this type is built.
         let server = topology.servers[primary as usize].clone();
-        if let Some(&addr) = topology
-            .resolved_addrs
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&primary)
-        {
-            return Ok((addr, Some(server)));
-        }
-        let addr = resolve_server_addr(&server).await?;
-        topology
-            .resolved_addrs
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(primary, addr);
+        let addr = resolve_cached_addr(&topology, primary).await?;
         Ok((addr, Some(server)))
     }
 
@@ -602,29 +589,7 @@ impl HotRodClient {
             // index that is out of range for `servers` before this type is
             // built.
             let server = topology.servers[primary as usize].clone();
-            // Split from the `.await` below rather than written as a
-            // single `if let ... else { ... await ... }` expression: a
-            // read guard from the condition of an `if`/`match` used as a
-            // `let` initializer is held for the whole statement, not
-            // just its own branch, so that shape would hold this lock
-            // across `resolve_server_addr`'s `.await` even though the
-            // `Some` branch never reaches it (the same hazard
-            // `owner_addr` avoids by returning early instead).
-            if let Some(&addr) = topology
-                .resolved_addrs
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&primary)
-            {
-                targets.push((addr, Some(server), segments));
-                continue;
-            }
-            let addr = resolve_server_addr(&server).await?;
-            topology
-                .resolved_addrs
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(primary, addr);
+            let addr = resolve_cached_addr(&topology, primary).await?;
             targets.push((addr, Some(server), segments));
         }
         Ok(targets)
@@ -878,6 +843,40 @@ async fn resolve_server_addr(server: &TopologyServer) -> Result<SocketAddr> {
                 format!("no address found for {}:{}", server.host, server.port),
             ))
         })
+}
+
+/// `primary`'s address, from `topology`'s `resolved_addrs` cache if
+/// already resolved, or resolved and cached otherwise. Shared by
+/// `owner_addr` (one segment's owner) and `nodes_and_owned_segments`
+/// (every owner at once), so the two cannot silently diverge on this
+/// caching rule the way they once risked doing as separate copies.
+///
+/// Returns early from the cache-hit branch rather than writing this as
+/// a single `if let ... else { ... await ... }` expression: a read
+/// guard from the condition of an `if`/`match` used as a `let`
+/// initializer is held for the whole statement, not just its own
+/// branch, so that shape would hold this lock across
+/// `resolve_server_addr`'s `.await` even on the branch that never
+/// reaches it.
+async fn resolve_cached_addr(topology: &ClusterTopology, primary: u32) -> Result<SocketAddr> {
+    if let Some(&addr) = topology
+        .resolved_addrs
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&primary)
+    {
+        return Ok(addr);
+    }
+    // Safe: every caller only passes a `primary` it already validated
+    // as a real index into `topology.servers`.
+    let server = &topology.servers[primary as usize];
+    let addr = resolve_server_addr(server).await?;
+    topology
+        .resolved_addrs
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(primary, addr);
+    Ok(addr)
 }
 
 #[cfg(test)]
