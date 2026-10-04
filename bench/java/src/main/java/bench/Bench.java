@@ -12,6 +12,7 @@ import org.infinispan.client.hotrod.MetadataValue;
 import org.infinispan.client.hotrod.RemoteCache;
 import org.infinispan.client.hotrod.RemoteCacheManager;
 import org.infinispan.client.hotrod.configuration.ConfigurationBuilder;
+import org.infinispan.commons.util.CloseableIterator;
 
 public final class Bench {
 
@@ -172,6 +173,28 @@ public final class Bench {
             cache.clear();
         }
         report("clear", clearIters, System.nanoTime() - start);
+
+        // retrieveEntries's default batch size matches hotrod-protocol's
+        // own default (ConfigurationProperties.DEFAULT_BATCH_SIZE,
+        // 10_000), so neither side gets a batch-size advantage.
+        List<String> iterKeys = keys("iter", iters);
+        Map<String, byte[]> iterEntries = new HashMap<>();
+        for (String key : iterKeys) {
+            iterEntries.put(key, value);
+        }
+        cache.putAll(iterEntries);
+
+        int iterated = 0;
+        start = System.nanoTime();
+        try (CloseableIterator<Map.Entry<Object, Object>> it = cache.retrieveEntries(null, 10_000)) {
+            while (it.hasNext()) {
+                it.next();
+                iterated++;
+            }
+        }
+        report("iter", iterated, System.nanoTime() - start);
+
+        cache.clear();
 
         // RemoteCacheManager.close() races with its own idle/reconnect
         // handling on shutdown and logs a harmless but noisy stack trace.

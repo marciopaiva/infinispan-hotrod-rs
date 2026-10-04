@@ -61,8 +61,19 @@ against its own set of keys so one operation's side effects never change
 what the next one measures: `put`, `get`, `contains_key`, `replace`,
 `get_with_version`, `replace_if_unmodified`, `remove_if_unmodified`,
 `remove`, `put_if_absent`, `put_all`, `get_all`, `size`, `stats`, `ping`,
-`clear`. `clear` runs last, since it wipes the whole cache, not just the
-bench's own keys.
+`clear`. `clear` runs last among those, since it wipes the whole cache,
+not just the bench's own keys.
+
+`iter` (`RemoteCache::iter`/`iter_with`, #53) runs after that, against
+`retrieveEntries(null, batchSize)` on the Java side, both with the same
+default batch size (`10_000`, `hotrod-protocol`'s own default): the
+closest direct equivalent either client has to a full-cache scan. Unlike
+every operation above, this one is only exposed on `RemoteCache`, not on
+`HotRodConnection`, so the Rust side opens a second, dedicated connection
+through `HotRodClient` just for this section. The Java side already used
+the equivalent `RemoteCacheManager`/`RemoteCache` wrapper for every
+operation above, so this is not a new asymmetry there, only on the Rust
+side.
 
 Two operations are excluded, because neither side has a matching public
 call to compare:
@@ -107,23 +118,24 @@ measurement.
 
 | Operation | Rust ops/ms | Rust us/op | Java ops/ms | Java us/op |
 | --- | --- | --- | --- | --- |
-| `put` | 11.72 | 85.30 | 8.03 | 124.60 |
-| `get` | 12.15 | 82.31 | 8.49 | 117.80 |
-| `contains_key` | 12.46 | 80.23 | 8.65 | 115.63 |
-| `replace` | 11.96 | 83.62 | 8.34 | 119.84 |
-| `get_with_version` | 12.24 | 81.67 | 8.50 | 117.64 |
-| `replace_if_unmodified` | 11.57 | 86.45 | 8.16 | 122.54 |
-| `remove_if_unmodified` | 11.88 | 84.18 | 8.42 | 118.83 |
-| `remove` | 11.79 | 84.82 | 8.38 | 119.39 |
-| `put_if_absent` | 11.83 | 84.51 | 8.47 | 118.08 |
-| `put_all` | 802.00 | 1.25 | 669.34 | 1.49 |
-| `get_all` | 812.85 | 1.23 | 685.90 | 1.46 |
-| `size` | 2.29 | 435.89 | 2.00 | 500.98 |
-| `stats` | 7.55 | 132.40 | 6.23 | 160.51 |
-| `ping` | 12.32 | 81.16 | n/a | n/a |
-| `clear` | 3.52 | 284.07 | 5.50 | 181.77 |
+| `put` | 11.32 | 88.31 | 7.80 | 128.27 |
+| `get` | 11.75 | 85.10 | 8.24 | 121.34 |
+| `contains_key` | 11.93 | 83.82 | 8.31 | 120.40 |
+| `replace` | 11.61 | 86.14 | 7.97 | 125.40 |
+| `get_with_version` | 12.22 | 81.82 | 8.14 | 122.82 |
+| `replace_if_unmodified` | 11.16 | 89.60 | 7.85 | 127.33 |
+| `remove_if_unmodified` | 11.47 | 87.17 | 7.67 | 130.33 |
+| `remove` | 11.42 | 87.55 | 8.15 | 122.73 |
+| `put_if_absent` | 11.36 | 88.01 | 8.19 | 122.11 |
+| `put_all` | 917.16 | 1.09 | 677.90 | 1.48 |
+| `get_all` | 959.79 | 1.04 | 659.32 | 1.52 |
+| `size` | 2.19 | 456.07 | 1.63 | 612.99 |
+| `stats` | 7.26 | 137.82 | 5.65 | 177.04 |
+| `ping` | 12.08 | 82.79 | n/a | n/a |
+| `clear` | 3.69 | 271.33 | 4.63 | 215.92 |
+| `iter` | 529.57 | 1.89 | 241.88 | 4.13 |
 
 `ping` has no Java number, per the exclusion noted above. `clear` is the
 one operation where the Java client comes out ahead in this run; every
-other operation favors `hotrod-protocol`, roughly by a third to a half
-less time per call.
+other operation, including the newly added `iter`, favors
+`hotrod-protocol`.

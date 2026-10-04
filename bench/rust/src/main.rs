@@ -1,7 +1,8 @@
 use std::env;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hotrod_protocol::{Expiration, HotRodConnection};
+use hotrod_protocol::{Expiration, HotRodClient, HotRodConnection};
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
@@ -181,6 +182,38 @@ async fn main() -> hotrod_protocol::Result<()> {
         conn.clear().await?;
     }
     report("clear", clear_iters, start.elapsed());
+
+    // `iter`/`iter_with` (#53) are only exposed on `RemoteCache`, unlike
+    // every operation above, which runs straight on the single
+    // `HotRodConnection`: server-side iteration's public entry point
+    // needs the client wrapper that `nodes_and_owned_segments` lives
+    // on, even against this single-node server. A second, dedicated
+    // connection for just this section, same as the Java side already
+    // does for everything via `RemoteCacheManager`.
+    let seed: SocketAddr = addr.parse().expect("BENCH_ADDR must be host:port");
+    let client = HotRodClient::connect(&[seed]).await?;
+    client.authenticate_plain("", &user, &pass).await?;
+    let remote_cache = client.cache(&cache);
+
+    let iter_keys = keys("iter", iters);
+    let iter_entries: Vec<(Vec<u8>, Vec<u8>)> = iter_keys
+        .iter()
+        .cloned()
+        .map(|key| (key, value.clone()))
+        .collect();
+    remote_cache
+        .put_all(iter_entries, Expiration::Default, Expiration::Default)
+        .await?;
+
+    let start = Instant::now();
+    let mut iterated = 0usize;
+    let mut cursor = remote_cache.iter().await?;
+    while cursor.next_entry().await?.is_some() {
+        iterated += 1;
+    }
+    report("iter", iterated, start.elapsed());
+
+    remote_cache.clear().await?;
 
     Ok(())
 }
