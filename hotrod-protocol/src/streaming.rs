@@ -35,9 +35,11 @@ use crate::wire::Expiration;
 pub struct GetStream {
     conn: PooledGuard,
     stream_id: i32,
+    // Doubles as "explicitly closed" once `close` sets it: either way
+    // means the server has already resolved this stream, so `Drop`'s
+    // only question is this one flag, not two kept in sync by hand.
     complete: bool,
     pending_first_chunk: Option<Vec<u8>>,
-    closed: bool,
     pub version: u64,
     pub created: Option<SystemTime>,
     pub lifespan: Expiration,
@@ -52,7 +54,6 @@ impl GetStream {
             stream_id: start.stream_id,
             complete: start.complete,
             pending_first_chunk: Some(start.chunk),
-            closed: false,
             version: start.version,
             created: start.created,
             lifespan: start.lifespan,
@@ -83,23 +84,23 @@ impl GetStream {
     /// knows this too, see its own docs below).
     pub async fn close(mut self) -> Result<()> {
         let result = self.conn.get_stream_end(self.stream_id).await;
-        self.closed = true;
+        self.complete = true;
         result
     }
 }
 
 impl Drop for GetStream {
     /// Poisons the connection unless the stream was already exhausted
-    /// or explicitly closed: either of those means the server has
-    /// already cleaned up its side, so the connection is perfectly
-    /// reusable. Anything else, including a cancelled `next_chunk`
-    /// (`closed` stays `false` if the future is dropped before it
-    /// finishes, the same cancellation-safety shape
-    /// `NearCachedCache::invalidate_after` uses), poisons it instead of
-    /// risking a future caller reusing a connection the server still
-    /// thinks has an open stream on it.
+    /// or explicitly closed (both set `complete`): either one means
+    /// the server has already cleaned up its side, so the connection
+    /// is perfectly reusable. Anything else, including a cancelled
+    /// `next_chunk`/`close` (`complete` stays `false` if that future
+    /// is dropped before it finishes, the same cancellation-safety
+    /// shape `NearCachedCache::invalidate_after` uses), poisons it
+    /// instead of risking a future caller reusing a connection the
+    /// server still thinks has an open stream on it.
     fn drop(&mut self) {
-        if !self.closed && !self.complete {
+        if !self.complete {
             self.conn.mark_poisoned();
         }
     }
@@ -133,14 +134,24 @@ impl PutStream {
     /// does, by marking the final chunk complete (the protocol carries
     /// no total size up front for the server to commit against
     /// otherwise).
+    ///
+    /// Sent chunks are dropped from the front of the buffer once, after
+    /// the loop below, rather than one `Vec::drain` per chunk: draining
+    /// from the front shifts whatever remains buffered down by that
+    /// much every time, so doing it once per chunk instead of once per
+    /// call would turn one large `write_chunk` into quadratic work
+    /// instead of linear.
     pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(bytes);
-        while self.buffer.len() >= self.chunk_size {
-            let chunk: Vec<u8> = self.buffer.drain(..self.chunk_size).collect();
+        let mut sent = 0;
+        while self.buffer.len() - sent >= self.chunk_size {
+            let end = sent + self.chunk_size;
             self.conn
-                .put_stream_next(self.stream_id, &chunk, false)
+                .put_stream_next(self.stream_id, &self.buffer[sent..end], false)
                 .await?;
+            sent = end;
         }
+        self.buffer.drain(..sent);
         Ok(())
     }
 

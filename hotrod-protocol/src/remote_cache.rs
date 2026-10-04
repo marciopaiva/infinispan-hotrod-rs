@@ -369,13 +369,13 @@ impl RemoteCache {
     pub async fn get_stream(&self, key: &[u8], batch_size: u32) -> Result<Option<GetStream>> {
         let (addr, origin) = self.client.owner_addr(key).await?;
         let mut guard = self.client.checkout(addr, &self.cache_name, origin).await?;
-        match guard.get_stream_start(key, batch_size).await? {
-            Some(start) => {
-                self.client.record_topology_update(&mut guard);
-                Ok(Some(GetStream::new(guard, start)))
-            }
-            None => Ok(None),
-        }
+        let start = guard.get_stream_start(key, batch_size).await?;
+        // Applied regardless of a hit or a miss: the response can carry
+        // a topology update either way, and skipping it on a miss would
+        // leave this client routing by a stale topology until some
+        // unrelated later call happens to reuse this exact connection.
+        self.client.record_topology_update(&mut guard);
+        Ok(start.map(|start| GetStream::new(guard, start)))
     }
 
     /// Opens a stream to write `key`'s value in chunks of up to
@@ -409,6 +409,15 @@ impl RemoteCache {
     /// Same as `put_stream`, but the write only commits if the entry's
     /// current version still matches `version` (from `get_with_version`),
     /// the same condition `replace_if_unmodified` checks.
+    ///
+    /// `version` is sent as the wire's `i64` field, where `0` and `-1`
+    /// are the `put_stream`/`put_stream_if_absent` sentinels (see
+    /// `docs/adr/0008-streaming.md`): a real version whose bit pattern
+    /// happens to equal one of those (as `u64::MAX`, or `0` itself)
+    /// would be sent as that sentinel instead of a real conditional
+    /// version. Inherent to the wire protocol's own encoding, the same
+    /// way the Java client's `long` field has the identical limitation;
+    /// not something this method can detect or guard against.
     pub async fn replace_stream_with_version(
         &self,
         key: &[u8],
