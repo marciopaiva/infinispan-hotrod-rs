@@ -40,13 +40,35 @@ pub(crate) enum OpCode {
     Size = 0x29,
     PutAll = 0x2D,
     GetAll = 0x2F,
+    // Streaming (protocol 4.1, Infinispan 15.1+): not the discontinued
+    // GET_STREAM/PUT_STREAM pair from Hot Rod 2.6 (0x37/0x39), which this
+    // crate never implements. These six, confirmed against
+    // HotRodConstants.java on both the client and server side, are the
+    // only ones the current Java client actually sends.
+    GetStreamStart = 0xE9,
+    GetStreamNext = 0xE7,
+    GetStreamEnd = 0xE5,
+    PutStreamStart = 0xEF,
+    PutStreamNext = 0xED,
+    PutStreamEnd = 0xEB,
 }
 
 impl OpCode {
     /// Every response opcode observed in the Java client is the request
-    /// opcode plus one.
+    /// opcode plus one, except the six streaming opcodes above, where
+    /// it is minus one (`0xE9` -> `0xE8`, not `0xEA`): confirmed against
+    /// `HotRodConstants.java`, not assumed from the otherwise universal
+    /// pattern.
     fn expected_response_opcode(self) -> u8 {
-        self as u8 + 1
+        match self {
+            OpCode::GetStreamStart
+            | OpCode::GetStreamNext
+            | OpCode::GetStreamEnd
+            | OpCode::PutStreamStart
+            | OpCode::PutStreamNext
+            | OpCode::PutStreamEnd => self as u8 - 1,
+            _ => self as u8 + 1,
+        }
     }
 }
 
