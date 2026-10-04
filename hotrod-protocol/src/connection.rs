@@ -36,7 +36,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
 use crate::header::OpCode;
-use crate::listener::{ServerFactory, MAX_FACTORY_PARAMS};
+use crate::listener::{write_factory_params, ServerFactory, MAX_FACTORY_PARAMS};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::tls::{self, TlsConfig, Transport};
@@ -1108,6 +1108,19 @@ impl HotRodConnection {
         filter: Option<&ServerFactory>,
         batch_size: u32,
     ) -> Result<Vec<u8>> {
+        // Checked before `begin_operation` poisons the connection, the
+        // same way `get_all`/`put_all` check `MAX_BULK_ENTRIES` before
+        // writing anything: a caller-side mistake like this one must
+        // not cost an otherwise healthy, never-touched connection.
+        if let Some(factory) = filter {
+            if factory.params.len() > MAX_FACTORY_PARAMS {
+                return Err(Error::BatchTooLarge {
+                    what: "a server-side iteration filter/converter factory's parameters",
+                    len: factory.params.len(),
+                    max: MAX_FACTORY_PARAMS,
+                });
+            }
+        }
         self.begin_operation()?;
         let timeout = self.timeout;
         let result = with_timeout(timeout, async {
@@ -1123,20 +1136,10 @@ impl HotRodConnection {
             match filter {
                 None => write_signed_vint(&mut body, -1),
                 Some(factory) => {
-                    if factory.params.len() > MAX_FACTORY_PARAMS {
-                        return Err(Error::BatchTooLarge {
-                            what: "a server-side iteration filter/converter factory's parameters",
-                            len: factory.params.len(),
-                            max: MAX_FACTORY_PARAMS,
-                        });
-                    }
                     let name_bytes = factory.name.as_bytes();
                     write_signed_vint(&mut body, name_bytes.len() as i32);
                     body.extend_from_slice(name_bytes);
-                    body.push(factory.params.len() as u8);
-                    for param in &factory.params {
-                        write_array(&mut body, param);
-                    }
+                    write_factory_params(&mut body, &factory.params);
                 }
             }
             write_vint(&mut body, batch_size);

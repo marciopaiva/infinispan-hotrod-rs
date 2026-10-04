@@ -185,6 +185,23 @@ pub struct CacheListener {
     poisoned: bool,
 }
 
+/// Writes a factory's parameter count (a single wire byte, the
+/// protocol's own ceiling: see `MAX_FACTORY_PARAMS`) and each parameter
+/// as an ordinary array. Shared by `write_factory` below and
+/// `connection.rs`'s `iteration_start`, which encode a factory's *name*
+/// differently (an empty-string sentinel here,
+/// `writeOptionalString`'s signed-vInt sentinel there) but its
+/// parameters identically. The caller must have already checked
+/// `params.len() <= MAX_FACTORY_PARAMS`: this never checks it again, so
+/// each caller can word its own `Error::BatchTooLarge` around the
+/// specific `ServerFactory` use that failed.
+pub(crate) fn write_factory_params(body: &mut Vec<u8>, params: &[Vec<u8>]) {
+    body.push(params.len() as u8);
+    for param in params {
+        write_array(body, param);
+    }
+}
+
 fn write_factory(body: &mut Vec<u8>, factory: Option<&ServerFactory>) -> Result<()> {
     match factory {
         None => write_array(body, b""),
@@ -197,13 +214,7 @@ fn write_factory(body: &mut Vec<u8>, factory: Option<&ServerFactory>) -> Result<
                 });
             }
             write_array(body, factory.name.as_bytes());
-            // A named factory's parameter count is a single byte on the
-            // wire (Codec30.writeNamedFactory), not a vInt like every
-            // other length-prefixed count elsewhere in this protocol.
-            body.push(factory.params.len() as u8);
-            for param in &factory.params {
-                write_array(body, param);
-            }
+            write_factory_params(body, &factory.params);
         }
     }
     Ok(())

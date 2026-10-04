@@ -186,15 +186,29 @@ impl CacheIterator {
 
     /// Returns the next entry, opening the next node's cursor as each
     /// one runs dry, or `None` once every node has been fully read.
+    ///
+    /// On error, `current` is cleared first: the connection behind it is
+    /// already poisoned (by whichever `iteration_next`/`iteration_end`
+    /// call failed), so leaving it in place would just make a following
+    /// call re-enter the same dead node and fail again with
+    /// `Error::PoisonedConnection` instead of the error that actually
+    /// happened. A target is only popped from `remaining_targets` once
+    /// `open_node_iterator` for it has actually succeeded, so a caller
+    /// that calls this again after an error opening a node retries that
+    /// same node rather than silently skipping it.
     pub async fn next_entry(&mut self) -> Result<Option<IterationEntry>> {
         loop {
             if let Some(node) = self.current.as_mut() {
-                if let Some(entry) = node.next_entry().await? {
-                    return Ok(Some(entry));
+                match node.next_entry().await {
+                    Ok(Some(entry)) => return Ok(Some(entry)),
+                    Ok(None) => self.current = None,
+                    Err(err) => {
+                        self.current = None;
+                        return Err(err);
+                    }
                 }
-                self.current = None;
             }
-            let Some((addr, origin, segments)) = self.remaining_targets.pop_front() else {
+            let Some((addr, origin, segments)) = self.remaining_targets.front().cloned() else {
                 return Ok(None);
             };
             self.current = Some(
@@ -202,6 +216,7 @@ impl CacheIterator {
                     .open_node_iterator(addr, origin, segments, &self.options)
                     .await?,
             );
+            self.remaining_targets.pop_front();
         }
     }
 }
@@ -216,6 +231,7 @@ mod tests {
     use super::*;
     use crate::client::tests::{read_request_opcode, response_header, unreachable_addr};
     use crate::client::{ClusterTopology, HotRodClient};
+    use crate::error::Error;
     use crate::remote_cache::tests::client_with_seeds_and_timeout;
     use crate::varint::{read_vint, write_vint};
     use crate::wire::{read_array, write_array};
@@ -474,5 +490,141 @@ mod tests {
 
         task_a.await.unwrap();
         task_b.await.unwrap();
+    }
+
+    /// Regression test for a review finding: before the fix, an error
+    /// from the active node left `current` set to that same (now
+    /// poisoned) node, so a following call re-entered it and failed
+    /// again with `Error::PoisonedConnection` instead of correctly
+    /// reporting the iteration over (there was only ever this one
+    /// target, and `open_node_iterator` for it already succeeded, so
+    /// there is nothing left to retry once it errors mid-scan).
+    #[tokio::test]
+    async fn cache_iterator_clears_the_failed_node_instead_of_wedging_on_error() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = tcp.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(opcode, 0x31, "expected an IterationStart request");
+            let _segments_sentinel = sock.read_u8().await.unwrap();
+            let _filter_sentinel = sock.read_u8().await.unwrap();
+            let _batch_size = read_vint(&mut sock).await.unwrap();
+            let _metadata = sock.read_u8().await.unwrap();
+            let mut resp = response_header(id, 0x32, 0x00);
+            write_array(&mut resp, b"iter-1");
+            sock.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(opcode, 0x33, "expected an IterationNext request");
+            let _iteration_id = read_array(&mut sock).await.unwrap();
+            let mut resp = response_header(id, 0x34, 0x00);
+            write_array(&mut resp, &[]); // finished segments
+            write_vint(&mut resp, 1); // entries count
+            write_vint(&mut resp, 2); // value projections: invalid, must be 1
+            sock.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seed(addr);
+        let cache = client.cache("my-cache");
+        let mut iter = cache.iter().await.expect("iter");
+
+        let err = iter
+            .next_entry()
+            .await
+            .expect_err("a malformed response must surface as an error");
+        assert!(matches!(err, Error::MalformedIterationResponse(_)));
+
+        let result = iter
+            .next_entry()
+            .await
+            .expect("the single target is already spent, not retried");
+        assert!(result.is_none());
+
+        server.await.unwrap();
+    }
+
+    /// Regression test for a review finding: before the fix, the next
+    /// target was popped from `remaining_targets` before
+    /// `open_node_iterator` ran, so a failure opening it (here, node
+    /// b's address never accepts a connection) lost that target for
+    /// good; a following call would have wrongly reported the whole
+    /// iteration done instead of retrying the same node. Built by
+    /// constructing `CacheIterator` directly instead of through
+    /// `RemoteCache::iter`, so which node is "first" and "second" does
+    /// not depend on `nodes_and_owned_segments`'s `HashMap` iteration
+    /// order.
+    #[tokio::test]
+    async fn cache_iterator_retries_the_same_node_after_a_failed_open() {
+        let node_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_a_addr = node_a.local_addr().unwrap();
+        let node_b_addr = unreachable_addr().await;
+
+        let task_a = tokio::spawn(async move {
+            let (mut sock, _) = node_a.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(opcode, 0x31, "expected an IterationStart request");
+            let _segments_sentinel = sock.read_u8().await.unwrap();
+            let _filter_sentinel = sock.read_u8().await.unwrap();
+            let _batch_size = read_vint(&mut sock).await.unwrap();
+            let _metadata = sock.read_u8().await.unwrap();
+            let mut resp = response_header(id, 0x32, 0x00);
+            write_array(&mut resp, b"iter-a");
+            sock.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(opcode, 0x33, "expected an IterationNext request");
+            let _iteration_id = read_array(&mut sock).await.unwrap();
+            let mut resp = response_header(id, 0x34, 0x00);
+            write_array(&mut resp, &[]); // finished segments
+            write_vint(&mut resp, 0); // entries count: exhausted immediately
+            sock.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut sock).await;
+            assert_eq!(opcode, 0x35, "expected an IterationEnd request");
+            let _iteration_id = read_array(&mut sock).await.unwrap();
+            let resp = response_header(id, 0x36, 0x00);
+            sock.write_all(&resp).await.unwrap();
+        });
+
+        let seed_addr = unreachable_addr().await;
+        let client =
+            client_with_seeds_and_timeout(vec![seed_addr], seed_addr, Duration::from_millis(300));
+        let cache = client.cache("my-cache");
+
+        let mut guard = client
+            .checkout(node_a_addr, "my-cache", None)
+            .await
+            .expect("checkout node a");
+        let iteration_id = guard
+            .iteration_start(None, None, 10_000)
+            .await
+            .expect("iteration_start on node a");
+        let node_a_iter = NodeIterator::new(guard, iteration_id);
+
+        let mut iter = CacheIterator::new(
+            cache,
+            Some(node_a_iter),
+            VecDeque::from(vec![(node_b_addr, None, Vec::new())]),
+            IterationOptions::default(),
+        );
+
+        // Node a is already exhausted and ended; the loop inside
+        // `next_entry` moves straight on to node b, which never
+        // accepts a connection.
+        let first_attempt = iter.next_entry().await;
+        assert!(matches!(first_attempt, Err(Error::Io(_))));
+
+        // If the target had been popped before the failed open (the
+        // bug this test guards against), this second call would see
+        // an empty `remaining_targets` and wrongly return `Ok(None)`
+        // instead of failing the same way again.
+        let second_attempt = iter.next_entry().await;
+        assert!(matches!(second_attempt, Err(Error::Io(_))));
+
+        task_a.await.unwrap();
     }
 }
