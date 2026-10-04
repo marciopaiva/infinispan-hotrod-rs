@@ -8,6 +8,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Server-side iteration: `RemoteCache::iter`/`iter_with` walk every
+  entry in a cache through a server-side cursor instead of requiring
+  the caller to already know every key, per
+  `docs/adr/0009-server-side-iteration.md` (#53). On a cluster,
+  `CacheIterator` opens one cursor per node that primary-owns at least
+  one segment, in turn, so no segment is skipped; `IterationOptions`
+  sets the batch size and an optional server-side filter/converter
+  factory (`ServerFactory`, already used by client listeners, #4). No
+  retry or failover if a node's cursor fails partway through, the same
+  stance streaming (#52) already takes.
 - Streaming: `RemoteCache::get_stream`/`put_stream`/
   `put_stream_if_absent`/`replace_stream_with_version` read or write a
   value in chunks instead of buffering it whole, per

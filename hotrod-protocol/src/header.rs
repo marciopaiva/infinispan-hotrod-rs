@@ -51,6 +51,13 @@ pub(crate) enum OpCode {
     PutStreamStart = 0xEF,
     PutStreamNext = 0xED,
     PutStreamEnd = 0xEB,
+    // Server-side iteration (Hot Rod 2.3, Infinispan 8.0): a completely
+    // separate protocol from streaming above, confirmed against
+    // HotRodConstants.java. These follow the normal "request + 1"
+    // response convention, unlike the streaming opcodes.
+    IterationStart = 0x31,
+    IterationNext = 0x33,
+    IterationEnd = 0x35,
 }
 
 impl OpCode {

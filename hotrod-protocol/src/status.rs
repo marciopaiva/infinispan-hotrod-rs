@@ -13,6 +13,12 @@ impl Status {
     const KEY_DOES_NOT_EXIST: u8 = 0x02;
     const SUCCESS_WITH_PREVIOUS: u8 = 0x03;
     const NOT_EXECUTED_WITH_PREVIOUS: u8 = 0x04;
+    /// `IterationNext`'s `iterationId` is no longer known to the server
+    /// (reaped after five minutes idle, or the server restarted), or
+    /// `IterationEnd` was sent for one already gone. Carries no message
+    /// body in either case, unlike every status in `is_error()`: confirmed
+    /// against `DefaultIterationManager`/`Encoder2x` on the server side.
+    const INVALID_ITERATION: u8 = 0x05;
 
     const INVALID_MAGIC_OR_MESSAGE_ID: u8 = 0x81;
     const UNKNOWN_COMMAND: u8 = 0x82;
@@ -38,6 +44,10 @@ impl Status {
         self.0 == Self::KEY_DOES_NOT_EXIST
     }
 
+    pub(crate) fn is_invalid_iteration(self) -> bool {
+        self.0 == Self::INVALID_ITERATION
+    }
+
     /// Every error status the server can send carries just one thing in the
     /// response body: a UTF-8 message (see Codec30.checkForErrorsInResponseStatus).
     pub(crate) fn is_error(self) -> bool {
@@ -55,7 +65,11 @@ impl Status {
     }
 
     pub(crate) fn is_known(self) -> bool {
-        self.is_success() || self.is_not_executed() || self.is_not_exist() || self.is_error()
+        self.is_success()
+            || self.is_not_executed()
+            || self.is_not_exist()
+            || self.is_invalid_iteration()
+            || self.is_error()
     }
 }
 
@@ -80,5 +94,13 @@ mod tests {
     #[test]
     fn unrecognized_byte_is_unknown() {
         assert!(!Status(0x99).is_known());
+    }
+
+    #[test]
+    fn invalid_iteration_is_known_but_not_an_error() {
+        let s = Status(0x05);
+        assert!(s.is_known());
+        assert!(s.is_invalid_iteration());
+        assert!(!s.is_error());
     }
 }

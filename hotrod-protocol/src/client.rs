@@ -546,6 +546,90 @@ impl HotRodClient {
         Ok((addr, Some(server)))
     }
 
+    /// Every node that primary-owns at least one segment, each paired with
+    /// the segments it owns: the fan-out plan for `CacheIterator` (see
+    /// `iteration.rs`), which opens one server-side iterator per entry here,
+    /// one at a time. Resolves and caches each address the same way
+    /// `owner_addr` does for a single key.
+    ///
+    /// Without a topology yet (a single-node cache, or no update has
+    /// arrived), returns just the seed with an empty segment list: `None`
+    /// segments on `IterationStart` means no filter, so the seed's own
+    /// iterator already covers the whole cache.
+    pub(crate) async fn nodes_and_owned_segments(
+        &self,
+    ) -> Result<Vec<(SocketAddr, Option<TopologyServer>, Vec<u32>)>> {
+        let active_seed = *self
+            .0
+            .active_seed_addr
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let topology = self
+            .0
+            .topology
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(topology) = topology else {
+            return Ok(vec![(active_seed, None, Vec::new())]);
+        };
+        if topology.segment_owners.is_empty() {
+            return Ok(vec![(active_seed, None, Vec::new())]);
+        }
+
+        let mut segments_by_primary: HashMap<u32, Vec<u32>> = HashMap::new();
+        // A segment with no owner at all is not something
+        // `read_topology_update` rejects, so it is handled the same way
+        // `owner_addr` handles it for a single key: fall back to the
+        // seed rather than silently never iterating that segment.
+        let mut unowned_segments = Vec::new();
+        for (segment, owners) in topology.segment_owners.iter().enumerate() {
+            match owners.first() {
+                Some(&primary) => segments_by_primary
+                    .entry(primary)
+                    .or_default()
+                    .push(segment as u32),
+                None => unowned_segments.push(segment as u32),
+            }
+        }
+
+        let mut targets = Vec::with_capacity(segments_by_primary.len() + 1);
+        if !unowned_segments.is_empty() {
+            targets.push((active_seed, None, unowned_segments));
+        }
+        for (primary, segments) in segments_by_primary {
+            // Safe: `topology::read_topology_update` rejects any owner
+            // index that is out of range for `servers` before this type is
+            // built.
+            let server = topology.servers[primary as usize].clone();
+            // Split from the `.await` below rather than written as a
+            // single `if let ... else { ... await ... }` expression: a
+            // read guard from the condition of an `if`/`match` used as a
+            // `let` initializer is held for the whole statement, not
+            // just its own branch, so that shape would hold this lock
+            // across `resolve_server_addr`'s `.await` even though the
+            // `Some` branch never reaches it (the same hazard
+            // `owner_addr` avoids by returning early instead).
+            if let Some(&addr) = topology
+                .resolved_addrs
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&primary)
+            {
+                targets.push((addr, Some(server), segments));
+                continue;
+            }
+            let addr = resolve_server_addr(&server).await?;
+            topology
+                .resolved_addrs
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(primary, addr);
+            targets.push((addr, Some(server), segments));
+        }
+        Ok(targets)
+    }
+
     fn pool_for(&self, addr: SocketAddr, cache_name: &str) -> Arc<ConnectionPool> {
         let key = (addr, cache_name.to_string());
         if let Some(pool) = self
@@ -969,6 +1053,128 @@ pub(crate) mod tests {
 
         let result = client.owner_addr(b"key").await;
         assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn nodes_and_owned_segments_returns_just_the_seed_without_a_topology() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = HotRodClient::connect(&[addr])
+            .await
+            .expect("connect to seed");
+
+        let targets = client
+            .nodes_and_owned_segments()
+            .await
+            .expect("nodes_and_owned_segments");
+        assert_eq!(targets, vec![(addr, None, Vec::new())]);
+    }
+
+    /// Regression test for a review finding: a segment with no owner
+    /// listed at all (not something `read_topology_update` rejects) must
+    /// not be silently dropped from the fan-out plan, which would make
+    /// `cache.iter()` quietly skip whatever it holds. `owner_addr` falls
+    /// back to the seed for the identical condition on a single key;
+    /// `nodes_and_owned_segments` must do the same for a whole segment.
+    #[tokio::test]
+    async fn nodes_and_owned_segments_falls_back_to_the_seed_for_an_unowned_segment() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = HotRodClient::connect(&[addr])
+            .await
+            .expect("connect to seed");
+
+        *client.0.topology.write().unwrap() = Some(Arc::new(ClusterTopology {
+            topology_id: 9,
+            servers: vec![TopologyServer {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            }],
+            hash_function_version: 3,
+            segment_owners: vec![vec![0], vec![]],
+            resolved_addrs: RwLock::new(HashMap::new()),
+        }));
+
+        let targets = client
+            .nodes_and_owned_segments()
+            .await
+            .expect("nodes_and_owned_segments");
+
+        let seed_target = targets
+            .iter()
+            .find(|(target_addr, origin, _)| *target_addr == addr && origin.is_none());
+        assert!(
+            seed_target.is_some_and(|(_, _, segments)| segments.contains(&1)),
+            "segment 1 has no owner, so it must be covered by a seed fallback target: got {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nodes_and_owned_segments_groups_segments_by_primary_owner() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = HotRodClient::connect(&[addr])
+            .await
+            .expect("connect to seed");
+
+        let other_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = other_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let servers = vec![
+            TopologyServer {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            },
+            TopologyServer {
+                host: other_addr.ip().to_string(),
+                port: other_addr.port(),
+            },
+        ];
+        // Segments 0 and 2 primary-owned by server 0, segment 1 by
+        // server 1.
+        *client.0.topology.write().unwrap() = Some(Arc::new(ClusterTopology {
+            topology_id: 9,
+            servers,
+            hash_function_version: 3,
+            segment_owners: vec![vec![0], vec![1], vec![0]],
+            resolved_addrs: RwLock::new(HashMap::new()),
+        }));
+
+        let mut targets = client
+            .nodes_and_owned_segments()
+            .await
+            .expect("nodes_and_owned_segments");
+        targets.sort_by_key(|(addr, _, _)| *addr);
+
+        let mut expected = vec![(addr, vec![0, 2]), (other_addr, vec![1])];
+        expected.sort_by_key(|(addr, _)| *addr);
+
+        for ((got_addr, _origin, mut got_segments), (expected_addr, expected_segments)) in
+            targets.into_iter().zip(expected)
+        {
+            got_segments.sort_unstable();
+            assert_eq!(got_addr, expected_addr);
+            assert_eq!(got_segments, expected_segments);
+        }
     }
 
     #[tokio::test]

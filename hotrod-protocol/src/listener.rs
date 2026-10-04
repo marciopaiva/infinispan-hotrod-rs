@@ -44,13 +44,15 @@ const EVENT_REMOVED: u8 = 0x62;
 const EVENT_EXPIRED: u8 = 0x63;
 
 /// Safety ceiling on a filter/converter factory's parameter count: the
-/// wire encodes it as a single byte (`Codec30.writeNamedFactory`), so
-/// `255` is the most this protocol can express at all, not a limit this
-/// client chose. Checked before writing anything, the same reasoning
-/// `MAX_BULK_ENTRIES` already uses for `get_all`/`put_all`: silently
-/// truncating a larger count would desync the request instead of
-/// rejecting it up front.
-const MAX_FACTORY_PARAMS: usize = u8::MAX as usize;
+/// wire encodes it as a single byte (`Codec30.writeNamedFactory`,
+/// `Codec30.writeIteratorStartOperation`), so `255` is the most this
+/// protocol can express at all, not a limit this client chose. Checked
+/// before writing anything, the same reasoning `MAX_BULK_ENTRIES` already
+/// uses for `get_all`/`put_all`: silently truncating a larger count would
+/// desync the request instead of rejecting it up front. `pub(crate)`: the
+/// same `ServerFactory` is also accepted by `iteration.rs`'s server-side
+/// iteration filter.
+pub(crate) const MAX_FACTORY_PARAMS: usize = u8::MAX as usize;
 
 /// Which event types a listener receives: a bitmask on the wire (`0x01`
 /// created, `0x02` modified, `0x04` removed, `0x08` expired). Defaults to
@@ -183,6 +185,23 @@ pub struct CacheListener {
     poisoned: bool,
 }
 
+/// Writes a factory's parameter count (a single wire byte, the
+/// protocol's own ceiling: see `MAX_FACTORY_PARAMS`) and each parameter
+/// as an ordinary array. Shared by `write_factory` below and
+/// `connection.rs`'s `iteration_start`, which encode a factory's *name*
+/// differently (an empty-string sentinel here,
+/// `writeOptionalString`'s signed-vInt sentinel there) but its
+/// parameters identically. The caller must have already checked
+/// `params.len() <= MAX_FACTORY_PARAMS`: this never checks it again, so
+/// each caller can word its own `Error::BatchTooLarge` around the
+/// specific `ServerFactory` use that failed.
+pub(crate) fn write_factory_params(body: &mut Vec<u8>, params: &[Vec<u8>]) {
+    body.push(params.len() as u8);
+    for param in params {
+        write_array(body, param);
+    }
+}
+
 fn write_factory(body: &mut Vec<u8>, factory: Option<&ServerFactory>) -> Result<()> {
     match factory {
         None => write_array(body, b""),
@@ -195,13 +214,7 @@ fn write_factory(body: &mut Vec<u8>, factory: Option<&ServerFactory>) -> Result<
                 });
             }
             write_array(body, factory.name.as_bytes());
-            // A named factory's parameter count is a single byte on the
-            // wire (Codec30.writeNamedFactory), not a vInt like every
-            // other length-prefixed count elsewhere in this protocol.
-            body.push(factory.params.len() as u8);
-            for param in &factory.params {
-                write_array(body, param);
-            }
+            write_factory_params(body, &factory.params);
         }
     }
     Ok(())

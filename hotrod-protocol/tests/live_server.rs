@@ -1140,3 +1140,84 @@ async fn streaming_put_and_get_roundtrip_a_value_larger_than_one_chunk() {
 
     cache.remove(b"ci-streaming-key").await.expect("cleanup");
 }
+
+/// Puts a known set of entries, then reads the whole cache back through
+/// `iter` and confirms every one comes back exactly once. Against a
+/// single node, `nodes_and_owned_segments` returns just the seed with no
+/// segment filter, so this exercises the no-topology path end to end,
+/// including the automatic `IterationEnd` once the cursor runs dry.
+#[tokio::test]
+#[ignore]
+async fn iteration_reads_back_every_entry_put_on_a_single_node() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+
+    cache.clear().await.expect("clear");
+
+    let mut expected: Vec<(Vec<u8>, Vec<u8>)> = (0..20)
+        .map(|i| {
+            (
+                format!("ci-iter-key-{i}").into_bytes(),
+                format!("ci-iter-value-{i}").into_bytes(),
+            )
+        })
+        .collect();
+    for (key, value) in &expected {
+        cache
+            .put(key, value, Expiration::Default, Expiration::Default)
+            .await
+            .expect("put");
+    }
+
+    let mut iter = cache.iter().await.expect("iter");
+    let mut seen = Vec::new();
+    while let Some(entry) = iter.next_entry().await.expect("next_entry") {
+        seen.push((entry.key, entry.value));
+    }
+    seen.sort();
+    expected.sort();
+    assert_eq!(seen, expected);
+
+    cache.clear().await.expect("cleanup");
+}
+
+/// Same as `iteration_reads_back_every_entry_put_on_a_single_node`, but
+/// against the two-node cluster fixture (#78): this is the test that
+/// matters most for #53's central design decision, since it is the only
+/// one that can prove the sequential per-node fan-out
+/// (`docs/adr/0009-server-side-iteration.md`) does not silently drop a
+/// segment owned by whichever node is not the seed.
+#[tokio::test]
+#[ignore]
+async fn cluster_iteration_reads_back_every_entry_across_both_nodes() {
+    let _guard = lock_live_server();
+    let cluster = connect_cluster().await;
+
+    cluster.clear().await.expect("clear");
+
+    let mut expected: Vec<(Vec<u8>, Vec<u8>)> = (0..50)
+        .map(|i| {
+            (
+                format!("ci-cluster-iter-key-{i}").into_bytes(),
+                format!("ci-cluster-iter-value-{i}").into_bytes(),
+            )
+        })
+        .collect();
+    for (key, value) in &expected {
+        cluster
+            .put(key, value, Expiration::Default, Expiration::Default)
+            .await
+            .unwrap_or_else(|err| panic!("put {key:?}: {err}"));
+    }
+
+    let mut iter = cluster.iter().await.expect("iter");
+    let mut seen = Vec::new();
+    while let Some(entry) = iter.next_entry().await.expect("next_entry") {
+        seen.push((entry.key, entry.value));
+    }
+    seen.sort();
+    expected.sort();
+    assert_eq!(seen, expected);
+
+    cluster.clear().await.expect("cleanup");
+}
