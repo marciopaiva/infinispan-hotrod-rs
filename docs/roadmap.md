@@ -6,7 +6,10 @@ against the Hot Rod protocol spec and the official Java and Go clients.
 Individual items still go through the Analyze/Propose/Resolve steps in
 `CLAUDE.md` section 4 before any code is written; this file exists so
 that step starts from a shared picture of the whole gap instead of one
-issue at a time.
+issue at a time. It groups the open issues by theme rather than listing
+them as one flat queue, but the ordering within and across themes is
+still the thing that changes as work lands; the issue numbers and ADRs
+linked throughout are the ground truth, not the prose around them.
 
 ## Where the project stands
 
@@ -22,13 +25,13 @@ routing, not just a TCP client that happens to also parse Hot Rod
 frames.
 
 The gap is everything a production deployment expects around that core:
-TLS was the first piece and is now done (`docs/adr/0004-tls-support.md`,
-#46). Connection pooling and concurrent dispatch is now done too
-(`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77), and
-so are client listeners
-(`docs/adr/0006-client-listeners.md`, #4) and near caching
-(`docs/adr/0007-near-caching.md`, #5). Streaming and typed serialization
-are still open; the PHP bridge still comes last.
+TLS was the first piece (`docs/adr/0004-tls-support.md`, #46). Connection
+pooling and concurrent dispatch followed
+(`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77), then
+client listeners (`docs/adr/0006-client-listeners.md`, #4) and near
+caching (`docs/adr/0007-near-caching.md`, #5), released together as
+v0.5.0. Large-value streaming, server-side iteration, typed
+serialization and the PHP bridge are still open.
 
 ## The structural change that gated the rest (done, #77)
 
@@ -50,7 +53,7 @@ HotRodClient
     |
 RemoteCache (one per named cache, borrowed from HotRodClient)
     |
-    +-- get / put / remove / bulk / ...
+    +-- get / put / remove / bulk / listen / near_cache / ...
 ```
 
 `HotRodConnection` kept its role as the single, sequential connection
@@ -60,54 +63,118 @@ and multi-cluster failover all assume a client that can hold several
 live connections and dispatch to them concurrently, so this needed to
 land before those features, not alongside the last one that ran into it.
 
-## Next up, now that #77, #78, #4 and #5 have landed
+## Themes
 
-Both P0 items are done (#77, #78), and both P1 items that depended on
-each other in sequence (#4, client listeners, then #5, near caching)
-are done with them. #52/#53 are the next P1 items, independent of each
-other and of everything above.
+Four P0/P1 items are done: pooling (#77), the multi-node CI fixture
+(#78), client listeners (#4) and near caching (#5), released together
+as v0.5.0. What is left groups into five themes. Large data access is
+next, ahead of the other four; those four are independent of each
+other and of large data access, so any of them can follow in whatever
+order is actually needed. Within a theme, order matters more, since
+later items there tend to build on earlier ones.
 
-* **#4 (client listeners)** shipped as `RemoteCache::listen`/`listen_with`
-  returning a `CacheListener`, on its own dedicated connection per
-  `docs/adr/0006-client-listeners.md`: no changes to `HotRodClient`'s
-  pool (#77) or to `HotRodConnection`'s synchronous request/response
-  model, and no automatic reconnection if that connection drops (a
-  documented limitation, not an oversight).
-* **#5 (near caching)** shipped as `RemoteCache::near_cache` returning a
-  `NearCachedCache`, per `docs/adr/0007-near-caching.md`: a bounded,
-  hand-rolled LRU of recently read entries, invalidated through a
-  plain `listen_with` listener (no bloom filter, no new wire surface).
-  If that listener's connection drops, the local cache clears itself
-  and stops being used at all, rather than risk serving data no
-  invalidation feed can ever correct again.
-* #52 (streaming) and #53 (server-side iteration) remain independent of
-  each other and of everything above; either can be picked up next.
+### Large data access (next up)
 
-## Proposed ordering
+* **Streaming (#52, GetStream/PutStream).** Values are currently always
+  fully buffered in memory; there is no way to read or write a value
+  larger than a caller is willing to hold whole. The exact opcodes and
+  framing need pinning against the real Java client source before any
+  Propose step, the same discipline every prior phase used for
+  hash/SASL/listener wire details: nothing here is confirmed yet.
+* **Server-side iteration (#53).** Only way to walk a cache without
+  already knowing its keys; needed for export, migration and cache
+  inspection tooling. Independent of streaming, but both land before
+  the themes below, since neither needs more.
 
-| Priority | Item | Issue | Why this order |
-| --- | --- | --- | --- |
-| ~~P0~~ | ~~Connection pooling / concurrent operations~~ | #77 (done) | Structural blocker described above |
-| ~~P0~~ | ~~Multi-node CI fixture~~ | #78 (done) | The cluster code path used to be exercised only by `#[ignore]`d manual tests; now runs on every push via `ci/infinispan-cluster/` |
-| ~~P1~~ | ~~Client listeners (cache events)~~ | #4 (done) | Prerequisite for near caching |
-| ~~P1~~ | ~~Near caching~~ | #5 (done) | Large latency win once listeners exist, particularly for the PHP bridge |
-| P1 | Streaming (GetStream/PutStream) | #52 | Values are currently always fully buffered in memory |
-| P1 | Server-side iteration | #53 | Only way to walk a cache without already knowing its keys |
-| P1 | Client statistics and telemetry | #54 | Needed before this is trusted in production, cheap to add once pooling exists |
-| P2 | Serialization abstraction (`Marshaller` trait) | (new, precedes #50) | `hotrod-protocol` is deliberately byte-oriented today; query needs typed values first |
-| P2 | Remote query (Ickle / Protobuf) | #50 | Depends on the marshaller and on Protobuf schema registration |
-| P2 | Multi-cluster failover | #56 | Disaster-recovery feature, not needed for a single-cluster deployment |
-| P3 | Multimap cache | #48 | Independent of the above, small surface |
-| P3 | Distributed counters | #49 | Independent of the above, small surface |
-| P3 | Remote administration | #55 | Management plane, separate from the data-plane work above |
-| P4 | Transaction support | #47 | Needs the pool and topology work settled first; two-phase commit across a changing cluster is its own hard problem |
-| P4 | GSSAPI authentication | #9 | Already deferred, needs a system Kerberos library |
-| P4 | Remote task execution | #51 | No current use case pulling on it |
+### Reliability and observability
 
-This intentionally does not try to move on GSSAPI, transactions,
-counters, multimap, admin, query, streaming, near caching and PHP at
-the same time. Each one lands after the layer it depends on, not in
-parallel with it.
+* **Client statistics and telemetry (#54).** Needed before this client
+  is trusted in production: operation counts and latency, connection
+  and pool state, near-cache hit/miss. Cheap to add now that pooling
+  exists to instrument.
+* Retry policy, node health tracking and circuit breaking are natural
+  extensions of this theme (an operation-aware retry policy in
+  particular, since blindly retrying `put`/`replace`/the versioned
+  operations risks silent duplicate writes), but none of them has an
+  issue filed yet. Worth proposing once #54 gives a concrete picture of
+  what is actually failing in practice, rather than designing retry
+  behavior against a guess.
+* Fuzzing the wire parsers (`read_vint`, `read_vlong`, `read_array`,
+  `read_topology_update`, the SASL challenge parsers) was already
+  planned before this rewrite and still has no issue filed; it belongs
+  here, since a parser that survives a fuzzer is exactly the kind of
+  reliability this theme is about.
+
+### Typed data
+
+* **Serialization abstraction.** `hotrod-protocol` is deliberately
+  byte-oriented today, with no built-in notion of typed values; a
+  `Marshaller`-shaped trait would let a caller work with typed values
+  without baking a specific format into the protocol layer. No issue
+  filed yet; precedes remote query.
+* **Remote query, Ickle/Protobuf (#50).** Depends on the marshaller
+  above and on Protobuf schema registration against the server.
+
+### High availability
+
+* **Multi-cluster failover (#56).** Disaster-recovery feature, not
+  needed for a single-cluster deployment; independent of the themes
+  above.
+
+### Specialized data structures and administration
+
+Each of these has its own dedicated Hot Rod operations, independent of
+`RemoteCache` and of each other; small individual surfaces.
+
+* **Multimap cache (#48)**
+* **Distributed counters (#49)**
+* **Remote administration (#55)**, create/remove caches: a management
+  plane, kept separate from the data-plane work above.
+
+### Deferred
+
+* **Transaction support (#47).** Two-phase commit across a changing
+  cluster topology is its own hard problem; needs the pool and
+  topology work settled first, which it now is, but still wants its
+  own Analyze/Propose pass rather than piggybacking on another phase.
+* **GSSAPI authentication (#9).** Already deferred: needs a system
+  Kerberos library, which conflicts with this project's preference for
+  no new system dependencies (the same reasoning ADR 0002 used to
+  defer it originally).
+* **Remote task execution (#51).** No current use case pulling on it.
+
+This intentionally does not try to move on everything at once. Each
+theme, and each item within one, lands after what it depends on, not
+in parallel with it.
+
+## Near cache: known gaps
+
+The near cache (#5, `docs/adr/0007-near-caching.md`) is bounded and
+LRU-evicted today (`NearCacheOptions::max_entries`), invalidated through
+a listener with a documented fail-safe if that listener dies. What the
+ADR explicitly left out, in order of how much it costs in practice:
+
+* No per-entry `lifespan`/`max_idle` tracking: a cached value can
+  outlive its own lifespan locally, and a local hit never refreshes
+  `max_idle` server-side. `get_with_version`/`VersionedValue` already
+  carry this metadata; using it instead of a bare value is the natural
+  fix, not yet taken on.
+* The race-closing generation counter is store-wide, not per key, so
+  heavy concurrent writes to unrelated keys can push the local hit rate
+  well below normal. A bounded per-key tombstone (reusing the same LRU
+  eviction already in `LruStore`) would fix this without reopening the
+  unbounded-growth problem a naive per-key scheme would have.
+* No in-flight request coalescing: concurrent `get` misses on the same
+  key each run their own independent fetch instead of sharing one.
+* No bloom-filter support (the Java client's `addNearCacheListener`
+  traffic optimization): without it, this client's listener receives
+  invalidation for every key that changes in the whole remote cache,
+  not just the ones it has cached, and filters client-side instead.
+* No hit/miss/invalidation statistics; folds naturally into the
+  broader client-statistics theme above (#54) once that exists.
+
+None of these block the themes above; revisit if real usage shows one
+of them actually costing something, rather than preemptively.
 
 ## PHP: not just a wrapper
 
@@ -131,31 +198,44 @@ Tokio internally while exposing a synchronous PHP API, the same way any
 other PHP extension hides its own I/O model. `getAsync`-style APIs are
 explicitly out of scope for the first PHP milestone.
 
-## Milestones
+This comes after every theme above: building it against transport,
+event and serialization layers that are still moving would mean redoing
+it.
 
-* **Transport and concurrency**: connection pooling, retry/backoff,
-  multi-node CI, fuzzing the wire parsers (`read_vint`, `read_vlong`,
-  `read_array`, `read_topology_update`, the SASL challenge parsers).
-* **Events and near cache** (done, #4/#5): client listeners
-  (`CacheListener::next`, a plain inherent method rather than an
-  `impl futures_core::Stream`, to avoid a new dependency), and a
-  bounded LRU near cache (`NearCachedCache`) invalidated through those
-  events.
-* **Large data**: `get_stream`/`put_stream`, server-side iteration,
-  both integrated with Tokio's `AsyncRead`/`AsyncWrite` rather than a
-  bespoke chunk API.
-* **Typed data**: the `Marshaller` trait, a Protobuf implementation,
-  then remote query on top of it.
-* **PHP ecosystem**: the extension itself, PSR-16, the Symfony adapter,
-  the session handler, prebuilt binaries. This comes last because it
-  depends on the transport, event and serialization layers being
-  settled; building it against a moving core would mean redoing it.
+## Guiding principles
+
+A few things this project has actually done repeatedly, worth stating
+once instead of re-discovering per phase:
+
+* **Cancellation is part of correctness, not an edge case.**
+  `HotRodConnection` poisons itself before writing a request and clears
+  the mark only once the response is read in full; `CacheListener` does
+  the same around each event frame; `NearCachedCache::invalidate_after`
+  invalidates from a guard's `Drop` specifically so a cancelled caller
+  cannot skip it. Any new operation that holds state across an
+  `.await` needs the same question asked of it: what does a future
+  dropped mid-flight leave behind?
+* **Protocol details come from the real client source, not memory.**
+  Every phase so far (hash routing, SASL mechanisms, listener framing)
+  pinned its wire format against the Java client's actual source on
+  GitHub before writing a line of parsing code. Streaming and
+  iteration need the same treatment before their own Propose step.
+* **No new dependency without the Analyze/Propose step.** Demonstrated
+  repeatedly: GSSAPI deferred partly over a system Kerberos dependency,
+  `rustls` chosen over `native-tls` to avoid a C one, connection pooling
+  and near caching's LRU both shipped with none at all.
+* **Test against a real server, not only a fake one.** Unit tests
+  against an in-process fake server catch wire-format regressions
+  fast; they have also missed real bugs a live Infinispan server
+  caught immediately (a nonexistent opcode, a wrong error-response
+  path). Every phase ends with `#[ignore]`d live-server tests, wired
+  into CI rather than left to run only by hand.
 
 ## Explicitly out of scope for now
 
 * A `hotrod-wire` / `hotrod-client` / `hotrod-php` crate split. Worth
-  reconsidering once pooling, listeners and streaming exist; premature
-  before that.
+  reconsidering once streaming and typed data exist; premature before
+  that.
 * Automatic PHP array to Protobuf/Java-object mapping. The PHP API
   should offer explicit `putBytes`/`putJson`/a configurable serializer,
   not implicit conversion.

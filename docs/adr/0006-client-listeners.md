@@ -54,8 +54,9 @@ normal, `1` an unmarshalled custom object, `2` raw custom bytes), an
 `isRetried` byte, then for a normal event a key and, for created/
 modified only, an 8-byte version; for a custom event (`isCustom` `1` or
 `2`), raw bytes instead, which this crate never attempts to unmarshal
-either way, consistent with it being "deliberately byte-oriented" (ADR
-0005). Confirmed directly in `Codec30.readCacheEvent`: the generic
+either way, consistent with `hotrod-protocol` being deliberately
+byte-oriented throughout, with no built-in notion of typed values.
+Confirmed directly in `Codec30.readCacheEvent`: the generic
 frame decoder reads magic/message id/opcode first and only then decides
 whether this is a reply to a specific pending request (opcode validated
 against what that request expects) or an event (opcode outside that
