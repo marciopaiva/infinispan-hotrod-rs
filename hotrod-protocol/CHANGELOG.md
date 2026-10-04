@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Client statistics: `RemoteCache::statistics`/`reset_statistics`
+  report hit/miss counts and average read/store/remove time, always
+  collected with no configuration flag, per
+  `docs/adr/0010-client-statistics-and-tracing.md` (#54, part 1 of 2;
+  tracing is the second part, not included yet). Instruments exactly
+  the operations the Java client's `clientStatistics()` does (get,
+  get_with_version, put, put_if_absent, replace,
+  replace_if_unmodified, remove, remove_if_unmodified, put_all,
+  get_all); contains_key/ping/size/clear/stats are not instrumented,
+  matching the Java client there too. `NearCachedCache::
+  near_cache_statistics`/`reset_near_cache_statistics` report a near
+  cache's own hit/miss/invalidation counts and current local size,
+  kept separate from the plain per-cache statistics above since a
+  near cache is its own distinct wrapper (ADR 0007), unlike the Java
+  client where near caching is intrinsic client configuration.
+  `HotRodClient::pool_statistics` reports idle/checked-out connection
+  counts per node; this one has no Java client equivalent.
 - Server-side iteration: `RemoteCache::iter`/`iter_with` walk every
   entry in a cache through a server-side cursor instead of requiring
   the caller to already know every key, per

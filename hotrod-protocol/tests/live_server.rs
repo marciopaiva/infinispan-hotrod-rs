@@ -1221,3 +1221,76 @@ async fn cluster_iteration_reads_back_every_entry_across_both_nodes() {
 
     cluster.clear().await.expect("cleanup");
 }
+
+/// Runs a known sequence of operations and confirms `statistics()`
+/// reports plausible numbers back: this crate's own counting, not a
+/// comparison against the server's `stats` operation (the two measure
+/// different things entirely). `pool_statistics()` and a near cache's
+/// `near_cache_statistics()` get the same treatment.
+#[tokio::test]
+#[ignore]
+async fn statistics_reflects_a_real_sequence_of_operations() {
+    let _guard = lock_live_server();
+
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+    let cache = client.cache("");
+
+    cache.remove(b"ci-stats-key").await.expect("cleanup");
+    cache.reset_statistics();
+
+    cache.get(b"ci-stats-key").await.expect("get (miss)");
+    cache
+        .put(
+            b"ci-stats-key",
+            b"value",
+            Expiration::Default,
+            Expiration::Default,
+        )
+        .await
+        .expect("put");
+    cache.get(b"ci-stats-key").await.expect("get (hit)");
+    cache.remove(b"ci-stats-key").await.expect("remove");
+
+    let stats = cache.statistics();
+    assert_eq!(stats.remote_hits, 1);
+    assert_eq!(stats.remote_misses, 1);
+    assert_eq!(stats.remote_stores, 1);
+    assert_eq!(stats.remote_removes, 1);
+
+    let near = cache
+        .near_cache(NearCacheOptions::default())
+        .await
+        .expect("near_cache");
+    near.put(
+        b"ci-near-stats-key",
+        b"value",
+        Expiration::Default,
+        Expiration::Default,
+    )
+    .await
+    .expect("put through the near cache");
+    near.get(b"ci-near-stats-key").await.expect("get (miss)");
+    near.get(b"ci-near-stats-key").await.expect("get (hit)");
+
+    let near_stats = near.near_cache_statistics();
+    assert_eq!(near_stats.hits, 1);
+    assert_eq!(near_stats.misses, 1);
+    assert_eq!(near_stats.size, 1);
+
+    let pool_stats = client.pool_statistics();
+    assert!(
+        !pool_stats.is_empty(),
+        "at least one pool should exist after the operations above"
+    );
+
+    near.remove(b"ci-near-stats-key").await.expect("cleanup");
+}

@@ -77,6 +77,13 @@ pub(crate) struct ConnectionPool {
     /// holds checked out: it turns into an empty slot whenever it is
     /// returned instead.
     closed: AtomicBool,
+    /// `slots.len()` on its own is not enough to tell idle from checked
+    /// out: a checkout pops its slot, shrinking the vec, until the slot
+    /// is returned. Kept separately so `idle_count`/`checked_out_count`
+    /// (see `HotRodClient::pool_statistics`, #54) can tell the two
+    /// apart without the slot count itself ever changing (`max_size` is
+    /// fixed for this pool's whole lifetime).
+    max_size: usize,
 }
 
 impl ConnectionPool {
@@ -85,7 +92,35 @@ impl ConnectionPool {
             semaphore: Semaphore::new(max_size),
             slots: Mutex::new((0..max_size).map(|_| Slot::Empty).collect()),
             closed: AtomicBool::new(false),
+            max_size,
         }
+    }
+
+    /// The fixed maximum number of connections, idle plus checked out,
+    /// this pool ever holds at once.
+    pub(crate) fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    /// How many connections are idle in this pool right now, ready to
+    /// be checked out without opening a new one. A snapshot: another
+    /// task's concurrent checkout or return can make it stale the
+    /// instant after this returns.
+    pub(crate) fn idle_count(&self) -> usize {
+        self.slots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Connection(_)))
+            .count()
+    }
+
+    /// How many connections are checked out of this pool right now
+    /// (`max_size` minus every slot, idle or empty, currently present
+    /// in `slots`: a checkout pops its slot until it is returned). Same
+    /// snapshot caveat as `idle_count`.
+    pub(crate) fn checked_out_count(&self) -> usize {
+        self.max_size - self.slots.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Waits for the next available slot: an idle connection, or an empty
@@ -272,6 +307,34 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn idle_and_checked_out_counts_track_outstanding_checkouts() {
+        let pool = ConnectionPool::new(2);
+        assert_eq!(pool.max_size(), 2);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.checked_out_count(), 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let conn = HotRodConnection::connect(addr, "").await.unwrap();
+
+        assert!(matches!(pool.checkout().await, Checkout::NeedsNew));
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(
+            pool.checked_out_count(),
+            1,
+            "the empty slot just taken counts as checked out, not idle"
+        );
+
+        pool.return_slot(Some(conn));
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.checked_out_count(), 0);
+    }
 
     /// Regression test for a review finding: `seed_idle` used to pop
     /// whatever slot a plain LIFO `checkout` happened to return, which

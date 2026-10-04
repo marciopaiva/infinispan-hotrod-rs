@@ -92,10 +92,17 @@ Both items in this theme are done.
 
 ### Reliability and observability
 
-* **Client statistics and telemetry (#54).** Needed before this client
-  is trusted in production: operation counts and latency, connection
-  and pool state, near-cache hit/miss. Cheap to add now that pooling
-  exists to instrument.
+* ~~Client statistics (#54, part 1 of 2)~~ (done). `RemoteCache::
+  statistics`/`reset_statistics`, `NearCachedCache::
+  near_cache_statistics`, `HotRodClient::pool_statistics`; see
+  `docs/adr/0010-client-statistics-and-tracing.md`.
+* **Tracing (#54, part 2 of 2), the remaining half of this issue.**
+  Local spans/events via the `tracing` crate around the same
+  dispatch point the statistics above instrument, per the same ADR.
+  Deliberately not cross-process trace propagation to the server
+  (what the Java client itself calls "telemetry"): that is a bigger,
+  separate feature, left for its own proposal if it turns out to
+  matter.
 * Retry policy, node health tracking and circuit breaking are natural
   extensions of this theme (an operation-aware retry policy in
   particular, since blindly retrying `put`/`replace`/the versioned
@@ -174,8 +181,9 @@ ADR explicitly left out, in order of how much it costs in practice:
   traffic optimization): without it, this client's listener receives
   invalidation for every key that changes in the whole remote cache,
   not just the ones it has cached, and filters client-side instead.
-* No hit/miss/invalidation statistics; folds naturally into the
-  broader client-statistics theme above (#54) once that exists.
+* ~~No hit/miss/invalidation statistics~~ (done, #54).
+  `NearCachedCache::near_cache_statistics` reports hits, misses,
+  invalidations and current local size.
 
 None of these block the themes above; revisit if real usage shows one
 of them actually costing something, rather than preemptively.
