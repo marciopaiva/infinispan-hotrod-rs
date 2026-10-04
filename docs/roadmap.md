@@ -30,9 +30,9 @@ pooling and concurrent dispatch followed
 (`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77), then
 client listeners (`docs/adr/0006-client-listeners.md`, #4) and near
 caching (`docs/adr/0007-near-caching.md`, #5), released together as
-v0.5.0. Streaming (`docs/adr/0008-streaming.md`, #52) is done too,
-unreleased. Server-side iteration, typed serialization and the PHP
-bridge are still open.
+v0.5.0. Streaming (`docs/adr/0008-streaming.md`, #52) and server-side
+iteration (`docs/adr/0009-server-side-iteration.md`, #53) are done too,
+unreleased. Typed serialization and the PHP bridge are still open.
 
 ## The structural change that gated the rest (done, #77)
 
@@ -66,27 +66,29 @@ land before those features, not alongside the last one that ran into it.
 
 ## Themes
 
-Five P0/P1 items are done: pooling (#77), the multi-node CI fixture
-(#78), client listeners (#4), near caching (#5) and streaming (#52).
-What is left groups into four themes, each independent of the others,
-so any of them can go next in whatever order is actually needed.
-Within a theme, order matters more, since later items there tend to
-build on earlier ones.
+Six P0/P1 items are done: pooling (#77), the multi-node CI fixture
+(#78), client listeners (#4), near caching (#5), streaming (#52) and
+server-side iteration (#53). What is left groups into four themes,
+each independent of the others, so any of them can go next in whatever
+order is actually needed. Within a theme, order matters more, since
+later items there tend to build on earlier ones.
 
 ### Large data access
+
+Both items in this theme are done.
 
 * ~~Streaming (#52, GetStream/PutStream)~~ (done). Values no longer
   have to be fully buffered in memory: `RemoteCache::get_stream`/
   `put_stream`/`put_stream_if_absent`/`replace_stream_with_version`
   read or write one in chunks, pinned to the one pooled connection
   that opened the stream, per `docs/adr/0008-streaming.md`.
-* **Server-side iteration (#53), the next item in this theme.** Only
-  way to walk a cache without already knowing its keys; needed for
-  export, migration and cache inspection tooling. The opcodes and
-  framing still need pinning against the real Java client source
-  before any Propose step, the same discipline #52 and every prior
-  phase used for their own wire details: nothing here is confirmed
-  yet.
+* ~~Server-side iteration (#53, retrieveEntries/keySet/entrySet/
+  values)~~ (done). `RemoteCache::iter`/`iter_with` walk a whole cache
+  without the caller already knowing its keys, needed for export,
+  migration and cache inspection tooling. On a cluster, opens one
+  cursor per owning node, sequentially; see
+  `docs/adr/0009-server-side-iteration.md` for why that trade was made
+  over the Java client's concurrent fan-out.
 
 ### Reliability and observability
 

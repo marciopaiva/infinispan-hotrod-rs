@@ -31,7 +31,7 @@ for release notes.
 | Remote query (Protobuf / Ickle) | Yes | No |
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
-| Server-side iteration | Yes | No |
+| Server-side iteration | Yes | Yes |
 | Stats and telemetry (metrics, tracing) | Yes | No |
 | Remote administration | Yes | No |
 | Multi-cluster failover | Yes | No |
@@ -114,6 +114,18 @@ put.finish().await?; // nothing is written until this commits it
 let mut get = cache.get_stream(b"key", 8192).await?.expect("entry exists");
 while let Some(chunk) = get.next_chunk().await? {
     process(chunk);
+}
+```
+
+`iter`/`iter_with` walk every entry in the cache server-side, one batch
+at a time, instead of requiring the caller to already know every key.
+On a cluster, this opens one cursor per node in turn, covering every
+segment:
+
+```rust
+let mut entries = cache.iter().await?;
+while let Some(entry) = entries.next_entry().await? {
+    process(entry.key, entry.value);
 }
 ```
 

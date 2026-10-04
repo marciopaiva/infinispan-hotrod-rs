@@ -43,6 +43,16 @@ pub enum Error {
     #[error("malformed cache event: {0}")]
     MalformedEvent(String),
 
+    #[error("malformed server-side iteration response: {0}")]
+    MalformedIterationResponse(String),
+
+    /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
+    /// knows this cursor, most likely because it sat idle past the
+    /// server's five-minute reaper. No retry is attempted; see
+    /// `docs/adr/0009-server-side-iteration.md`.
+    #[error("server-side iteration cursor is no longer known to the server")]
+    InvalidIteration,
+
     #[error("SCRAM server verification failed: the server's final signature did not match")]
     ScramServerVerificationFailed,
 

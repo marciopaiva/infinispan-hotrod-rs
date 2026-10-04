@@ -24,6 +24,16 @@ pub(crate) fn write_vint(buf: &mut Vec<u8>, mut value: u32) {
     }
 }
 
+/// ZigZag-encodes `value` before writing it as a plain `vInt`: Hot Rod's
+/// `ByteBufUtil.writeSignedVInt`/`SignedNumeric.encode`. Unlike the raw
+/// bit-reinterpretation `write_vint` already uses for the topology id,
+/// this maps `-1` to the single byte `0x01`, not five bytes of set bits,
+/// so the two must not be confused. `IterationStart`'s "no filter"/"no
+/// segment list" sentinels are the only callers.
+pub(crate) fn write_signed_vint(buf: &mut Vec<u8>, value: i32) {
+    write_vint(buf, ((value << 1) ^ (value >> 31)) as u32);
+}
+
 pub(crate) fn write_vlong(buf: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7F) as u8;
@@ -115,6 +125,20 @@ mod tests {
         write_vint(&mut buf, (-1i32) as u32);
         let value = read_vint(&mut buf.as_slice()).await.expect("read_vint");
         assert_eq!(value as i32, -1);
+    }
+
+    #[test]
+    fn write_signed_vint_of_negative_one_is_a_single_byte() {
+        let mut buf = Vec::new();
+        write_signed_vint(&mut buf, -1);
+        assert_eq!(buf, vec![0x01]);
+    }
+
+    #[test]
+    fn write_signed_vint_of_a_non_negative_value_doubles_it() {
+        let mut buf = Vec::new();
+        write_signed_vint(&mut buf, 5);
+        assert_eq!(buf, vec![0x0A]);
     }
 
     #[tokio::test]

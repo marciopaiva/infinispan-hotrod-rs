@@ -44,13 +44,15 @@ const EVENT_REMOVED: u8 = 0x62;
 const EVENT_EXPIRED: u8 = 0x63;
 
 /// Safety ceiling on a filter/converter factory's parameter count: the
-/// wire encodes it as a single byte (`Codec30.writeNamedFactory`), so
-/// `255` is the most this protocol can express at all, not a limit this
-/// client chose. Checked before writing anything, the same reasoning
-/// `MAX_BULK_ENTRIES` already uses for `get_all`/`put_all`: silently
-/// truncating a larger count would desync the request instead of
-/// rejecting it up front.
-const MAX_FACTORY_PARAMS: usize = u8::MAX as usize;
+/// wire encodes it as a single byte (`Codec30.writeNamedFactory`,
+/// `Codec30.writeIteratorStartOperation`), so `255` is the most this
+/// protocol can express at all, not a limit this client chose. Checked
+/// before writing anything, the same reasoning `MAX_BULK_ENTRIES` already
+/// uses for `get_all`/`put_all`: silently truncating a larger count would
+/// desync the request instead of rejecting it up front. `pub(crate)`: the
+/// same `ServerFactory` is also accepted by `iteration.rs`'s server-side
+/// iteration filter.
+pub(crate) const MAX_FACTORY_PARAMS: usize = u8::MAX as usize;
 
 /// Which event types a listener receives: a bitmask on the wire (`0x01`
 /// created, `0x02` modified, `0x04` removed, `0x08` expired). Defaults to
