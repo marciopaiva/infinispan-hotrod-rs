@@ -849,16 +849,13 @@ impl HotRodConnection {
         result
     }
 
-    /// Mirrors `GetWithMetadataOperation.readMetadataValue`: flags select
-    /// which timestamp/duration pairs are present, then an 8-byte version
-    /// and the value always follow. The timestamps are server wall-clock
-    /// time in epoch milliseconds (`TimeService.wallClockTime`), the
-    /// durations are in seconds.
     /// The metadata block (`GetWithMetadataOperation.readMetadataValue`):
     /// flags select which timestamp/duration pairs are present, then an
-    /// 8-byte version always follows. Shared by `read_versioned_value`
-    /// and `get_stream_start`, which both carry this same block before
-    /// their own value/chunk. Returns `(created, lifespan, last_used,
+    /// 8-byte version always follows. The timestamps are server
+    /// wall-clock time in epoch milliseconds (`TimeService.wallClockTime`),
+    /// the durations are in seconds. Shared by `read_versioned_value` and
+    /// `get_stream_start`, which both carry this same block before their
+    /// own value/chunk. Returns `(created, lifespan, last_used,
     /// max_idle, version)`.
     async fn read_entry_metadata(
         &mut self,
@@ -897,6 +894,7 @@ impl HotRodConnection {
         Ok((created, lifespan, last_used, max_idle, version))
     }
 
+    /// `read_entry_metadata`'s block, followed by the value itself.
     async fn read_versioned_value(&mut self) -> Result<VersionedValue> {
         let (created, lifespan, last_used, max_idle, version) = self.read_entry_metadata().await?;
         let value = read_array(&mut self.stream).await?;
