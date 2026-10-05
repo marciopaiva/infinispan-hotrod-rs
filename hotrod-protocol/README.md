@@ -33,7 +33,8 @@ for release notes.
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
 | Client statistics | Yes | Yes |
-| Tracing | Yes | No |
+| Tracing: local spans (via the `tracing` crate) | No | Yes |
+| Tracing: trace-context propagation to the server | Yes | No |
 | Remote administration | Yes | No |
 | Multi-cluster failover | Yes | No |
 
@@ -144,6 +145,17 @@ println!("{} hits, {} misses", stats.remote_hits, stats.remote_misses);
 for pool in client.pool_statistics() {
     println!("{}: {} idle, {} checked out", pool.address, pool.idle_connections, pool.checked_out_connections);
 }
+```
+
+Every operation also opens a [`tracing`](https://docs.rs/tracing) span
+named `hotrod_operation`, carrying the cache name and the operation's
+name and duration (never the key or value), with an error event on
+failure. Install any `tracing` subscriber to see them; without one,
+this costs nothing:
+
+```rust
+tracing_subscriber::fmt::init(); // or any other subscriber
+cache.get(b"key").await?; // now shows up as a span in whatever the subscriber does with it
 ```
 
 ## License

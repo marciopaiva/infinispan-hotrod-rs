@@ -8,23 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Tracing: every dispatched operation opens a
+  [`tracing`](https://docs.rs/tracing) span named `hotrod_operation`,
+  at the same point statistics (below) are recorded, carrying the
+  cache name and the operation's name and duration, with an error
+  event on failure, never the key or value either carries, per
+  `docs/adr/0010-client-statistics-and-tracing.md` (#54, part 2 of
+  2). Deliberately not cross-process trace-context propagation to the
+  server (what the Java client itself calls "telemetry"): that is a
+  bigger, separate feature, left for its own proposal if it turns out
+  to matter. No overhead without a `tracing` subscriber installed.
 - Client statistics: `RemoteCache::statistics`/`reset_statistics`
   report hit/miss counts and average read/store/remove time, always
-  collected with no configuration flag, per
-  `docs/adr/0010-client-statistics-and-tracing.md` (#54, part 1 of 2;
-  tracing is the second part, not included yet). Instruments exactly
-  the operations the Java client's `clientStatistics()` does (get,
-  get_with_version, put, put_if_absent, replace,
-  replace_if_unmodified, remove, remove_if_unmodified, put_all,
-  get_all); contains_key/ping/size/clear/stats are not instrumented,
-  matching the Java client there too. `NearCachedCache::
-  near_cache_statistics`/`reset_near_cache_statistics` report a near
-  cache's own hit/miss/invalidation counts and current local size,
-  kept separate from the plain per-cache statistics above since a
-  near cache is its own distinct wrapper (ADR 0007), unlike the Java
-  client where near caching is intrinsic client configuration.
-  `HotRodClient::pool_statistics` reports idle/checked-out connection
-  counts per node; this one has no Java client equivalent.
+  collected with no configuration flag, per the same ADR (#54, part 1
+  of 2). Instruments exactly the operations the Java client's
+  `clientStatistics()` does (get, get_with_version, put,
+  put_if_absent, replace, replace_if_unmodified, remove,
+  remove_if_unmodified, put_all, get_all); contains_key/ping/size/
+  clear/stats are not instrumented, matching the Java client there
+  too. `NearCachedCache::near_cache_statistics`/
+  `reset_near_cache_statistics` report a near cache's own
+  hit/miss/invalidation counts and current local size, kept separate
+  from the plain per-cache statistics above since a near cache is its
+  own distinct wrapper (ADR 0007), unlike the Java client where near
+  caching is intrinsic client configuration. `HotRodClient::
+  pool_statistics` reports idle/checked-out connection counts per
+  node; this one has no Java client equivalent.
 - Server-side iteration: `RemoteCache::iter`/`iter_with` walk every
   entry in a cache through a server-side cursor instead of requiring
   the caller to already know every key, per
