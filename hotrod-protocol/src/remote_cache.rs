@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use crate::client::HotRodClient;
 use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
@@ -18,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::iteration::{CacheIterator, IterationOptions, NodeIterator};
 use crate::listener::{CacheListener, ListenOptions};
 use crate::near_cache::{NearCacheOptions, NearCachedCache};
+use crate::stats::ClientStatistics;
 use crate::streaming::{GetStream, PutStream};
 use crate::topology::TopologyServer;
 use crate::wire::Expiration;
@@ -512,6 +514,22 @@ impl RemoteCache {
         Ok(NodeIterator::new(guard, iteration_id))
     }
 
+    /// This cache's client-side statistics: counts and average time
+    /// for the operations `docs/adr/0010-client-statistics-and-tracing.md`
+    /// instruments, always collected, no configuration flag. Creates
+    /// this cache name's counters on first access if nothing has
+    /// called an instrumented operation on it yet, so this never
+    /// needs an `Option`.
+    pub fn statistics(&self) -> ClientStatistics {
+        self.client.stats_for(&self.cache_name).snapshot()
+    }
+
+    /// Zeroes this cache's statistics and restarts the clock
+    /// `time_since_reset` measures from.
+    pub fn reset_statistics(&self) {
+        self.client.stats_for(&self.cache_name).reset();
+    }
+
     /// Routes `key` to its computed owner, checking out a connection for
     /// this cache (opening and authenticating one first if needed) and
     /// running `op` against it. On an I/O or timeout error, the checked
@@ -532,7 +550,7 @@ impl RemoteCache {
     async fn call(&self, key: &[u8], op: Operation) -> Result<OperationResult> {
         let (addr, origin) = self.client.owner_addr(key).await?;
         let outcome = match self.client.checkout(addr, &self.cache_name, origin).await {
-            Ok(mut guard) => run_operation(&mut guard, &op).await.inspect(|_| {
+            Ok(mut guard) => self.run_and_record(&mut guard, &op).await.inspect(|_| {
                 self.client.record_topology_update(&mut guard);
             }),
             Err(err) => Err(err),
@@ -567,7 +585,7 @@ impl RemoteCache {
     async fn run_seed_op(&self, op: &Operation) -> Result<OperationResult> {
         let seed = self.active_seed_addr();
         let attempt = match self.client.checkout(seed, &self.cache_name, None).await {
-            Ok(mut guard) => run_operation(&mut guard, op).await.inspect(|_| {
+            Ok(mut guard) => self.run_and_record(&mut guard, op).await.inspect(|_| {
                 self.client.record_topology_update(&mut guard);
             }),
             Err(err) => Err(err),
@@ -603,9 +621,67 @@ impl RemoteCache {
             .client
             .checkout(new_seed, &self.cache_name, None)
             .await?;
-        run_operation(&mut guard, op).await.inspect(|_| {
+        self.run_and_record(&mut guard, op).await.inspect(|_| {
             self.client.record_topology_update(&mut guard);
         })
+    }
+
+    /// Runs `op` and, only if it succeeds, records its timing into
+    /// this cache's statistics (`docs/adr/0010-client-statistics-and-tracing.md`):
+    /// a failed attempt (timed out, I/O error, retried) measures
+    /// nothing, since what matters here is the cost of an operation
+    /// that actually worked. The one place every one of `call`'s four
+    /// dispatch paths routes `op` through a connection, so this is
+    /// also the one place that needs to record statistics, rather
+    /// than each of the four repeating it.
+    async fn run_and_record(
+        &self,
+        conn: &mut HotRodConnection,
+        op: &Operation,
+    ) -> Result<OperationResult> {
+        let start = Instant::now();
+        let result = run_operation(conn, op).await?;
+        self.record_stats(op, start.elapsed(), &result);
+        Ok(result)
+    }
+
+    /// Classifies `op`/`result` into this cache's read/store/remove
+    /// counters, matching exactly the set the Java client's
+    /// `StatsOperationsFactory` instruments: `contains_key`/`ping`/
+    /// `size`/`clear`/`stats` fall through to the catch-all and record
+    /// nothing, same as there.
+    fn record_stats(&self, op: &Operation, elapsed: Duration, result: &OperationResult) {
+        let stats = self.client.stats_for(&self.cache_name);
+        match (op, result) {
+            (Operation::Get(_), OperationResult::Get(value)) => {
+                stats.record_read(elapsed, value.is_some());
+            }
+            (Operation::GetWithVersion(_), OperationResult::GetWithVersion(value)) => {
+                stats.record_read(elapsed, value.is_some());
+            }
+            (Operation::GetAll(keys), OperationResult::GetAll(found)) => {
+                // Counted per requested key, not per unique key found:
+                // `found.len()` alone undercounts hits (and so
+                // overcounts misses) whenever `keys` repeats a key
+                // that was actually found, since a `HashMap` can only
+                // ever report it once.
+                let hits = keys.iter().filter(|key| found.contains_key(*key)).count() as u64;
+                let misses = keys.len() as u64 - hits;
+                stats.record_bulk_read(elapsed, hits, misses);
+            }
+            (
+                Operation::Put(..)
+                | Operation::PutIfAbsent(..)
+                | Operation::Replace(..)
+                | Operation::ReplaceIfUnmodified(..)
+                | Operation::PutAll(..),
+                _,
+            ) => stats.record_store(elapsed),
+            (Operation::Remove(_) | Operation::RemoveIfUnmodified(..), _) => {
+                stats.record_remove(elapsed);
+            }
+            _ => {}
+        }
     }
 
     fn active_seed_addr(&self) -> std::net::SocketAddr {
@@ -636,7 +712,7 @@ pub(crate) mod tests {
     use crate::client::{AuthMethod, ClientInner, ClusterTopology, HotRodClient};
     use crate::topology::TopologyServer;
     use crate::varint::{read_vint, write_vint};
-    use crate::wire::read_array;
+    use crate::wire::{read_array, write_array};
 
     /// Builds a client with a fixed seed list and active seed, bypassing
     /// `connect`: several tests need `seed_addrs` to include an address
@@ -659,6 +735,7 @@ pub(crate) mod tests {
             auth: RwLock::new(None),
             tls: None,
             timeout: RwLock::new(timeout),
+            cache_stats: RwLock::new(StdHashMap::new()),
         })
     }
 
@@ -1111,6 +1188,255 @@ pub(crate) mod tests {
             )
             .await
             .expect("put_all");
+
+        seed_task.await.unwrap();
+    }
+
+    /// Covers `docs/adr/0010-client-statistics-and-tracing.md`'s
+    /// instrumented set end to end: a hit and a miss (`get`), a store
+    /// (`put`), a remove (`remove`), and a bulk read with one hit and
+    /// one miss (`get_all`), checked against `statistics()`'s final
+    /// snapshot. No topology is set, so every call routes straight to
+    /// the seed, the same simplification
+    /// `contains_key_routes_to_the_computed_owner`'s sibling tests
+    /// already rely on elsewhere in this file.
+    #[tokio::test]
+    async fn statistics_records_hits_misses_stores_and_removes() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request (hit)");
+            let _key = read_array(&mut stream).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, b"value");
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request (miss)");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x01, "expected a Put request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let _time_units = stream.read_u8().await.unwrap();
+            let _value = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x02, 0x00);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x0B, "expected a Remove request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x0C, 0x00);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2F, "expected a GetAll request");
+            let count = read_vint(&mut stream).await.unwrap();
+            for _ in 0..count {
+                read_array(&mut stream).await.unwrap();
+            }
+            let mut resp = response_header(id, 0x30, 0x00);
+            write_vint(&mut resp, 1); // one entry found
+            write_array(&mut resp, b"found-key");
+            write_array(&mut resp, b"found-value");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+
+        assert_eq!(
+            cache.get(b"hit-key").await.expect("get"),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(cache.get(b"miss-key").await.expect("get"), None);
+        cache
+            .put(b"key", b"value", Expiration::Default, Expiration::Default)
+            .await
+            .expect("put");
+        cache.remove(b"key").await.expect("remove");
+        cache
+            .get_all([b"found-key".as_slice(), b"missing-key".as_slice()])
+            .await
+            .expect("get_all");
+
+        let stats = cache.statistics();
+        assert_eq!(stats.remote_hits, 2, "one from get, one from get_all");
+        assert_eq!(stats.remote_misses, 2, "one from get, one from get_all");
+        assert_eq!(stats.remote_stores, 1);
+        assert_eq!(stats.remote_removes, 1);
+
+        seed_task.await.unwrap();
+    }
+
+    /// Regression test for a review finding: `get_all` must count hits
+    /// and misses per *requested* key, not per unique key the server
+    /// found. Requesting the same existing key twice must record two
+    /// hits, not one hit and one miss, which `found.len()` alone would
+    /// have given (a `HashMap` only ever reports a key once).
+    #[tokio::test]
+    async fn statistics_counts_get_all_hits_per_requested_key_not_per_unique_key_found() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2F, "expected a GetAll request");
+            let count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(count, 2, "the duplicate key must still be sent twice");
+            for _ in 0..count {
+                read_array(&mut stream).await.unwrap();
+            }
+            let mut resp = response_header(id, 0x30, 0x00);
+            write_vint(&mut resp, 1); // one unique entry found
+            write_array(&mut resp, b"dup-key");
+            write_array(&mut resp, b"value");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+
+        cache
+            .get_all([b"dup-key".as_slice(), b"dup-key".as_slice()])
+            .await
+            .expect("get_all");
+
+        let stats = cache.statistics();
+        assert_eq!(
+            stats.remote_hits, 2,
+            "both requests for the found key must count"
+        );
+        assert_eq!(stats.remote_misses, 0);
+
+        seed_task.await.unwrap();
+    }
+
+    /// `contains_key`/`ping`/`size`/`clear`/`stats` are explicitly not
+    /// instrumented by the Java client either (see the ADR); confirms
+    /// this client matches that exactly instead of silently
+    /// instrumenting more than intended.
+    #[tokio::test]
+    async fn statistics_does_not_record_uninstrumented_operations() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x0F, "expected a ContainsKey request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x10, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x17, "expected a Ping request");
+            let mut resp = response_header(id, 0x18, 0x00);
+            resp.push(0);
+            resp.push(0);
+            resp.push(41);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x29, "expected a Size request");
+            let mut resp = response_header(id, 0x2A, 0x00);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x13, "expected a Clear request");
+            let resp = response_header(id, 0x14, 0x00);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x15, "expected a Stats request");
+            let mut resp = response_header(id, 0x16, 0x00);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+
+        cache.contains_key(b"key").await.expect("contains_key");
+        cache.ping().await.expect("ping");
+        cache.size().await.expect("size");
+        cache.clear().await.expect("clear");
+        cache.stats().await.expect("stats");
+
+        // Every counter must still be zero; `time_since_reset` is not
+        // compared against `ClientStatistics::default()` here, since
+        // it legitimately ticks up from this cache's first access
+        // onward, reset or not.
+        let stats = cache.statistics();
+        assert_eq!(stats.remote_hits, 0);
+        assert_eq!(stats.remote_misses, 0);
+        assert_eq!(stats.average_remote_read_time, Duration::ZERO);
+        assert_eq!(stats.remote_stores, 0);
+        assert_eq!(stats.average_remote_store_time, Duration::ZERO);
+        assert_eq!(stats.remote_removes, 0);
+        assert_eq!(stats.average_remote_remove_time, Duration::ZERO);
+
+        seed_task.await.unwrap();
+    }
+
+    /// A failed operation (a timeout here) must not be counted: it
+    /// measures the cost of an operation that worked, not one that
+    /// failed trying.
+    #[tokio::test]
+    async fn statistics_does_not_record_a_failed_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = client_with_seeds_and_timeout(vec![addr], addr, Duration::from_millis(100));
+        let cache = client.cache("my-cache");
+
+        let result = cache.get(b"key").await;
+        assert!(matches!(result, Err(Error::Timeout(_))));
+
+        let stats = cache.statistics();
+        assert_eq!(stats.remote_hits, 0);
+        assert_eq!(stats.remote_misses, 0);
+        assert_eq!(stats.average_remote_read_time, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn reset_statistics_zeroes_counts() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+        cache.get(b"key").await.expect("get");
+        assert_eq!(cache.statistics().remote_misses, 1);
+
+        cache.reset_statistics();
+        let stats = cache.statistics();
+        assert_eq!(stats.remote_misses, 0);
+        assert_eq!(stats.remote_hits, 0);
+        assert!(
+            stats.time_since_reset < Duration::from_secs(1),
+            "reset_statistics should have restarted the clock just now"
+        );
 
         seed_task.await.unwrap();
     }

@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 use crate::error::Result;
 use crate::listener::{CacheEvent, CacheEventInterests, ListenOptions};
 use crate::remote_cache::RemoteCache;
+use crate::stats::{NearCacheStatistics, NearCacheStatisticsInner};
 use crate::wire::Expiration;
 
 /// Options for `RemoteCache::near_cache`, kept as its own type so a
@@ -151,6 +152,12 @@ impl LruStore {
         self.order.clear();
     }
 
+    /// How many entries are cached locally right now: `NearCachedCache::
+    /// statistics`'s live `size` field.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// `insert_if_current` unconditionally, for tests that do not care
     /// about the generation check itself.
     #[cfg(test)]
@@ -167,6 +174,14 @@ impl LruStore {
 struct NearCacheState {
     alive: AtomicBool,
     store: Mutex<LruStore>,
+    /// Hits/misses are recorded by `NearCachedCache::get` directly
+    /// (the decision of which one happened is specific to that
+    /// method); `invalidate`/`clear` below record an invalidation
+    /// themselves, so every call site (the background listener task,
+    /// `put`/`remove`'s immediate local invalidation, `clear`, and the
+    /// `mark_dead` fail-safe) is covered without having to remember to
+    /// do it separately. See `docs/adr/0010-client-statistics-and-tracing.md`.
+    stats: NearCacheStatisticsInner,
 }
 
 impl NearCacheState {
@@ -174,6 +189,7 @@ impl NearCacheState {
         Self {
             alive: AtomicBool::new(true),
             store: Mutex::new(LruStore::new(max_entries)),
+            stats: NearCacheStatisticsInner::default(),
         }
     }
 
@@ -216,10 +232,28 @@ impl NearCacheState {
 
     fn invalidate(&self, key: &[u8]) {
         self.lock().invalidate(key);
+        self.stats.record_invalidation();
     }
 
     fn clear(&self) {
         self.lock().clear();
+        self.stats.record_invalidation();
+    }
+
+    fn record_hit(&self) {
+        self.stats.record_hit();
+    }
+
+    fn record_miss(&self) {
+        self.stats.record_miss();
+    }
+
+    fn statistics(&self) -> NearCacheStatistics {
+        self.stats.snapshot(self.lock().len())
+    }
+
+    fn reset_statistics(&self) {
+        self.stats.reset();
     }
 
     /// The invalidation feed is gone for good (no reconnection, see the
@@ -374,12 +408,16 @@ impl NearCachedCache {
         // turn for what is logically one critical section.
         let generation = if self.state.is_alive() {
             match self.state.get_or_generation(key) {
-                Ok(value) => return Ok(Some(value)),
+                Ok(value) => {
+                    self.state.record_hit();
+                    return Ok(Some(value));
+                }
                 Err(generation) => Some(generation),
             }
         } else {
             None
         };
+        self.state.record_miss();
         let value = self.cache.get(key).await?;
         if let (Some(generation), Some(value)) = (generation, value.as_ref()) {
             self.state
@@ -451,6 +489,27 @@ impl NearCachedCache {
     pub async fn clear(&self) -> Result<()> {
         self.invalidate_after(self.cache.clear(), |state| state.clear())
             .await
+    }
+
+    /// This near cache's own hit/miss/invalidation counts and current
+    /// local size. Named `near_cache_statistics`, not `statistics`,
+    /// deliberately: `Deref` already reaches the wrapped
+    /// `RemoteCache`'s own `statistics()`, and an inherent method of
+    /// the same name here would shadow it instead of calling through,
+    /// making that one unreachable by dot syntax. See
+    /// `docs/adr/0010-client-statistics-and-tracing.md` for why near-cache
+    /// statistics live in their own snapshot rather than folded into
+    /// that same one, the way the Java client's single
+    /// `clientStatistics()` bean does.
+    pub fn near_cache_statistics(&self) -> NearCacheStatistics {
+        self.state.statistics()
+    }
+
+    /// Zeroes this near cache's hit/miss/invalidation counts (not its
+    /// contents: `size` is read live, so `clear()` is what empties it)
+    /// and restarts the clock `time_since_reset` measures from.
+    pub fn reset_near_cache_statistics(&self) {
+        self.state.reset_statistics();
     }
 }
 
@@ -703,6 +762,42 @@ mod tests {
             drop(server.await.unwrap());
         }
 
+        /// `docs/adr/0010-client-statistics-and-tracing.md` (#54): a
+        /// miss (the first `get`, which falls through to the network)
+        /// and a hit (the second, served locally) must show up in
+        /// `near_cache_statistics()`, along with the live `size`.
+        #[tokio::test]
+        async fn near_cache_statistics_tracks_hits_misses_and_live_size() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
+
+                listen_sock
+            });
+
+            let client = client_with_seed(addr);
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            let stats = near.near_cache_statistics();
+            assert_eq!(stats.misses, 1);
+            assert_eq!(stats.hits, 1);
+            assert_eq!(stats.size, 1);
+
+            drop(server.await.unwrap());
+        }
+
         #[tokio::test]
         async fn a_modified_event_invalidates_the_cached_entry() {
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -737,6 +832,11 @@ mod tests {
 
             let after_invalidation = poll_until(&near, b"key", b"value-2").await;
             assert_eq!(after_invalidation, b"value-2");
+
+            assert!(
+                near.near_cache_statistics().invalidations >= 1,
+                "the Modified event must have recorded at least one invalidation"
+            );
 
             drop(server.await.unwrap());
         }

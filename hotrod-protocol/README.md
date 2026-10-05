@@ -32,7 +32,8 @@ for release notes.
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
-| Stats and telemetry (metrics, tracing) | Yes | No |
+| Client statistics | Yes | Yes |
+| Tracing | Yes | No |
 | Remote administration | Yes | No |
 | Multi-cluster failover | Yes | No |
 
@@ -126,6 +127,22 @@ segment:
 let mut entries = cache.iter().await?;
 while let Some(entry) = entries.next_entry().await? {
     process(entry.key, entry.value);
+}
+```
+
+`statistics`/`reset_statistics` report hit/miss counts and average
+read/store/remove time for a `RemoteCache`, always collected (no
+configuration flag needed); `near_cache_statistics` reports the same
+idea for a near cache's own hit/miss/invalidation counts and current
+local size. `pool_statistics` reports idle and checked-out connection
+counts per node, with no Java client equivalent:
+
+```rust
+let stats = cache.statistics();
+println!("{} hits, {} misses", stats.remote_hits, stats.remote_misses);
+
+for pool in client.pool_statistics() {
+    println!("{}: {} idle, {} checked out", pool.address, pool.idle_connections, pool.checked_out_connections);
 }
 ```
 

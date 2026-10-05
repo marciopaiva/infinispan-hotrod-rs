@@ -52,6 +52,7 @@ use crate::error::{Error, Result};
 use crate::hash;
 use crate::pool::{Checkout, ConnectionPool, PooledGuard};
 use crate::remote_cache::RemoteCache;
+use crate::stats::{CacheStatisticsInner, PoolStatistics};
 use crate::tls::TlsConfig;
 use crate::topology::TopologyServer;
 
@@ -170,6 +171,12 @@ pub(crate) struct ClientInner {
     /// ADR 0004.
     pub(crate) tls: Option<TlsConfig>,
     pub(crate) timeout: RwLock<Duration>,
+    /// One statistics counter set per cache name this client has
+    /// dispatched an operation for, or had `RemoteCache::statistics`
+    /// called on. See `docs/adr/0010-client-statistics-and-tracing.md`:
+    /// scoped by cache name, the same way `pools` is, not aggregated
+    /// across the whole client.
+    pub(crate) cache_stats: RwLock<HashMap<String, Arc<CacheStatisticsInner>>>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation
@@ -330,6 +337,7 @@ impl HotRodClient {
                         auth: RwLock::new(None),
                         tls,
                         timeout: RwLock::new(timeout),
+                        cache_stats: RwLock::new(HashMap::new()),
                     })));
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -596,23 +604,41 @@ impl HotRodClient {
     }
 
     fn pool_for(&self, addr: SocketAddr, cache_name: &str) -> Arc<ConnectionPool> {
-        let key = (addr, cache_name.to_string());
-        if let Some(pool) = self
-            .0
+        get_or_insert_with(&self.0.pools, (addr, cache_name.to_string()), || {
+            Arc::new(ConnectionPool::new(DEFAULT_MAX_CONNECTIONS_PER_NODE))
+        })
+    }
+
+    /// The statistics counters for `cache_name`, created the first
+    /// time this cache name is seen, by an operation or by
+    /// `RemoteCache::statistics` itself. Same lazy-insert shape as
+    /// `pool_for`, sharing `get_or_insert_with` with it rather than
+    /// repeating the double-checked-locking pattern a second time.
+    pub(crate) fn stats_for(&self, cache_name: &str) -> Arc<CacheStatisticsInner> {
+        get_or_insert_with(&self.0.cache_stats, cache_name.to_string(), Arc::default)
+    }
+
+    /// A snapshot of every connection pool this client currently has,
+    /// one entry per `(node, cache name)` pair it has talked to. See
+    /// `docs/adr/0010-client-statistics-and-tracing.md`: this crate's
+    /// own addition, with no Java client counterpart.
+    pub fn pool_statistics(&self) -> Vec<PoolStatistics> {
+        self.0
             .pools
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&key)
-        {
-            return pool.clone();
-        }
-        self.0
-            .pools
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(key)
-            .or_insert_with(|| Arc::new(ConnectionPool::new(DEFAULT_MAX_CONNECTIONS_PER_NODE)))
-            .clone()
+            .iter()
+            .map(|((addr, cache_name), pool)| {
+                let counts = pool.slot_counts();
+                PoolStatistics {
+                    address: *addr,
+                    cache_name: cache_name.clone(),
+                    idle_connections: counts.idle,
+                    checked_out_connections: counts.checked_out,
+                    max_connections: pool.max_size(),
+                }
+            })
+            .collect()
     }
 
     /// Checks out a connection to `addr` for `cache_name`, opening and
@@ -877,6 +903,26 @@ async fn resolve_cached_addr(topology: &ClusterTopology, primary: u32) -> Result
         .unwrap_or_else(|p| p.into_inner())
         .insert(primary, addr);
     Ok(addr)
+}
+
+/// `map`'s value for `key`, inserting `make()`'s result first if
+/// none exists yet. A read lock is tried first, so the common case
+/// (the key already exists) never takes the write lock at all.
+/// Shared by `pool_for` and `stats_for`, the only two places this
+/// client lazily creates a keyed, `Arc`-shared value this way.
+fn get_or_insert_with<K, V>(map: &RwLock<HashMap<K, V>>, key: K, make: impl FnOnce() -> V) -> V
+where
+    K: std::hash::Hash + Eq,
+    V: Clone,
+{
+    if let Some(value) = map.read().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return value.clone();
+    }
+    map.write()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key)
+        .or_insert_with(make)
+        .clone()
 }
 
 #[cfg(test)]
@@ -1205,6 +1251,7 @@ pub(crate) mod tests {
             auth: RwLock::new(None),
             tls: None,
             timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
         });
 
         client
@@ -1281,6 +1328,7 @@ pub(crate) mod tests {
             auth: RwLock::new(None),
             tls: None,
             timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
         });
 
         client
@@ -1327,6 +1375,7 @@ pub(crate) mod tests {
             auth: RwLock::new(None),
             tls: None,
             timeout: RwLock::new(Duration::from_millis(200)),
+            cache_stats: RwLock::new(HashMap::new()),
         });
 
         // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed
@@ -1339,6 +1388,39 @@ pub(crate) mod tests {
                 "attempt {attempt} should fail fast with Io, not hang into Timeout"
             );
         }
+    }
+
+    /// `pool_statistics` (#54) has no Java equivalent; this is this
+    /// crate's own test of it, not a parity check: one pool, one
+    /// connection checked out and never returned, confirming the
+    /// idle/checked-out split and the address/cache-name labeling.
+    #[tokio::test]
+    async fn pool_statistics_reflects_idle_and_checked_out_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = HotRodClient::connect(&[addr])
+            .await
+            .expect("connect to seed");
+        let guard = client
+            .checkout(addr, "my-cache", None)
+            .await
+            .expect("checkout");
+
+        let stats = client.pool_statistics();
+        assert_eq!(stats.len(), 1);
+        let pool = &stats[0];
+        assert_eq!(pool.address, addr);
+        assert_eq!(pool.cache_name, "my-cache");
+        assert_eq!(pool.checked_out_connections, 1);
+        assert_eq!(pool.idle_connections, 0);
+        assert!(pool.max_connections >= 1);
+
+        drop(guard);
     }
 
     /// Reads one request's fixed header fields far enough to identify the

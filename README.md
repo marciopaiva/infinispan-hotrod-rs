@@ -30,7 +30,8 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Remote task execution | Yes | No ([#51](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/51)) |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
-| Stats and telemetry (metrics, tracing) | Yes | No ([#54](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/54)) |
+| Client statistics | Yes | Yes |
+| Tracing | Yes | No ([#54](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/54)) |
 | Remote administration | Yes | No ([#55](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/55)) |
 | Multi-cluster failover | Yes | No ([#56](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/56)) |
 
