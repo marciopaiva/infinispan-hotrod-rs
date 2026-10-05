@@ -9,6 +9,7 @@ readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time", "sync"] }
+tracing = "0.1"
 thiserror = "2"
 sha2 = "0.10"
 hmac = "0.12"

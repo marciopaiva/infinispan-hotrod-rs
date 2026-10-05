@@ -30,8 +30,10 @@ pooling and concurrent dispatch followed
 (`docs/adr/0005-connection-pooling-and-client-cache-split.md`, #77), then
 client listeners (`docs/adr/0006-client-listeners.md`, #4) and near
 caching (`docs/adr/0007-near-caching.md`, #5), released together as
-v0.5.0. Streaming (`docs/adr/0008-streaming.md`, #52) and server-side
-iteration (`docs/adr/0009-server-side-iteration.md`, #53) are done too,
+v0.5.0. Streaming (`docs/adr/0008-streaming.md`, #52), server-side
+iteration (`docs/adr/0009-server-side-iteration.md`, #53) and client
+statistics and tracing
+(`docs/adr/0010-client-statistics-and-tracing.md`, #54) are done too,
 unreleased. Typed serialization and the PHP bridge are still open.
 
 ## The structural change that gated the rest (done, #77)
@@ -66,12 +68,13 @@ land before those features, not alongside the last one that ran into it.
 
 ## Themes
 
-Six P0/P1 items are done: pooling (#77), the multi-node CI fixture
-(#78), client listeners (#4), near caching (#5), streaming (#52) and
-server-side iteration (#53). What is left groups into four themes,
-each independent of the others, so any of them can go next in whatever
-order is actually needed. Within a theme, order matters more, since
-later items there tend to build on earlier ones.
+Seven P0/P1 items are done: pooling (#77), the multi-node CI fixture
+(#78), client listeners (#4), near caching (#5), streaming (#52),
+server-side iteration (#53) and client statistics and tracing (#54).
+What is left groups into four themes, each independent of the others,
+so any of them can go next in whatever order is actually needed.
+Within a theme, order matters more, since later items there tend to
+build on earlier ones.
 
 ### Large data access
 
@@ -92,17 +95,18 @@ Both items in this theme are done.
 
 ### Reliability and observability
 
+Both halves of #54 are done.
+
 * ~~Client statistics (#54, part 1 of 2)~~ (done). `RemoteCache::
   statistics`/`reset_statistics`, `NearCachedCache::
   near_cache_statistics`, `HotRodClient::pool_statistics`; see
   `docs/adr/0010-client-statistics-and-tracing.md`.
-* **Tracing (#54, part 2 of 2), the remaining half of this issue.**
-  Local spans/events via the `tracing` crate around the same
-  dispatch point the statistics above instrument, per the same ADR.
-  Deliberately not cross-process trace propagation to the server
-  (what the Java client itself calls "telemetry"): that is a bigger,
-  separate feature, left for its own proposal if it turns out to
-  matter.
+* ~~Tracing (#54, part 2 of 2)~~ (done). A `tracing` span per
+  dispatched operation, at the same point the statistics above are
+  recorded, per the same ADR. Deliberately not cross-process trace
+  propagation to the server (what the Java client itself calls
+  "telemetry"): that is a bigger, separate feature, left for its own
+  proposal if it turns out to matter.
 * Retry policy, node health tracking and circuit breaking are natural
   extensions of this theme (an operation-aware retry policy in
   particular, since blindly retrying `put`/`replace`/the versioned

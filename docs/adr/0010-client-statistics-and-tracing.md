@@ -122,12 +122,22 @@ per-cache `ClientStatistics` because the granularity differs (per
 ## Consequences
 
 * New public API: `RemoteCache::statistics`/`reset_statistics`
-  (`ClientStatistics`), `NearCachedCache::statistics`/
-  `reset_statistics` (`NearCacheStatistics`), `HotRodClient::
-  pool_statistics` (`Vec<PoolStatistics>`). Additive: nothing
-  existing changes shape.
+  (`ClientStatistics`), `HotRodClient::pool_statistics`
+  (`Vec<PoolStatistics>`). Additive: nothing existing changes shape.
+* `NearCachedCache::near_cache_statistics`/
+  `reset_near_cache_statistics` (`NearCacheStatistics`), named that
+  way rather than `statistics`/`reset_statistics`: `NearCachedCache`
+  already `Deref`s to the wrapped `RemoteCache`, so an inherent
+  method of the same name here would shadow that `Deref` path instead
+  of calling through it, making the plain cache's own `statistics()`
+  unreachable by dot syntax through a `NearCachedCache`.
 * New dependency: `tracing`. No new dependency for statistics itself
-  (`std::sync::atomic` and `std::time::Instant` suffice).
+  (`std::sync::atomic` and `std::time::Instant` suffice). One span
+  (`#[tracing::instrument]`, named `hotrod_operation`) per dispatch,
+  at the exact point statistics are also recorded
+  (`RemoteCache::run_and_record`), carrying the cache name, the
+  operation's name and its duration, with an error event on failure;
+  never the key or value either carries.
 * `pool.rs`'s `ConnectionPool` gains a stored `max_size` field (today
   only passed through to the semaphore and the initial vec, never
   kept) so `pool_statistics` has something to subtract the live idle
@@ -135,4 +145,5 @@ per-cache `ClientStatistics` because the granularity differs (per
 * Not implemented, left for a later, independent, additive change if
   it turns out to matter: cross-process trace-context propagation to
   the server (what the Java client actually calls "telemetry"),
-  statistics for streaming (#52) and server-side iteration (#53).
+  statistics or tracing for streaming (#52) and server-side iteration
+  (#53).

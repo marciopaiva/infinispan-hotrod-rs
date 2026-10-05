@@ -49,6 +49,33 @@ enum Operation {
     PutAll(Vec<(Vec<u8>, Vec<u8>)>, Expiration, Expiration),
 }
 
+impl Operation {
+    /// This operation's name for the tracing span `run_and_record`
+    /// opens around every dispatch (`docs/adr/0010-client-statistics-and-tracing.md`,
+    /// part 2): every variant gets one, unlike `record_stats`'s
+    /// classification, which deliberately leaves some out to match
+    /// the Java client's narrower instrumented set.
+    fn label(&self) -> &'static str {
+        match self {
+            Operation::Get(_) => "get",
+            Operation::Put(..) => "put",
+            Operation::PutIfAbsent(..) => "put_if_absent",
+            Operation::Replace(..) => "replace",
+            Operation::Remove(_) => "remove",
+            Operation::GetWithVersion(_) => "get_with_version",
+            Operation::ReplaceIfUnmodified(..) => "replace_if_unmodified",
+            Operation::RemoveIfUnmodified(..) => "remove_if_unmodified",
+            Operation::ContainsKey(_) => "contains_key",
+            Operation::Ping => "ping",
+            Operation::Size => "size",
+            Operation::Clear => "clear",
+            Operation::Stats => "stats",
+            Operation::GetAll(_) => "get_all",
+            Operation::PutAll(..) => "put_all",
+        }
+    }
+}
+
 enum OperationResult {
     Get(Option<Vec<u8>>),
     Put,
@@ -626,21 +653,36 @@ impl RemoteCache {
         })
     }
 
-    /// Runs `op` and, only if it succeeds, records its timing into
-    /// this cache's statistics (`docs/adr/0010-client-statistics-and-tracing.md`):
-    /// a failed attempt (timed out, I/O error, retried) measures
-    /// nothing, since what matters here is the cost of an operation
-    /// that actually worked. The one place every one of `call`'s four
-    /// dispatch paths routes `op` through a connection, so this is
-    /// also the one place that needs to record statistics, rather
-    /// than each of the four repeating it.
+    /// Runs `op`, wrapped in one `tracing` span covering every
+    /// dispatch (`docs/adr/0010-client-statistics-and-tracing.md`,
+    /// part 2): `cache`/`op`/`duration_us` fields, an error event via
+    /// `err` on failure, but never the key or value `op`/`conn`
+    /// themselves carry, which is exactly why those two arguments are
+    /// skipped rather than auto-captured. Separately, only if `op`
+    /// succeeds, records its timing into this cache's statistics
+    /// (part 1): a failed attempt (timed out, I/O error, retried)
+    /// measures nothing there, since what matters to the counters is
+    /// the cost of an operation that actually worked; the span's own
+    /// `duration_us` is recorded either way. The one place every one
+    /// of `call`'s four dispatch paths routes `op` through a
+    /// connection, so this is also the one place that needs either
+    /// kind of instrumentation, rather than each of the four
+    /// repeating it.
+    #[tracing::instrument(
+        name = "hotrod_operation",
+        skip(self, conn, op),
+        fields(cache = %self.cache_name, op = op.label(), duration_us = tracing::field::Empty),
+        err
+    )]
     async fn run_and_record(
         &self,
         conn: &mut HotRodConnection,
         op: &Operation,
     ) -> Result<OperationResult> {
         let start = Instant::now();
-        let result = run_operation(conn, op).await?;
+        let outcome = run_operation(conn, op).await;
+        tracing::Span::current().record("duration_us", start.elapsed().as_micros() as u64);
+        let result = outcome?;
         self.record_stats(op, start.elapsed(), &result);
         Ok(result)
     }
@@ -699,7 +741,7 @@ pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::net::SocketAddr;
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1439,5 +1481,197 @@ pub(crate) mod tests {
         );
 
         seed_task.await.unwrap();
+    }
+
+    /// A permanently-`enabled()`, otherwise no-op subscriber, and the
+    /// machinery (`ensure_global_tracing_default`, right below) that
+    /// installs it as tracing's *global* default exactly once, before
+    /// either test below installs its own thread-local one.
+    ///
+    /// `tracing`'s per-callsite interest cache is global for the
+    /// whole test binary, not scoped to a subscriber or a thread:
+    /// without this, whichever test anywhere in this binary (tracing-
+    /// aware or not, since dozens of other tests in this very module
+    /// call `cache.get()`/`put()`/... with no subscriber installed at
+    /// all) happens to be the first, on whatever thread, to touch the
+    /// `hotrod_operation` callsite decides, for the rest of the
+    /// process, whether that callsite is ever dispatched to any
+    /// subscriber again at all, including a `set_default` override a
+    /// later test installs on its own thread: once cached `never()`,
+    /// a thread-local override does not get consulted at all, which
+    /// is exactly the flake a version of this test without this fix
+    /// hit under the test harness's default parallel execution. A
+    /// global default that is always `enabled()` keeps that cached
+    /// interest at `sometimes()` instead, so each later occurrence
+    /// still asks `Dispatch::current()` fresh, which a `set_default`
+    /// guard correctly overrides on its own thread regardless of what
+    /// any other concurrent thread is doing.
+    struct AlwaysEnabledSubscriber;
+
+    impl tracing::Subscriber for AlwaysEnabledSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    static GLOBAL_TRACING_DEFAULT_INIT: std::sync::Once = std::sync::Once::new();
+
+    /// Installs `AlwaysEnabledSubscriber` as the global default
+    /// exactly once (every call after the first is a no-op: a global
+    /// default can only ever be set once), then rebuilds the interest
+    /// cache every time this runs, not just on the first call: a
+    /// callsite registered for the first time by some concurrent
+    /// test, in the narrow window before this function's first caller
+    /// finishes installing the global default, needs its own rebuild
+    /// pass after that default is in place to be pulled out of a
+    /// `never()` it might have raced into. Call this before
+    /// installing a thread-local `set_default` override, in every
+    /// test that asserts on captured spans/events.
+    fn ensure_global_tracing_default() {
+        GLOBAL_TRACING_DEFAULT_INIT.call_once(|| {
+            // Already-set is fine (e.g. a future caller after some
+            // other mechanism won the race to set a global default):
+            // this function's whole point is achieved either way, an
+            // always-enabled global default now exists.
+            let _ = tracing::subscriber::set_global_default(AlwaysEnabledSubscriber);
+        });
+        tracing::callsite::rebuild_interest_cache();
+    }
+
+    /// A minimal `tracing::Subscriber` that just records, for every
+    /// span opened, its name and the names of the fields it declared
+    /// (not their values: `Attributes` exposes those lazily through a
+    /// visitor this test has no need to implement, since confirming
+    /// which fields exist is already enough to prove `skip(..)` left
+    /// `key`/`value`/`conn`/`op` itself out), and the name of every
+    /// event recorded. No extra dependency: everything here comes
+    /// from the `tracing` crate this PR already added, not a test-only
+    /// mocking crate.
+    #[derive(Default)]
+    struct RecordingSubscriber {
+        spans: Mutex<Vec<(&'static str, Vec<&'static str>)>>,
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    impl tracing::Subscriber for RecordingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let fields = attrs.metadata().fields().iter().map(|f| f.name()).collect();
+            self.spans
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((attrs.metadata().name(), fields));
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(event.metadata().name());
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Covers `docs/adr/0010-client-statistics-and-tracing.md`'s part
+    /// 2: a dispatched operation must open exactly one
+    /// `hotrod_operation` span carrying `cache`/`op`/`duration_us`,
+    /// and critically must never carry a field named `key`, `value`,
+    /// `conn`, `op` (the argument, as opposed to the `op` field
+    /// explicitly set from `op.label()`) or `self`: proof that
+    /// `#[tracing::instrument(skip(self, conn, op), ...)]` is doing
+    /// its job of keeping raw request/response bytes out of the span
+    /// instead of relying on every future edit to remember it by hand.
+    #[tokio::test]
+    async fn run_and_record_opens_a_span_naming_the_operation_without_key_or_value_fields() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, b"value");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        ensure_global_tracing_default();
+        let subscriber = Arc::new(RecordingSubscriber::default());
+        let _default_guard = tracing::subscriber::set_default(subscriber.clone());
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+        cache.get(b"super-secret-key").await.expect("get");
+
+        {
+            let spans = subscriber.spans.lock().unwrap();
+            assert_eq!(spans.len(), 1, "exactly one span per dispatched operation");
+            let (name, fields) = &spans[0];
+            assert_eq!(*name, "hotrod_operation");
+            assert!(fields.contains(&"cache"));
+            assert!(fields.contains(&"op"));
+            assert!(fields.contains(&"duration_us"));
+            for forbidden in ["key", "value", "conn", "self"] {
+                assert!(
+                    !fields.contains(&forbidden),
+                    "span fields {fields:?} must never include {forbidden:?}"
+                );
+            }
+        }
+
+        seed_task.await.unwrap();
+    }
+
+    /// Same span, but on a failed dispatch: `#[instrument(err)]` must
+    /// still emit an event (so a `tracing` subscriber sees the
+    /// failure), without this test needing to inspect the error's own
+    /// content.
+    #[tokio::test]
+    async fn run_and_record_emits_an_error_event_on_a_failed_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        ensure_global_tracing_default();
+        let subscriber = Arc::new(RecordingSubscriber::default());
+        let _default_guard = tracing::subscriber::set_default(subscriber.clone());
+
+        let client = client_with_seeds_and_timeout(vec![addr], addr, Duration::from_millis(100));
+        let cache = client.cache("my-cache");
+        let result = cache.get(b"key").await;
+        assert!(matches!(result, Err(Error::Timeout(_))));
+
+        assert!(
+            !subscriber.events.lock().unwrap().is_empty(),
+            "a failed operation must still emit an error event"
+        );
     }
 }
