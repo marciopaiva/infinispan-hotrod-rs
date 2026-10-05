@@ -114,11 +114,11 @@ Both halves of #54 are done.
   issue filed yet. Worth proposing once #54 gives a concrete picture of
   what is actually failing in practice, rather than designing retry
   behavior against a guess.
-* Fuzzing the wire parsers (`read_vint`, `read_vlong`, `read_array`,
-  `read_topology_update`, the SASL challenge parsers) was already
-  planned before this rewrite and still has no issue filed; it belongs
-  here, since a parser that survives a fuzzer is exactly the kind of
-  reliability this theme is about.
+* ~~Fuzzing the wire parsers~~ (done). `fuzz/` (`cargo-fuzz`, dev-only,
+  never part of the normal build or CI) covers `read_vint`/
+  `read_vlong`, `read_array`/`read_string`/`read_string_map`,
+  `read_topology_update`, `read_response_header`, and the SCRAM/DIGEST
+  challenge parsers; see `fuzz/README.md`.
 
 ### Typed data
 
