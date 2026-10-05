@@ -136,12 +136,45 @@ per-cache `ClientStatistics` because the granularity differs (per
   (`#[tracing::instrument]`, named `hotrod_operation`) per dispatch,
   at the exact point statistics are also recorded
   (`RemoteCache::run_and_record`), carrying the cache name, the
-  operation's name and its duration, with an error event on failure;
-  never the key or value either carries.
+  operation's name and its duration, with a `WARN`-level event on
+  failure (not the macro's own `ERROR` default: this span covers one
+  attempt, and `call`/`run_seed_op`/`failover_and_retry` retry an
+  `Error::Io`/`Error::Timeout` attempt before giving up, so `ERROR`
+  would fire just as loudly for a transient failure a retry then
+  recovers from); never the key or value either carries.
+* **A retried logical call opens more than one `hotrod_operation`
+  span, with no shared id linking them back together.** Each of
+  `call`'s four dispatch paths runs `run_and_record` independently;
+  a failed attempt against a computed owner followed by a successful
+  one against the seed is two spans, not one correlated pair.
+  Statistics (part 1) do not have this problem, since
+  `record_stats` only ever runs once, for whichever attempt
+  succeeds; code that aggregates spans instead (counting
+  `hotrod_operation` occurrences per `op`, or summing
+  `duration_us`) will overcount relative to the `ClientStatistics`
+  counters for exactly the calls that needed a retry. Accepted for
+  now: a correlation id would need a span wrapping `call` itself,
+  a bigger change than this phase takes on, and retries are the
+  uncommon path to begin with.
 * `pool.rs`'s `ConnectionPool` gains a stored `max_size` field (today
   only passed through to the semaphore and the initial vec, never
   kept) so `pool_statistics` has something to subtract the live idle
   count from.
+* **`tracing`'s per-callsite interest cache is global for the whole
+  process, not scoped to a subscriber or a thread**, which makes
+  testing captured span/event content under a parallel test harness
+  genuinely hazardous: whichever test anywhere in the binary (tracing-
+  aware or not) is first to touch a given instrumented call site, on
+  whatever thread, decides for the rest of the process whether that
+  call site is ever dispatched to any subscriber again, including a
+  `tracing::subscriber::set_default` override a later test installs
+  on its own thread. `remote_cache.rs`'s own tracing tests work around
+  this with a `std::sync::Once`-guarded, permanently-`enabled()`
+  global default plus one `tracing::callsite::rebuild_interest_cache()`
+  call (`ensure_global_tracing_default`); a future test exercising a
+  different instrumented call site, or an evaluation of `tracing-test`/
+  `tracing-mock` as a dev-dependency instead of this hand-rolled
+  workaround, needs the same treatment or the same hazard.
 * Not implemented, left for a later, independent, additive change if
   it turns out to matter: cross-process trace-context propagation to
   the server (what the Java client actually calls "telemetry"),

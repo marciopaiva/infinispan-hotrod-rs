@@ -655,10 +655,21 @@ impl RemoteCache {
 
     /// Runs `op`, wrapped in one `tracing` span covering every
     /// dispatch (`docs/adr/0010-client-statistics-and-tracing.md`,
-    /// part 2): `cache`/`op`/`duration_us` fields, an error event via
-    /// `err` on failure, but never the key or value `op`/`conn`
-    /// themselves carry, which is exactly why those two arguments are
-    /// skipped rather than auto-captured. Separately, only if `op`
+    /// part 2): `cache`/`op`/`duration_us` fields, a `WARN`-level
+    /// event via `err` on failure, but never the key or value `op`/
+    /// `conn` themselves carry, which is exactly why those two
+    /// arguments are skipped rather than auto-captured. `WARN`, not
+    /// the macro's own `ERROR` default: this span covers one attempt,
+    /// and `call`/`run_seed_op`/`failover_and_retry` retry an
+    /// `Error::Io`/`Error::Timeout` attempt against another node
+    /// before giving up, so a transient failure that a retry then
+    /// recovers from would otherwise emit the same severity an
+    /// operation that truly failed does, indistinguishable to an
+    /// observability pipeline that pages on `ERROR`. One retried
+    /// logical call still opens more than one span this way, with no
+    /// shared id linking them back together: see the ADR's
+    /// Consequences section for why that is an accepted limitation,
+    /// not something this phase fixes. Separately, only if `op`
     /// succeeds, records its timing into this cache's statistics
     /// (part 1): a failed attempt (timed out, I/O error, retried)
     /// measures nothing there, since what matters to the counters is
@@ -672,7 +683,7 @@ impl RemoteCache {
         name = "hotrod_operation",
         skip(self, conn, op),
         fields(cache = %self.cache_name, op = op.label(), duration_us = tracing::field::Empty),
-        err
+        err(level = "warn")
     )]
     async fn run_and_record(
         &self,
@@ -1580,13 +1591,17 @@ pub(crate) mod tests {
 
     /// Covers `docs/adr/0010-client-statistics-and-tracing.md`'s part
     /// 2: a dispatched operation must open exactly one
-    /// `hotrod_operation` span carrying `cache`/`op`/`duration_us`,
-    /// and critically must never carry a field named `key`, `value`,
-    /// `conn`, `op` (the argument, as opposed to the `op` field
-    /// explicitly set from `op.label()`) or `self`: proof that
+    /// `hotrod_operation` span, with exactly the field set
+    /// `cache`/`op`/`duration_us`, no more and no less. Checking the
+    /// full set rather than a blocklist of forbidden names is what
+    /// makes this a real proof that
     /// `#[tracing::instrument(skip(self, conn, op), ...)]` is doing
-    /// its job of keeping raw request/response bytes out of the span
-    /// instead of relying on every future edit to remember it by hand.
+    /// its job: `self`/`conn`/`op` are this function's only other
+    /// parameters, and `op` in particular carries the operation's raw
+    /// key and value bytes directly, so either one being
+    /// auto-captured instead of skipped would show up here as a
+    /// fourth field, caught regardless of what that field happened to
+    /// be named.
     #[tokio::test]
     async fn run_and_record_opens_a_span_naming_the_operation_without_key_or_value_fields() {
         let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1614,24 +1629,26 @@ pub(crate) mod tests {
             assert_eq!(spans.len(), 1, "exactly one span per dispatched operation");
             let (name, fields) = &spans[0];
             assert_eq!(*name, "hotrod_operation");
-            assert!(fields.contains(&"cache"));
-            assert!(fields.contains(&"op"));
-            assert!(fields.contains(&"duration_us"));
-            for forbidden in ["key", "value", "conn", "self"] {
-                assert!(
-                    !fields.contains(&forbidden),
-                    "span fields {fields:?} must never include {forbidden:?}"
-                );
-            }
+            // The exact field set, not just a blocklist: `run_and_record`'s
+            // only parameters are `self`, `conn` and `op`, so a field
+            // literally named "key" or "value" could never appear
+            // regardless of whether `skip(..)` is correct, and checking
+            // for their absence alone would prove nothing. Asserting the
+            // full set instead also catches `self`/`conn` ever being
+            // auto-captured, which `skip(..)` is what actually prevents.
+            let mut sorted_fields = fields.clone();
+            sorted_fields.sort_unstable();
+            assert_eq!(sorted_fields, ["cache", "duration_us", "op"]);
         }
 
         seed_task.await.unwrap();
     }
 
-    /// Same span, but on a failed dispatch: `#[instrument(err)]` must
-    /// still emit an event (so a `tracing` subscriber sees the
-    /// failure), without this test needing to inspect the error's own
-    /// content.
+    /// Same span, but on a failed dispatch: `#[instrument(err(level =
+    /// "warn"))]` must still emit an event (so a `tracing` subscriber
+    /// sees the failure, at `WARN` rather than the macro's `ERROR`
+    /// default), without this test needing to inspect the error's own
+    /// content or the event's level.
     #[tokio::test]
     async fn run_and_record_emits_an_error_event_on_a_failed_operation() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
