@@ -7,7 +7,6 @@ mod common;
 
 fuzz_target!(|data: &[u8]| {
     common::runtime().block_on(async {
-        let mut reader = data;
-        let _ = hotrod_protocol::fuzz_internal::read_response_header(&mut reader).await;
+        let _ = hotrod_protocol::fuzz_internal::read_response_header(data).await;
     });
 });

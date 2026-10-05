@@ -29,6 +29,20 @@ use crate::sasl::SaslMechanism;
 
 type HmacSha512 = Hmac<Sha512>;
 
+/// Safety ceiling on the server-first-message's `i=` iteration count,
+/// checked before it is ever passed to `pbkdf2_hmac`. Not a protocol
+/// limit: real servers use counts from the low thousands up to the
+/// few hundred thousand (NIST/OWASP guidance for PBKDF2). Without
+/// this, a malicious or compromised server naming
+/// `u32::MAX` here costs this client roughly four billion
+/// PBKDF2-HMAC-SHA512 rounds, a CPU-exhaustion denial of service
+/// during authentication, confirmed by a fuzz run against
+/// `fuzz_internal::scram_respond` (`fuzz/fuzz_targets/sasl_challenge.rs`)
+/// timing out on exactly this input. Same reasoning
+/// `topology.rs`'s `MAX_TOPOLOGY_COUNT` already uses for a hostile
+/// server-declared count elsewhere.
+const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
+
 pub(crate) struct ScramSha512Mechanism {
     password: String,
     client_nonce: String,
@@ -112,6 +126,13 @@ impl SaslMechanism for ScramSha512Mechanism {
                 "server-first-message iteration count is not a number".to_string(),
             )
         })?;
+        if iterations > MAX_SCRAM_ITERATIONS {
+            return Err(Error::DeclaredLengthTooLarge {
+                what: "a SCRAM-SHA-512 iteration count",
+                declared: iterations,
+                max: MAX_SCRAM_ITERATIONS,
+            });
+        }
 
         let mut salted_password = [0u8; 64];
         pbkdf2_hmac::<Sha512>(
@@ -236,6 +257,31 @@ mod tests {
         let challenge = b"r=not-the-client-nonce,s=c2FsdA==,i=4096";
         let err = mechanism.respond(Some(challenge)).unwrap_err();
         assert!(matches!(err, Error::MalformedChallenge(_)));
+    }
+
+    /// Regression test for a review finding (surfaced by fuzzing this
+    /// exact function via `fuzz_internal::scram_respond`): a
+    /// malicious or compromised server naming an absurd iteration
+    /// count must be rejected before it ever reaches `pbkdf2_hmac`,
+    /// not run for real.
+    #[test]
+    fn rejects_an_iteration_count_over_the_safety_limit() {
+        let mut mechanism = ScramSha512Mechanism::new("alice", "s3cr3t");
+        mechanism.respond(None).unwrap();
+        let challenge = format!(
+            "r={}fake-server-nonce,s=c2FsdA==,i={}",
+            mechanism.client_nonce,
+            MAX_SCRAM_ITERATIONS as u64 + 1
+        );
+        let err = mechanism.respond(Some(challenge.as_bytes())).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::DeclaredLengthTooLarge {
+                declared,
+                max: MAX_SCRAM_ITERATIONS,
+                ..
+            } if declared == MAX_SCRAM_ITERATIONS + 1
+        ));
     }
 
     /// Captured from a real WildFly Elytron 2.6.0.Final `SaslServer` and

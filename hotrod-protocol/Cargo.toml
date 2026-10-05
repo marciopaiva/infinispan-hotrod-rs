@@ -10,8 +10,12 @@ readme = "README.md"
 [features]
 # Exposes a handful of pub(crate) parsers through thin pub wrappers in
 # a #[doc(hidden)] module (see lib.rs's fuzz_internal), so fuzz/'s
-# targets can call into them without widening the real, default
-# public API. Nothing outside fuzz/ should ever enable this.
+# targets can call into them. Purely additive, the normal Cargo rule
+# for any feature: the module only exists when this is on, nothing
+# else in the crate is conditioned on it, so a default build (this
+# off, as CI's `--all-features` run never exercises) is unaffected by
+# construction, not by a check that specifically verifies it. Nothing
+# outside fuzz/ should ever enable this.
 fuzzing = []
 
 [dependencies]
