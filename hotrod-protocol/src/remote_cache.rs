@@ -681,9 +681,10 @@ impl RemoteCache {
     ) -> Result<OperationResult> {
         let start = Instant::now();
         let outcome = run_operation(conn, op).await;
-        tracing::Span::current().record("duration_us", start.elapsed().as_micros() as u64);
+        let elapsed = start.elapsed();
+        tracing::Span::current().record("duration_us", elapsed.as_micros() as u64);
         let result = outcome?;
-        self.record_stats(op, start.elapsed(), &result);
+        self.record_stats(op, elapsed, &result);
         Ok(result)
     }
 
@@ -1483,75 +1484,6 @@ pub(crate) mod tests {
         seed_task.await.unwrap();
     }
 
-    /// A permanently-`enabled()`, otherwise no-op subscriber, and the
-    /// machinery (`ensure_global_tracing_default`, right below) that
-    /// installs it as tracing's *global* default exactly once, before
-    /// either test below installs its own thread-local one.
-    ///
-    /// `tracing`'s per-callsite interest cache is global for the
-    /// whole test binary, not scoped to a subscriber or a thread:
-    /// without this, whichever test anywhere in this binary (tracing-
-    /// aware or not, since dozens of other tests in this very module
-    /// call `cache.get()`/`put()`/... with no subscriber installed at
-    /// all) happens to be the first, on whatever thread, to touch the
-    /// `hotrod_operation` callsite decides, for the rest of the
-    /// process, whether that callsite is ever dispatched to any
-    /// subscriber again at all, including a `set_default` override a
-    /// later test installs on its own thread: once cached `never()`,
-    /// a thread-local override does not get consulted at all, which
-    /// is exactly the flake a version of this test without this fix
-    /// hit under the test harness's default parallel execution. A
-    /// global default that is always `enabled()` keeps that cached
-    /// interest at `sometimes()` instead, so each later occurrence
-    /// still asks `Dispatch::current()` fresh, which a `set_default`
-    /// guard correctly overrides on its own thread regardless of what
-    /// any other concurrent thread is doing.
-    struct AlwaysEnabledSubscriber;
-
-    impl tracing::Subscriber for AlwaysEnabledSubscriber {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, _event: &tracing::Event<'_>) {}
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    static GLOBAL_TRACING_DEFAULT_INIT: std::sync::Once = std::sync::Once::new();
-
-    /// Installs `AlwaysEnabledSubscriber` as the global default
-    /// exactly once (every call after the first is a no-op: a global
-    /// default can only ever be set once), then rebuilds the interest
-    /// cache every time this runs, not just on the first call: a
-    /// callsite registered for the first time by some concurrent
-    /// test, in the narrow window before this function's first caller
-    /// finishes installing the global default, needs its own rebuild
-    /// pass after that default is in place to be pulled out of a
-    /// `never()` it might have raced into. Call this before
-    /// installing a thread-local `set_default` override, in every
-    /// test that asserts on captured spans/events.
-    fn ensure_global_tracing_default() {
-        GLOBAL_TRACING_DEFAULT_INIT.call_once(|| {
-            // Already-set is fine (e.g. a future caller after some
-            // other mechanism won the race to set a global default):
-            // this function's whole point is achieved either way, an
-            // always-enabled global default now exists.
-            let _ = tracing::subscriber::set_global_default(AlwaysEnabledSubscriber);
-        });
-        tracing::callsite::rebuild_interest_cache();
-    }
-
     /// A minimal `tracing::Subscriber` that just records, for every
     /// span opened, its name and the names of the fields it declared
     /// (not their values: `Attributes` exposes those lazily through a
@@ -1595,6 +1527,55 @@ pub(crate) mod tests {
         fn enter(&self, _span: &tracing::span::Id) {}
 
         fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    static GLOBAL_TRACING_DEFAULT_INIT: std::sync::Once = std::sync::Once::new();
+
+    /// Installs a permanently-`enabled()` `RecordingSubscriber` (its
+    /// own recorded spans/events are never read back; only its
+    /// `enabled() -> true` matters here, so there is no need for a
+    /// second, otherwise-identical subscriber type just for this) as
+    /// tracing's *global* default, then rebuilds the interest cache,
+    /// both exactly once for the whole test binary: every call after
+    /// the first is a complete no-op, `Once` guarantees that.
+    ///
+    /// `tracing`'s per-callsite interest cache is global for the
+    /// whole test binary, not scoped to a subscriber or a thread:
+    /// without this, whichever test anywhere in this binary (tracing-
+    /// aware or not, since dozens of other tests in this very module
+    /// call `cache.get()`/`put()`/... with no subscriber installed at
+    /// all) happens to be the first, on whatever thread, to touch the
+    /// `hotrod_operation` callsite decides, for the rest of the
+    /// process, whether that callsite is ever dispatched to any
+    /// subscriber again at all, including a `set_default` override a
+    /// later test installs on its own thread: once cached `never()`,
+    /// a thread-local override does not get consulted at all, which
+    /// is exactly the flake a version of this test without this fix
+    /// hit under the test harness's default parallel execution. A
+    /// global default that is always `enabled()` keeps that cached
+    /// interest at `sometimes()` instead, so each later occurrence
+    /// still asks `Dispatch::current()` fresh, which a `set_default`
+    /// guard correctly overrides on its own thread regardless of what
+    /// any other concurrent thread is doing. The rebuild only needs
+    /// to run once, right after the install it is paired with inside
+    /// the same `call_once` closure: by the time that closure returns
+    /// to any caller, `Once`'s own happens-before guarantee means the
+    /// global default is already visible process-wide, closing the
+    /// one race window (a callsite lazily registered by an unrelated,
+    /// concurrently-running test while this closure is still running)
+    /// that rebuild exists to correct; nothing a later call to this
+    /// function could still be racing against. Call this before
+    /// installing a thread-local `set_default` override, in every
+    /// test that asserts on captured spans/events.
+    fn ensure_global_tracing_default() {
+        GLOBAL_TRACING_DEFAULT_INIT.call_once(|| {
+            // Already-set is fine (e.g. a future caller after some
+            // other mechanism won the race to set a global default):
+            // this function's whole point is achieved either way, an
+            // always-enabled global default now exists.
+            let _ = tracing::subscriber::set_global_default(RecordingSubscriber::default());
+            tracing::callsite::rebuild_interest_cache();
+        });
     }
 
     /// Covers `docs/adr/0010-client-statistics-and-tracing.md`'s part
