@@ -8,6 +8,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `fuzz/`: a `cargo-fuzz` dev tool (never part of the normal build,
+  tests or CI) covering the wire parsers (`read_vint`/`read_vlong`,
+  `read_array`/`read_string`/`read_string_map`,
+  `read_topology_update`, `read_response_header`, the SCRAM/DIGEST
+  challenge parsers), see `fuzz/README.md`. Adds a `fuzzing` Cargo
+  feature, off by default and meant only for `fuzz/`'s own use: it
+  exposes thin `pub` wrappers around a handful of otherwise
+  `pub(crate)` parsers through a `#[doc(hidden)]` module, with no
+  effect on the real public API when left off.
 - Tracing: every dispatched operation opens a
   [`tracing`](https://docs.rs/tracing) span named `hotrod_operation`,
   at the same point statistics (below) are recorded, carrying the

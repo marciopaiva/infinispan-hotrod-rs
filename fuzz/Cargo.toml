@@ -1,0 +1,62 @@
+[package]
+name = "hotrod-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Its own workspace root, deliberately: without this, Cargo walks up
+# to /Cargo.toml's [workspace] and refuses to build unless this crate
+# is added to its `members`, which would pull libfuzzer-sys (and the
+# nightly-only cfg(fuzzing) it needs to run under) into every ordinary
+# `cargo build`/`test`/`clippy` at the repository root.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Only to drive the async parsers' first poll to completion: fuzzed
+# input never actually blocks on real I/O, since &[u8] implements
+# AsyncRead by reading from the slice directly, so a current-thread
+# runtime with no I/O driver enabled is enough.
+tokio = { version = "1", features = ["rt"] }
+
+[dependencies.hotrod-protocol]
+path = "../hotrod-protocol"
+features = ["fuzzing"]
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "array_and_string"
+path = "fuzz_targets/array_and_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topology_update"
+path = "fuzz_targets/topology_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response_header"
+path = "fuzz_targets/response_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sasl_challenge"
+path = "fuzz_targets/sasl_challenge.rs"
+test = false
+doc = false
+bench = false
