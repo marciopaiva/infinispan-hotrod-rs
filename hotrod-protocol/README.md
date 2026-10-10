@@ -16,7 +16,7 @@ for release notes.
 | Feature | Java client | `hotrod-protocol` |
 | --- | --- | --- |
 | Core operations (get, put, remove, putIfAbsent, replace, versioned variants) | Yes | Yes |
-| Bulk operations (getAll, putAll, removeAll) | Yes | Yes |
+| Bulk operations (getAll, putAll) | Yes | Yes |
 | containsKey, ping, size, clear, stats | Yes | Yes |
 | Full entry metadata (creation, last used, lifespan, max idle) | Yes | Yes |
 | Authentication: PLAIN, SCRAM-SHA-512, DIGEST-SHA-256, OAUTHBEARER | Yes | Yes |

@@ -68,13 +68,16 @@ land before those features, not alongside the last one that ran into it.
 
 ## Themes
 
-Seven P0/P1 items are done: pooling (#77), the multi-node CI fixture
-(#78), client listeners (#4), near caching (#5), streaming (#52),
-server-side iteration (#53) and client statistics and tracing (#54).
-What is left groups into four themes, each independent of the others,
-so any of them can go next in whatever order is actually needed.
-Within a theme, order matters more, since later items there tend to
-build on earlier ones.
+Seven P0/P1 items gated everything else: pooling (#77), the
+multi-node CI fixture (#78), client listeners (#4), near caching
+(#5), streaming (#52), server-side iteration (#53) and client
+statistics and tracing (#54). All seven are done, and so is every
+other item each theme below marks `(done)`: fuzzing, retry policy and
+node health tracking (#97), and the serialization abstraction (#99).
+What is left groups into five themes, each independent of the
+others, so any of them can go next in whatever order is actually
+needed. Within a theme, order matters more, since later items there
+tend to build on earlier ones.
 
 ### Large data access
 

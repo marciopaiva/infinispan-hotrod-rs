@@ -6,6 +6,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-10
+
 ### Added
 
 - Serialization abstraction: a `Marshaller` trait (`marshall.rs`) and
