@@ -44,6 +44,20 @@ impl Status {
         self.0 == Self::KEY_DOES_NOT_EXIST
     }
 
+    /// True only for `NOT_EXECUTED_WITH_PREVIOUS` (`0x04`), never for
+    /// `NOT_PUT_REMOVED_REPLACED` (`0x01`), unlike `is_not_executed`.
+    /// `counter_add_and_get`/`counter_compare_and_swap`/
+    /// `counter_get_and_set` (`docs/adr/0015-distributed-counters.md`)
+    /// need this exact distinction: the server is only confirmed to
+    /// use `0x04` for a bounded strong counter's out-of-bounds
+    /// rejection, and `0x01` means something else entirely wherever
+    /// this crate already reads it (a conditional cache write that
+    /// did not happen). Conflating the two here would misreport an
+    /// unrelated status as `Error::CounterOutOfBounds`.
+    pub(crate) fn is_not_executed_with_previous(self) -> bool {
+        self.0 == Self::NOT_EXECUTED_WITH_PREVIOUS
+    }
+
     /// Mirrors the Java client's own `hasPrevious()` predicate: true for
     /// the two statuses whose name says a "previous" value is involved
     /// (`SUCCESS_WITH_PREVIOUS`, `NOT_EXECUTED_WITH_PREVIOUS`). Used by
@@ -125,5 +139,15 @@ mod tests {
         assert!(Status(0x04).has_previous());
         assert!(!Status(0x01).has_previous());
         assert!(!Status(0x02).has_previous());
+    }
+
+    #[test]
+    fn is_not_executed_with_previous_excludes_not_put_removed_replaced() {
+        assert!(Status(0x04).is_not_executed_with_previous());
+        assert!(!Status(0x01).is_not_executed_with_previous());
+        // Both statuses still satisfy the broader is_not_executed():
+        // the new predicate exists to narrow that down, not replace it.
+        assert!(Status(0x01).is_not_executed());
+        assert!(Status(0x04).is_not_executed());
     }
 }

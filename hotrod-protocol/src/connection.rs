@@ -997,7 +997,7 @@ impl HotRodConnection {
             if header.status.is_not_exist() {
                 return Err(Error::CounterNotFound(name.to_string()));
             }
-            if header.status.is_not_executed() {
+            if header.status.is_not_executed_with_previous() {
                 return Err(Error::CounterOutOfBounds);
             }
             tokio::io::AsyncReadExt::read_i64(&mut self.stream)
@@ -1034,7 +1034,7 @@ impl HotRodConnection {
             if header.status.is_not_exist() {
                 return Err(Error::CounterNotFound(name.to_string()));
             }
-            if header.status.is_not_executed() {
+            if header.status.is_not_executed_with_previous() {
                 return Err(Error::CounterOutOfBounds);
             }
             tokio::io::AsyncReadExt::read_i64(&mut self.stream)
@@ -1062,7 +1062,7 @@ impl HotRodConnection {
             if header.status.is_not_exist() {
                 return Err(Error::CounterNotFound(name.to_string()));
             }
-            if header.status.is_not_executed() {
+            if header.status.is_not_executed_with_previous() {
                 return Err(Error::CounterOutOfBounds);
             }
             tokio::io::AsyncReadExt::read_i64(&mut self.stream)

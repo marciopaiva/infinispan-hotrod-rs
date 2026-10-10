@@ -73,11 +73,14 @@ pub(crate) enum OpCode {
     CounterCreate = 0x4B,
     CounterGetConfiguration = 0x4D,
     // The one counter opcode that is not "request + 1": 0x50 is
-    // reserved by HotRodConstants.java for a historical, unused
-    // ERROR_RESPONSE opcode (errors are reported through the status
-    // byte of the matching request's own response opcode, not a
-    // dedicated opcode of their own), which sits between this
-    // request and its response. See expected_response_opcode.
+    // ERROR_RESPONSE, the real, actively-used opcode the server
+    // sends back for any failed operation's response, documented
+    // and tested further down in this file (see
+    // read_response_header's own handling of it, confirmed against
+    // a live server). It is not itself a counter opcode, but its
+    // value happens to sit between this request and its response,
+    // pushing the response to +2 instead of +1. See
+    // expected_response_opcode.
     CounterIsDefined = 0x4F,
     CounterAddAndGet = 0x52,
     CounterReset = 0x54,
@@ -123,8 +126,8 @@ impl OpCode {
             | OpCode::PutStreamNext
             | OpCode::PutStreamEnd => self as u8 - 1,
             // See this opcode's own doc comment: 0x50, between this
-            // request and its response, is reserved for a historical,
-            // unused opcode, confirmed against HotRodConstants.java.
+            // request and its response, is ERROR_RESPONSE's own
+            // value, confirmed against HotRodConstants.java.
             OpCode::CounterIsDefined => self as u8 + 2,
             _ => self as u8 + 1,
         }

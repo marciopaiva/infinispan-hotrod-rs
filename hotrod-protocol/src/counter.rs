@@ -146,10 +146,20 @@ impl<'a> CounterManager<'a> {
         self.cache().counter_define(name.to_string(), config).await
     }
 
+    /// Does not error for a name that was never defined: it answers
+    /// `false`, the same way the server itself distinguishes this
+    /// one operation's "not defined" (a dedicated non-error status)
+    /// from the `KeyDoesNotExist` every other counter operation uses.
     pub async fn is_defined(&self, name: &str) -> Result<bool> {
         self.cache().counter_is_defined(name.to_string()).await
     }
 
+    /// `None` for a name that was never defined: unlike
+    /// `StrongCounter::get_value`/`WeakCounter::get_value` and most
+    /// other counter operations, this one does not error for that
+    /// case (`docs/adr/0015-distributed-counters.md`), matching the
+    /// same shape every other "might not exist" read in this crate
+    /// already uses.
     pub async fn get_configuration(&self, name: &str) -> Result<Option<CounterConfiguration>> {
         self.cache()
             .counter_get_configuration(name.to_string())
@@ -161,6 +171,9 @@ impl<'a> CounterManager<'a> {
         self.cache().counter_names().await
     }
 
+    /// Returns a handle to a strong counter, without checking that
+    /// `name` is actually defined as one (or defined at all): that
+    /// only matters once an operation is actually called on it.
     pub fn strong_counter(&self, name: impl Into<String>) -> StrongCounter {
         StrongCounter {
             cache: self.cache(),
@@ -168,6 +181,7 @@ impl<'a> CounterManager<'a> {
         }
     }
 
+    /// Same as `strong_counter`, but for a weak counter.
     pub fn weak_counter(&self, name: impl Into<String>) -> WeakCounter {
         WeakCounter {
             cache: self.cache(),
@@ -187,24 +201,35 @@ pub struct StrongCounter {
 }
 
 impl StrongCounter {
+    /// The name this handle was obtained with, not a round trip to
+    /// the server.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Fetches the counter's current value. `Error::CounterNotFound`
+    /// if `name` was never defined.
     pub async fn get_value(&self) -> Result<i64> {
         self.cache.counter_get(self.name.clone()).await
     }
 
+    /// Adds `delta` (negative to subtract) and returns the new
+    /// value. `Error::CounterOutOfBounds` if this counter is bounded
+    /// and the result would cross its configured bound (the value is
+    /// left unchanged); `Error::CounterNotFound` if `name` was never
+    /// defined.
     pub async fn add_and_get(&self, delta: i64) -> Result<i64> {
         self.cache
             .counter_add_and_get(self.name.clone(), delta)
             .await
     }
 
+    /// Same as `add_and_get(1)`.
     pub async fn increment_and_get(&self) -> Result<i64> {
         self.add_and_get(1).await
     }
 
+    /// Same as `add_and_get(-1)`.
     pub async fn decrement_and_get(&self) -> Result<i64> {
         self.add_and_get(-1).await
     }
@@ -235,6 +260,8 @@ impl StrongCounter {
             .await
     }
 
+    /// Resets the counter to its configured initial value.
+    /// `Error::CounterNotFound` if `name` was never defined.
     pub async fn reset(&self) -> Result<()> {
         self.cache.counter_reset(self.name.clone()).await
     }
@@ -264,10 +291,14 @@ pub struct WeakCounter {
 }
 
 impl WeakCounter {
+    /// The name this handle was obtained with, not a round trip to
+    /// the server.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Fetches the counter's current value. `Error::CounterNotFound`
+    /// if `name` was never defined.
     pub async fn get_value(&self) -> Result<i64> {
         self.cache.counter_get(self.name.clone()).await
     }
@@ -283,14 +314,18 @@ impl WeakCounter {
         Ok(())
     }
 
+    /// Same as `add(1)`.
     pub async fn increment(&self) -> Result<()> {
         self.add(1).await
     }
 
+    /// Same as `add(-1)`.
     pub async fn decrement(&self) -> Result<()> {
         self.add(-1).await
     }
 
+    /// Resets the counter to its configured initial value.
+    /// `Error::CounterNotFound` if `name` was never defined.
     pub async fn reset(&self) -> Result<()> {
         self.cache.counter_reset(self.name.clone()).await
     }
