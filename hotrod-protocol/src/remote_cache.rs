@@ -20,10 +20,12 @@ use crate::error::{Error, Result};
 use crate::health::NodeHealth;
 use crate::iteration::{CacheIterator, IterationOptions, NodeIterator};
 use crate::listener::{CacheListener, ListenOptions};
+use crate::marshall::Marshaller;
 use crate::near_cache::{NearCacheOptions, NearCachedCache};
 use crate::stats::ClientStatistics;
 use crate::streaming::{GetStream, PutStream};
 use crate::topology::TopologyServer;
+use crate::typed_cache::TypedCache;
 use crate::wire::Expiration;
 
 /// One of `HotRodConnection`'s cache operations, with its arguments owned
@@ -392,6 +394,22 @@ impl RemoteCache {
     /// `Modified`/`Removed`/`Expired`.
     pub async fn near_cache(&self, options: NearCacheOptions) -> Result<NearCachedCache> {
         NearCachedCache::register(self.clone(), options).await
+    }
+
+    /// Wraps this cache with a typed façade
+    /// (`docs/adr/0012-serialization-abstraction.md`): every operation
+    /// marshalls its typed arguments through `key_marshaller`/
+    /// `value_marshaller` and unmarshalls the result, delegating to
+    /// this same byte-oriented `RemoteCache` underneath, so routing,
+    /// retries and statistics all keep working unchanged. Synchronous
+    /// and cheap, unlike `near_cache`: nothing here needs a network
+    /// round trip to set up.
+    pub fn typed<MK: Marshaller, MV: Marshaller>(
+        &self,
+        key_marshaller: MK,
+        value_marshaller: MV,
+    ) -> TypedCache<MK, MV> {
+        TypedCache::new(self.clone(), key_marshaller, value_marshaller)
     }
 
     /// Opens a stream to read `key`'s value in chunks of up to
@@ -866,14 +884,18 @@ pub(crate) mod tests {
         })
     }
 
-    fn client_with_seeds(
+    /// Shared with `typed_cache.rs`'s own tests, same reason as
+    /// `client_with_seeds_and_timeout`.
+    pub(crate) fn client_with_seeds(
         seed_addrs: Vec<SocketAddr>,
         active_seed_addr: SocketAddr,
     ) -> HotRodClient {
         client_with_seeds_and_timeout(seed_addrs, active_seed_addr, Duration::from_millis(100))
     }
 
-    fn set_topology(client: &HotRodClient, topology: ClusterTopology) {
+    /// Shared with `typed_cache.rs`'s own tests, same reason as
+    /// `client_with_seeds_and_timeout`.
+    pub(crate) fn set_topology(client: &HotRodClient, topology: ClusterTopology) {
         *client.inner().topology.write().unwrap() = Some(Arc::new(topology));
     }
 

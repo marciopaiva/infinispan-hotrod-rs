@@ -8,6 +8,19 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Serialization abstraction: a `Marshaller` trait (`marshall.rs`) and
+  `TypedCache` (`typed_cache.rs`), a typed façade over `RemoteCache`
+  obtained via `RemoteCache::typed(key_marshaller, value_marshaller)`.
+  Covers `get`/`put`/`put_if_absent`/`replace`/`remove`/
+  `get_with_version`/`replace_if_unmodified`/`remove_if_unmodified`/
+  `contains_key`/`get_all`/`put_all` with typed arguments and return
+  values; everything else (streaming, server-side iteration, client
+  listeners, near caching) is reached unchanged through `Deref`, the
+  same way `NearCachedCache` already works. Ships with two
+  dependency-free marshallers, `BytesMarshaller` and `Utf8Marshaller`;
+  a caller wanting JSON, Protobuf or anything else implements
+  `Marshaller` themselves. See
+  `docs/adr/0012-serialization-abstraction.md` (#99).
 - Retry policy and node health tracking: `RemoteCache`'s retry chain
   tries the primary owner, then each backup owner, then the active
   seed, then every other configured seed, bounded by a configurable

@@ -140,6 +140,14 @@ pub enum Error {
 
     #[error("invalid TLS certificate or key material: {0}")]
     InvalidTlsMaterial(String),
+
+    /// A `Marshaller::marshall`/`unmarshall` call failed, wrapped from
+    /// whatever error type that marshaller uses
+    /// (`docs/adr/0012-serialization-abstraction.md`). `TypedCache` is
+    /// the only thing that produces this; nothing byte-oriented ever
+    /// does.
+    #[error("failed to marshall or unmarshall a value: {0}")]
+    Marshalling(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Result alias for `hotrod_protocol::Error`.

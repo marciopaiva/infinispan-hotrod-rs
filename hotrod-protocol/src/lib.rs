@@ -45,6 +45,7 @@ mod header;
 mod health;
 mod iteration;
 mod listener;
+mod marshall;
 mod near_cache;
 mod pool;
 mod remote_cache;
@@ -55,6 +56,7 @@ mod status;
 mod streaming;
 mod tls;
 mod topology;
+mod typed_cache;
 mod varint;
 mod wire;
 
@@ -63,11 +65,13 @@ pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_
 pub use error::{Error, Result};
 pub use iteration::{CacheIterator, IterationEntry, IterationOptions};
 pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions, ServerFactory};
+pub use marshall::{BytesMarshaller, Marshaller, Utf8Marshaller};
 pub use near_cache::{NearCacheOptions, NearCachedCache};
 pub use remote_cache::RemoteCache;
 pub use stats::{ClientStatistics, NearCacheStatistics, PoolStatistics};
 pub use streaming::{GetStream, PutStream};
 pub use tls::TlsConfig;
+pub use typed_cache::{TypedCache, TypedVersionedValue};
 pub use wire::Expiration;
 
 /// Thin `pub` wrappers around a handful of otherwise `pub(crate)` wire

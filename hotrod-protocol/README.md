@@ -29,6 +29,7 @@ for release notes.
 | Transactions | Yes | No |
 | Multimap cache | Yes | No |
 | Counters | Yes | No |
+| Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
 | Remote query (Protobuf / Ickle) | Yes | No |
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
@@ -102,6 +103,21 @@ near.put(b"key", b"value", Expiration::Default, Expiration::Default)
     .await?;
 let value = near.get(b"key").await?; // served from the network once, cached after
 let count = near.size().await?; // reached through to the underlying RemoteCache
+```
+
+`typed` wraps a `RemoteCache` with a typed façade: marshal/unmarshal
+keys and values through a `Marshaller` instead of handling raw bytes
+directly. `BytesMarshaller`/`Utf8Marshaller` ship built in; implement
+`Marshaller` yourself for JSON, Protobuf or anything else:
+
+```rust
+use hotrod_protocol::Utf8Marshaller;
+
+let typed = cache.typed(Utf8Marshaller, Utf8Marshaller);
+typed
+    .put(&"key".to_string(), &"value".to_string(), Expiration::Default, Expiration::Default)
+    .await?;
+let value = typed.get(&"key".to_string()).await?;
 ```
 
 `get_stream`/`put_stream` read or write a value in chunks instead of
