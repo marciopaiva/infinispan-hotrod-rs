@@ -874,13 +874,13 @@ pub(crate) mod tests {
         DEFAULT_SERVER_FAILURE_TIMEOUT,
     };
     use crate::health::NodeHealth;
-    use crate::protobuf_wire::{
-        read_length_delimited, read_tag, write_int32, write_length_delimited, write_tag,
-        WIRE_TYPE_LENGTH_DELIMITED, WIRE_TYPE_VARINT,
+    use crate::protobuf_wire::{read_length_delimited, read_tag, WIRE_TYPE_VARINT};
+    use crate::query::test_support::{
+        query_response_bytes, wrapped_entity_bytes, wrapped_scalar_bytes,
     };
     use crate::query::{QueryRow, QueryValue};
     use crate::topology::TopologyServer;
-    use crate::varint::{read_vint, write_vint};
+    use crate::varint::{read_vint, read_vlong, write_vint};
     use crate::wire::{read_array, write_array};
 
     /// Builds a client with a fixed seed list and active seed, bypassing
@@ -1642,47 +1642,76 @@ pub(crate) mod tests {
         seed_task.await.unwrap();
     }
 
-    /// Builds one `WrappedMessage`'s bytes wrapping a whole entity:
-    /// field 16 (`wrappedTypeName`) then field 17 (`wrappedMessage`),
-    /// per `docs/adr/0013-remote-query.md`.
-    fn wrapped_entity_bytes(type_name: &str, entity_bytes: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        write_tag(&mut buf, 16, WIRE_TYPE_LENGTH_DELIMITED);
-        write_length_delimited(&mut buf, type_name.as_bytes());
-        write_tag(&mut buf, 17, WIRE_TYPE_LENGTH_DELIMITED);
-        write_length_delimited(&mut buf, entity_bytes);
-        buf
-    }
+    /// `register_proto_schema`'s wire format was confirmed only
+    /// "empirically" against a live server
+    /// (`docs/adr/0013-remote-query.md`); this is its fake-server
+    /// regression coverage: a predefined `application/x-protostream`
+    /// media type (id 12) declared for both key and value, both
+    /// `WrappedMessage`-wrapped as strings, not sent as raw bytes.
+    #[tokio::test]
+    async fn register_proto_schema_declares_protostream_and_wraps_key_and_value() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
 
-    fn wrapped_string_bytes(value: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        write_tag(&mut buf, 9, WIRE_TYPE_LENGTH_DELIMITED); // wrappedString
-        write_length_delimited(&mut buf, value.as_bytes());
-        buf
-    }
+            assert_eq!(
+                stream.read_u8().await.unwrap(),
+                0xA0,
+                "expected a request magic byte"
+            );
+            let id = read_vlong(&mut stream).await.unwrap();
+            let _version = stream.read_u8().await.unwrap();
+            let opcode = stream.read_u8().await.unwrap();
+            assert_eq!(opcode, 0x01, "expected a Put request");
+            let cache_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(cache_name, b"___protobuf_metadata");
+            let _flags = read_vint(&mut stream).await.unwrap();
+            let _intelligence = stream.read_u8().await.unwrap();
+            let _topology_id = read_vint(&mut stream).await.unwrap();
 
-    fn wrapped_int32_bytes(value: i32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        write_tag(&mut buf, 5, WIRE_TYPE_VARINT); // wrappedInt32
-        write_int32(&mut buf, value);
-        buf
-    }
+            for _ in 0..2 {
+                assert_eq!(
+                    stream.read_u8().await.unwrap(),
+                    1,
+                    "expected a predefined media type, not \"none\""
+                );
+                assert_eq!(
+                    read_vint(&mut stream).await.unwrap(),
+                    12,
+                    "expected application/x-protostream's predefined id"
+                );
+                assert_eq!(
+                    read_vint(&mut stream).await.unwrap(),
+                    0,
+                    "expected no media type parameters"
+                );
+            }
+            let _additional_params = read_vint(&mut stream).await.unwrap();
 
-    fn query_response_bytes(
-        projection_size: i32,
-        wrapped_results: &[Vec<u8>],
-        hit_count: i32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        write_tag(&mut buf, 2, WIRE_TYPE_VARINT); // projectionSize
-        write_int32(&mut buf, projection_size);
-        for wrapped in wrapped_results {
-            write_tag(&mut buf, 3, WIRE_TYPE_LENGTH_DELIMITED); // results
-            write_length_delimited(&mut buf, wrapped);
-        }
-        write_tag(&mut buf, 4, WIRE_TYPE_VARINT); // hitCount
-        write_int32(&mut buf, hit_count);
-        buf
+            let key = read_array(&mut stream).await.unwrap();
+            let _time_units = stream.read_u8().await.unwrap();
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(
+                key,
+                wrapped_scalar_bytes(&QueryValue::String("my-schema.proto".to_string()))
+            );
+            assert_eq!(
+                value,
+                wrapped_scalar_bytes(&QueryValue::String("message Foo {}".to_string()))
+            );
+
+            let resp = response_header(id, 0x02, 0x00);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        client
+            .register_proto_schema("my-schema.proto", "message Foo {}")
+            .await
+            .expect("register_proto_schema should succeed");
+
+        seed_task.await.unwrap();
     }
 
     /// `docs/adr/0013-remote-query.md`: no key to route by, so `query`
@@ -1760,10 +1789,10 @@ pub(crate) mod tests {
             let response = query_response_bytes(
                 2,
                 &[
-                    wrapped_string_bytes("Alice"),
-                    wrapped_int32_bytes(30),
-                    wrapped_string_bytes("Bob"),
-                    wrapped_int32_bytes(40),
+                    wrapped_scalar_bytes(&QueryValue::String("Alice".to_string())),
+                    wrapped_scalar_bytes(&QueryValue::Int32(30)),
+                    wrapped_scalar_bytes(&QueryValue::String("Bob".to_string())),
+                    wrapped_scalar_bytes(&QueryValue::Int32(40)),
                 ],
                 2,
             );

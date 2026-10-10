@@ -1283,11 +1283,19 @@ impl HotRodConnection {
 
         // Query is the one operation whose request/response bodies are
         // themselves Protobuf, and the server picks how to decode them
-        // based on this declared media type; `___protobuf_metadata`'s
-        // value needs the same declaration to be stored as a schema at
-        // all, confirmed empirically against a live server before
-        // either existed (`docs/adr/0013-remote-query.md`). Every
-        // other operation still declares "none", unchanged.
+        // based on this declared media type
+        // (`docs/adr/0013-remote-query.md`). `___protobuf_metadata`'s
+        // own storage is fixed to protostream server-side regardless
+        // of what a request declares, confirmed empirically (a write
+        // declaring "none" was rejected outright); this applies to
+        // every operation against that cache, not just
+        // `register_proto_schema`'s write, since a read would need the
+        // same declaration to correctly interpret what comes back.
+        // `PROTOBUF_METADATA_CACHE_NAME`'s triple-underscore prefix is
+        // Infinispan's own reserved-name convention for internal
+        // caches, not something a real user cache plausibly collides
+        // with. Every other operation, against every other cache,
+        // still declares "none", unchanged.
         let media_type = if matches!(opcode, OpCode::Query)
             || cache_name == crate::client::PROTOBUF_METADATA_CACHE_NAME.as_bytes()
         {
@@ -1373,8 +1381,13 @@ mod tests {
         let _flags = crate::varint::read_vint(stream).await.unwrap();
         let _intelligence = stream.read_u8().await.unwrap();
         let _topology_id = crate::varint::read_vint(stream).await.unwrap();
-        let _key_media_type = stream.read_u8().await.unwrap();
-        let _value_media_type = stream.read_u8().await.unwrap();
+        // Not two bare bytes: most requests declare "none" (one zero
+        // byte each), but the query operation and any operation
+        // against `___protobuf_metadata` declare a real predefined
+        // media type (`docs/adr/0013-remote-query.md`), which is
+        // longer. `skip_media_type` already knows the real format.
+        crate::wire::skip_media_type(stream).await.unwrap();
+        crate::wire::skip_media_type(stream).await.unwrap();
         let _additional_params = crate::varint::read_vint(stream).await.unwrap();
         (message_id, opcode)
     }

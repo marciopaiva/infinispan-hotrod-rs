@@ -93,14 +93,14 @@ before merge:
   `DefaultQuerySerializer.decodeQueryRequest` picks how to interpret
   the request body from the media type the request declares, and
   "none" picks the wrong transcoder.
-* **`register_proto_schema`'s write to `___protobuf_metadata`.**
-  Declaring "none" made the server reject even a key that already
-  was a string (`CacheException: The key must be a String: class
-  java.lang.Integer`): this cache's own storage is fixed to
-  `application/x-protostream` regardless of what a request declares,
-  and an unwrapped scalar carries no type of its own, so the decoder
-  guessed the shortest-looking type (binary varint) instead of a
-  string.
+* **Any operation against `___protobuf_metadata`**, confirmed via
+  `register_proto_schema`'s `put`. Declaring "none" made the server
+  reject even a key that already was a string (`CacheException: The
+  key must be a String: class java.lang.Integer`): this cache's own
+  storage is fixed to `application/x-protostream` server-side
+  regardless of what a request declares, and an unwrapped scalar
+  carries no type of its own, so the decoder guessed the
+  shortest-looking type (binary varint) instead of a string.
 
 Both are fixed by declaring the predefined `application/x-protostream`
 media type (id 12, confirmed against the Java client's own
@@ -108,11 +108,13 @@ media type (id 12, confirmed against the Java client's own
 registration specifically, `WrappedMessage`-wrapping both the key
 (schema name) and value (schema source) as scalars first (confirmed
 empirically: a correctly-declared-protostream but still-unwrapped
-string value was still rejected). This is a narrow, two-call-site
-fix (`header::RequestMediaType::Protostream`, used only by the query
-operation and by writes to `___protobuf_metadata`), not general
-media-type negotiation: every other operation still declares "none",
-unchanged.
+string value was still rejected). This is a narrow fix
+(`header::RequestMediaType::Protostream`, used only by the query
+operation and by any operation whose cache name is
+`___protobuf_metadata`, a name reserved by Infinispan itself, not one
+a real user cache plausibly collides with), not general media-type
+negotiation: every other operation, against every other cache, still
+declares "none", unchanged.
 
 What remains genuinely out of scope, confirmed by the same testing:
 making an arbitrary `RemoteCache`/`TypedCache` write queryable (i.e.

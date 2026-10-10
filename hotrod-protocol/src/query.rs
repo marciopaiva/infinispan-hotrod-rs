@@ -63,14 +63,12 @@ pub enum QueryRow {
 /// opaque bytes.
 enum WrappedValue {
     Scalar(QueryValue),
-    Entity {
-        #[allow(dead_code)]
-        // kept for completeness; QueryRow::Entity does not carry it, see ADR 0013
-        type_id: Option<u32>,
-        #[allow(dead_code)]
-        type_name: Option<String>,
-        bytes: Vec<u8>,
-    },
+    /// `type_id`/`type_name` are not kept here: nothing downstream
+    /// consumes them (`QueryRow::Entity` carries only the bytes, see
+    /// ADR 0013), so `decode_wrapped_value` only uses them locally,
+    /// to validate that exactly one was present before discarding
+    /// both.
+    Entity(Vec<u8>),
 }
 
 const WRAPPED_DOUBLE: u32 = 1;
@@ -153,6 +151,19 @@ fn write_wrapped_scalar(buf: &mut Vec<u8>, value: &QueryValue) {
 /// fields this phase does not recognize (`skip_field`), matching the
 /// forward-compatible stance the format's own documentation asks for.
 fn decode_wrapped_value(bytes: &[u8]) -> Result<WrappedValue> {
+    /// A known field's wire type didn't match what that field is
+    /// defined to carry: reading it with the field's own reader would
+    /// consume the wrong byte count and desync every field after it,
+    /// so this is reported as malformed instead.
+    fn check_wire_type(field: u32, actual: u8, expected: u8) -> Result<()> {
+        if actual != expected {
+            return Err(Error::MalformedQueryResponse(format!(
+                "WrappedMessage field {field} has wire type {actual}, expected {expected}"
+            )));
+        }
+        Ok(())
+    }
+
     let mut pos = 0;
     let mut scalar: Option<QueryValue> = None;
     let mut type_id: Option<u32> = None;
@@ -160,43 +171,68 @@ fn decode_wrapped_value(bytes: &[u8]) -> Result<WrappedValue> {
     let mut message_bytes: Option<Vec<u8>> = None;
     let mut is_empty = false;
 
-    while let Some((field, _wire_type)) = read_tag(bytes, &mut pos)? {
+    while let Some((field, wire_type)) = read_tag(bytes, &mut pos)? {
         match field {
             WRAPPED_DOUBLE => {
+                check_wire_type(field, wire_type, WIRE_TYPE_FIXED64)?;
                 scalar = Some(QueryValue::Double(f64::from_bits(read_fixed64(
                     bytes, &mut pos,
-                )?)))
+                )?)));
             }
             WRAPPED_FLOAT => {
+                check_wire_type(field, wire_type, WIRE_TYPE_FIXED32)?;
                 scalar = Some(QueryValue::Float(f32::from_bits(read_fixed32(
                     bytes, &mut pos,
-                )?)))
+                )?)));
             }
-            WRAPPED_INT64 => scalar = Some(QueryValue::Int64(read_int64(bytes, &mut pos)?)),
-            WRAPPED_UINT64 => scalar = Some(QueryValue::UInt64(read_varint(bytes, &mut pos)?)),
-            WRAPPED_INT32 => scalar = Some(QueryValue::Int32(read_int32(bytes, &mut pos)?)),
-            WRAPPED_BOOL => scalar = Some(QueryValue::Bool(read_varint(bytes, &mut pos)? != 0)),
+            WRAPPED_INT64 => {
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
+                scalar = Some(QueryValue::Int64(read_int64(bytes, &mut pos)?));
+            }
+            WRAPPED_UINT64 => {
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
+                scalar = Some(QueryValue::UInt64(read_varint(bytes, &mut pos)?));
+            }
+            WRAPPED_INT32 => {
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
+                scalar = Some(QueryValue::Int32(read_int32(bytes, &mut pos)?));
+            }
+            WRAPPED_BOOL => {
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
+                scalar = Some(QueryValue::Bool(read_varint(bytes, &mut pos)? != 0));
+            }
             WRAPPED_STRING => {
+                check_wire_type(field, wire_type, WIRE_TYPE_LENGTH_DELIMITED)?;
                 scalar = Some(QueryValue::String(String::from_utf8(
                     read_length_delimited(bytes, &mut pos)?,
-                )?))
+                )?));
             }
             WRAPPED_BYTES => {
-                scalar = Some(QueryValue::Bytes(read_length_delimited(bytes, &mut pos)?))
+                check_wire_type(field, wire_type, WIRE_TYPE_LENGTH_DELIMITED)?;
+                scalar = Some(QueryValue::Bytes(read_length_delimited(bytes, &mut pos)?));
             }
             WRAPPED_UINT32 => {
-                scalar = Some(QueryValue::UInt32(read_varint(bytes, &mut pos)? as u32))
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
+                scalar = Some(QueryValue::UInt32(read_varint(bytes, &mut pos)? as u32));
             }
             WRAPPED_TYPE_NAME => {
-                type_name = Some(String::from_utf8(read_length_delimited(bytes, &mut pos)?)?)
+                check_wire_type(field, wire_type, WIRE_TYPE_LENGTH_DELIMITED)?;
+                type_name = Some(String::from_utf8(read_length_delimited(bytes, &mut pos)?)?);
             }
-            WRAPPED_TYPE_ID => type_id = Some(read_varint(bytes, &mut pos)? as u32),
-            WRAPPED_MESSAGE => message_bytes = Some(read_length_delimited(bytes, &mut pos)?),
+            WRAPPED_TYPE_ID => {
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
+                type_id = Some(read_varint(bytes, &mut pos)? as u32);
+            }
+            WRAPPED_MESSAGE => {
+                check_wire_type(field, wire_type, WIRE_TYPE_LENGTH_DELIMITED)?;
+                message_bytes = Some(read_length_delimited(bytes, &mut pos)?);
+            }
             WRAPPED_EMPTY => {
+                check_wire_type(field, wire_type, WIRE_TYPE_VARINT)?;
                 read_varint(bytes, &mut pos)?;
                 is_empty = true;
             }
-            _ => skip_field(bytes, &mut pos, _wire_type)?,
+            _ => skip_field(bytes, &mut pos, wire_type)?,
         }
     }
 
@@ -204,16 +240,13 @@ fn decode_wrapped_value(bytes: &[u8]) -> Result<WrappedValue> {
         return Ok(WrappedValue::Scalar(QueryValue::Null));
     }
     if let Some(bytes) = message_bytes {
-        if type_id.is_none() && type_name.is_none() {
-            return Err(Error::MalformedQueryResponse(
-                "a WrappedMessage has a message payload but no type id or type name".to_string(),
-            ));
+        if type_id.is_some() == type_name.is_some() {
+            return Err(Error::MalformedQueryResponse(format!(
+                "a WrappedMessage has a message payload but {} a type id and a type name",
+                if type_id.is_some() { "both" } else { "neither" }
+            )));
         }
-        return Ok(WrappedValue::Entity {
-            type_id,
-            type_name,
-            bytes,
-        });
+        return Ok(WrappedValue::Entity(bytes));
     }
     scalar.map(WrappedValue::Scalar).ok_or_else(|| {
         Error::MalformedQueryResponse("a WrappedMessage has no recognized field set".to_string())
@@ -224,20 +257,13 @@ const NAMED_PARAMETER_NAME: u32 = 1;
 const NAMED_PARAMETER_VALUE: u32 = 2;
 
 fn write_named_parameter(buf: &mut Vec<u8>, name: &str, value: &QueryValue) {
-    let mut param = Vec::new();
-    write_tag(&mut param, NAMED_PARAMETER_NAME, WIRE_TYPE_LENGTH_DELIMITED);
-    write_length_delimited(&mut param, name.as_bytes());
+    write_tag(buf, NAMED_PARAMETER_NAME, WIRE_TYPE_LENGTH_DELIMITED);
+    write_length_delimited(buf, name.as_bytes());
 
     let mut wrapped = Vec::new();
     write_wrapped_scalar(&mut wrapped, value);
-    write_tag(
-        &mut param,
-        NAMED_PARAMETER_VALUE,
-        WIRE_TYPE_LENGTH_DELIMITED,
-    );
-    write_length_delimited(&mut param, &wrapped);
-
-    buf.extend_from_slice(&param);
+    write_tag(buf, NAMED_PARAMETER_VALUE, WIRE_TYPE_LENGTH_DELIMITED);
+    write_length_delimited(buf, &wrapped);
 }
 
 const QUERY_REQUEST_QUERY_STRING: u32 = 1;
@@ -336,7 +362,7 @@ fn build_rows(projection_size: i32, results: Vec<WrappedValue>) -> Result<Vec<Qu
         return Ok(results
             .into_iter()
             .map(|value| match value {
-                WrappedValue::Entity { bytes, .. } => QueryRow::Entity(bytes),
+                WrappedValue::Entity(bytes) => QueryRow::Entity(bytes),
                 WrappedValue::Scalar(value) => QueryRow::Columns(vec![value]),
             })
             .collect());
@@ -349,20 +375,26 @@ fn build_rows(projection_size: i32, results: Vec<WrappedValue>) -> Result<Vec<Qu
             results.len()
         )));
     }
-    Ok(results
-        .chunks(size)
-        .map(|chunk| {
-            QueryRow::Columns(
-                chunk
-                    .iter()
-                    .map(|value| match value {
-                        WrappedValue::Scalar(value) => value.clone(),
-                        WrappedValue::Entity { bytes, .. } => QueryValue::Bytes(bytes.clone()),
-                    })
-                    .collect(),
-            )
-        })
-        .collect())
+
+    // Consumes `results` by value instead of `chunks()`-borrowing it,
+    // so each `QueryValue` moves into its row directly rather than
+    // being cloned out of a borrowed chunk.
+    let mut rows = Vec::with_capacity(results.len() / size);
+    let mut results = results.into_iter();
+    loop {
+        let row: Vec<QueryValue> = (&mut results)
+            .take(size)
+            .map(|value| match value {
+                WrappedValue::Scalar(value) => value,
+                WrappedValue::Entity(bytes) => QueryValue::Bytes(bytes),
+            })
+            .collect();
+        if row.is_empty() {
+            break;
+        }
+        rows.push(QueryRow::Columns(row));
+    }
+    Ok(rows)
 }
 
 /// The result of executing a `Query`: one `QueryRow` per matching
@@ -422,6 +454,9 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// Runs the query against the server, always against the seed
+    /// connection (no key to route by, the same as `get_all`/
+    /// `put_all`/`size`/`clear`), consuming this builder.
     pub async fn execute(self) -> Result<QueryResult> {
         self.cache
             .run_query(encode_query_request(
@@ -434,15 +469,53 @@ impl<'a> Query<'a> {
     }
 }
 
+/// Test-only wire-building helpers shared across modules
+/// (`remote_cache.rs`'s own `query`/`register_proto_schema` tests),
+/// so a fake server there builds fixtures the same way this module's
+/// own tests do, from the one real encoding instead of a second,
+/// hand-rolled copy of the same magic numbers that could silently
+/// drift from it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    fn wrapped_scalar_bytes(value: &QueryValue) -> Vec<u8> {
+    pub(crate) fn wrapped_scalar_bytes(value: &QueryValue) -> Vec<u8> {
         let mut buf = Vec::new();
         write_wrapped_scalar(&mut buf, value);
         buf
     }
+
+    pub(crate) fn wrapped_entity_bytes(type_name: &str, entity_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_tag(&mut buf, WRAPPED_TYPE_NAME, WIRE_TYPE_LENGTH_DELIMITED);
+        write_length_delimited(&mut buf, type_name.as_bytes());
+        write_tag(&mut buf, WRAPPED_MESSAGE, WIRE_TYPE_LENGTH_DELIMITED);
+        write_length_delimited(&mut buf, entity_bytes);
+        buf
+    }
+
+    pub(crate) fn query_response_bytes(
+        projection_size: i32,
+        wrapped_results: &[Vec<u8>],
+        hit_count: i32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_tag(&mut buf, QUERY_RESPONSE_PROJECTION_SIZE, WIRE_TYPE_VARINT);
+        write_int32(&mut buf, projection_size);
+        for wrapped in wrapped_results {
+            write_tag(&mut buf, QUERY_RESPONSE_RESULTS, WIRE_TYPE_LENGTH_DELIMITED);
+            write_length_delimited(&mut buf, wrapped);
+        }
+        write_tag(&mut buf, QUERY_RESPONSE_HIT_COUNT, WIRE_TYPE_VARINT);
+        write_int32(&mut buf, hit_count);
+        buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::wrapped_scalar_bytes;
+    use super::*;
 
     #[test]
     fn wrapped_scalar_round_trips_every_query_value_variant() {
@@ -470,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_entity_decodes_type_name_and_message_bytes() {
+    fn wrapped_entity_decodes_message_bytes_identified_by_type_name() {
         let mut buf = Vec::new();
         write_tag(&mut buf, WRAPPED_TYPE_NAME, WIRE_TYPE_LENGTH_DELIMITED);
         write_length_delimited(&mut buf, b"org.example.User");
@@ -478,18 +551,13 @@ mod tests {
         write_length_delimited(&mut buf, b"entity-bytes");
 
         match decode_wrapped_value(&buf).unwrap() {
-            WrappedValue::Entity {
-                type_name, bytes, ..
-            } => {
-                assert_eq!(type_name.as_deref(), Some("org.example.User"));
-                assert_eq!(bytes, b"entity-bytes");
-            }
+            WrappedValue::Entity(bytes) => assert_eq!(bytes, b"entity-bytes"),
             WrappedValue::Scalar(_) => panic!("expected an entity"),
         }
     }
 
     #[test]
-    fn wrapped_entity_decodes_type_id_and_message_bytes() {
+    fn wrapped_entity_decodes_message_bytes_identified_by_type_id() {
         let mut buf = Vec::new();
         write_tag(&mut buf, WRAPPED_TYPE_ID, WIRE_TYPE_VARINT);
         write_varint(&mut buf, 42);
@@ -497,12 +565,25 @@ mod tests {
         write_length_delimited(&mut buf, b"entity-bytes");
 
         match decode_wrapped_value(&buf).unwrap() {
-            WrappedValue::Entity { type_id, bytes, .. } => {
-                assert_eq!(type_id, Some(42));
-                assert_eq!(bytes, b"entity-bytes");
-            }
+            WrappedValue::Entity(bytes) => assert_eq!(bytes, b"entity-bytes"),
             WrappedValue::Scalar(_) => panic!("expected an entity"),
         }
+    }
+
+    #[test]
+    fn wrapped_message_with_both_type_name_and_type_id_is_rejected() {
+        let mut buf = Vec::new();
+        write_tag(&mut buf, WRAPPED_TYPE_NAME, WIRE_TYPE_LENGTH_DELIMITED);
+        write_length_delimited(&mut buf, b"org.example.User");
+        write_tag(&mut buf, WRAPPED_TYPE_ID, WIRE_TYPE_VARINT);
+        write_varint(&mut buf, 42);
+        write_tag(&mut buf, WRAPPED_MESSAGE, WIRE_TYPE_LENGTH_DELIMITED);
+        write_length_delimited(&mut buf, b"entity-bytes");
+
+        assert!(matches!(
+            decode_wrapped_value(&buf),
+            Err(Error::MalformedQueryResponse(_))
+        ));
     }
 
     #[test]

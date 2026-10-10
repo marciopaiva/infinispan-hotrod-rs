@@ -12,16 +12,19 @@
 //! framing), so parsing it is plain, synchronous, in-memory work, not
 //! network I/O.
 //!
-//! The varint and zigzag encodings below happen to be byte-for-byte
-//! identical to `varint.rs`'s own vInt/SignedVInt (both are the
-//! standard Protocol Buffers LEB128 scheme), but are written again
-//! here rather than shared: `varint.rs` streams directly off a
-//! connection, while this module only ever sees an already-buffered
-//! slice, and the two protocols (Hot Rod's own framing vs. the
-//! Protobuf envelope it happens to carry for this one operation) are
-//! only coincidentally related, not meant to stay coupled.
+//! The varint and zigzag encodings below are byte-for-byte identical
+//! to `varint.rs`'s own vLong/SignedVInt (both are the standard
+//! Protocol Buffers LEB128 scheme). `write_varint` reuses
+//! `varint::write_vlong` directly, since writing is already
+//! buffer-based there (`&mut Vec<u8>`, not a connection) and nothing
+//! about the algorithm differs. `read_varint` cannot be shared the
+//! same way: `varint::read_vlong` streams off an `AsyncRead`
+//! connection, while this module only ever parses an
+//! already-buffered slice with a plain cursor, so it is reimplemented
+//! here rather than wrapping a stream around a slice just to reuse it.
 
 use crate::error::{Error, Result};
+use crate::varint::write_vlong;
 
 pub(crate) const WIRE_TYPE_VARINT: u8 = 0;
 pub(crate) const WIRE_TYPE_FIXED64: u8 = 1;
@@ -38,17 +41,8 @@ const MAX_VARINT_BYTES: u8 = 10;
 /// `wire::MAX_ARRAY_LEN`.
 const MAX_LENGTH_DELIMITED_LEN: u64 = 64 * 1024 * 1024;
 
-pub(crate) fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            buf.push(byte | 0x80);
-        } else {
-            buf.push(byte);
-            break;
-        }
-    }
+pub(crate) fn write_varint(buf: &mut Vec<u8>, value: u64) {
+    write_vlong(buf, value);
 }
 
 pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
