@@ -20,6 +20,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   length-delimited framing). A caller's own entity bytes inside a
   result stay opaque, decoded by their own `Marshaller`. See
   `docs/adr/0013-remote-query.md` (#50).
+- Remote administration: `HotRodClient::administration()` returns an
+  `Administration` handle to create, remove and list caches
+  (`create_cache`/`get_or_create_cache`/`remove_cache`/`cache_names`),
+  with `AdminFlag::Volatile`/`AdminFlag::Update` via `.with_flags()`.
+  Built on the generic named-task mechanism every Hot Rod
+  administration operation already uses server-side
+  (`EXEC_REQUEST`/`EXEC_RESPONSE`), no dedicated administration
+  opcodes. See `docs/adr/0014-remote-administration.md` (#55).
 
 ## [0.6.0] - 2026-10-10
 

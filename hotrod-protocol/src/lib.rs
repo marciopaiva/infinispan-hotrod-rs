@@ -36,6 +36,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 mod client;
 mod connection;
 mod digest;
@@ -62,6 +63,7 @@ mod typed_cache;
 mod varint;
 mod wire;
 
+pub use admin::{AdminFlag, Administration, CacheConfig};
 pub use client::HotRodClient;
 pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT};
 pub use error::{Error, MarshallingSide, Result};

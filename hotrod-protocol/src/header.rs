@@ -59,6 +59,11 @@ pub(crate) enum OpCode {
     AddClientListener = 0x25,
     RemoveClientListener = 0x27,
     Size = 0x29,
+    // Executes a named task (used for remote administration, e.g.
+    // "@@cache@create"; see docs/adr/0014-remote-administration.md).
+    // Confirmed against HotRodConstants.java on both sides. Normal
+    // "response = request + 1" convention.
+    Exec = 0x2B,
     PutAll = 0x2D,
     GetAll = 0x2F,
     // Streaming (protocol 4.1, Infinispan 15.1+): not the discontinued

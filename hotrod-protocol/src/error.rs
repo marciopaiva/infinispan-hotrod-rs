@@ -49,6 +49,14 @@ pub enum Error {
     #[error("malformed query request or response: {0}")]
     MalformedQueryResponse(String),
 
+    /// A remote administration task (`docs/adr/0014-remote-administration.md`)
+    /// returned a response this client could not parse as the JSON it
+    /// expected. The server-side task itself ran fine, there is no
+    /// protocol-level error here; this is `execute_task`'s success byte
+    /// array failing to parse once decoded.
+    #[error("malformed remote administration response: {0}")]
+    MalformedAdminResponse(String),
+
     /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
     /// knows this cursor, most likely because it sat idle past the
     /// server's five-minute reaper. No retry is attempted; see

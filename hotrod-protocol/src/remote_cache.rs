@@ -53,6 +53,7 @@ enum Operation {
     GetAll(Vec<Vec<u8>>),
     PutAll(Vec<(Vec<u8>, Vec<u8>)>, Expiration, Expiration),
     Query(Vec<u8>),
+    Exec(String, Vec<(String, Vec<u8>)>),
 }
 
 impl Operation {
@@ -79,6 +80,7 @@ impl Operation {
             Operation::GetAll(_) => "get_all",
             Operation::PutAll(..) => "put_all",
             Operation::Query(_) => "query",
+            Operation::Exec(..) => "exec",
         }
     }
 }
@@ -96,6 +98,7 @@ enum OperationResult {
     GetAll(HashMap<Vec<u8>, Vec<u8>>),
     PutAll,
     Query(QueryResult),
+    Exec(Vec<u8>),
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -152,6 +155,9 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
         Operation::Query(request_bytes) => {
             Ok(OperationResult::Query(conn.query(request_bytes).await?))
         }
+        Operation::Exec(task_name, params) => Ok(OperationResult::Exec(
+            conn.execute_task(task_name, params).await?,
+        )),
     }
 }
 
@@ -431,6 +437,20 @@ impl RemoteCache {
         match self.call_seed(Operation::Query(request_bytes)).await? {
             OperationResult::Query(result) => Ok(result),
             _ => unreachable!("Operation::Query always yields OperationResult::Query"),
+        }
+    }
+
+    /// Runs a named server-side task, see
+    /// `docs/adr/0014-remote-administration.md`. No key to route by,
+    /// same as `query`: always goes to the seed.
+    pub(crate) async fn run_exec(
+        &self,
+        task_name: String,
+        params: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<u8>> {
+        match self.call_seed(Operation::Exec(task_name, params)).await? {
+            OperationResult::Exec(result) => Ok(result),
+            _ => unreachable!("Operation::Exec always yields OperationResult::Exec"),
         }
     }
 
