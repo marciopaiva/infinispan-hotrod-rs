@@ -21,6 +21,7 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Authentication: GSSAPI | Yes | No ([#9](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/9)) |
 | TLS and mutual TLS | Yes | Yes |
 | Cluster topology tracking, hash-aware routing | Yes | Yes |
+| Configurable retry policy, per-node circuit breaker | Yes | Yes |
 | Client listeners (cache events) | Yes | Yes |
 | Near caching | Yes | Yes |
 | Transactions | Yes | No ([#47](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/47)) |

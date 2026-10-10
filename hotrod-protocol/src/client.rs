@@ -50,6 +50,7 @@ use tokio::task::JoinSet;
 use crate::connection::{HotRodConnection, DEFAULT_TIMEOUT, DEFAULT_TOPOLOGY_ID};
 use crate::error::{Error, Result};
 use crate::hash;
+use crate::health::NodeHealth;
 use crate::pool::{Checkout, ConnectionPool, PooledGuard};
 use crate::remote_cache::RemoteCache;
 use crate::stats::{CacheStatisticsInner, PoolStatistics};
@@ -62,6 +63,19 @@ use crate::topology::TopologyServer;
 /// multiplying the four `connect*` constructors by pool-size variants for
 /// a need that is still hypothetical. Revisit if that changes.
 const DEFAULT_MAX_CONNECTIONS_PER_NODE: usize = 8;
+
+/// Default number of retries `RemoteCache`'s dispatch loop makes after
+/// an operation's first attempt, before giving up and returning the
+/// last attempt's error. Same default as the Java client's
+/// `maxRetries` (`docs/adr/0011-retry-policy-and-node-health.md`).
+pub(crate) const DEFAULT_MAX_RETRIES: usize = 3;
+
+/// Default quarantine window `NodeHealth` applies to a node once it
+/// fails, matching the Java client's default `serverFailureTimeout`
+/// (`docs/adr/0011-retry-policy-and-node-health.md`). `None` disables
+/// quarantine entirely, the idiomatic equivalent of the Java client's
+/// `-1` sentinel.
+pub(crate) const DEFAULT_SERVER_FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Credentials for one SASL mechanism, kept so a connection opened later
 /// to any node, for any cache, can be authenticated the same way as the
@@ -177,6 +191,17 @@ pub(crate) struct ClientInner {
     /// scoped by cache name, the same way `pools` is, not aggregated
     /// across the whole client.
     pub(crate) cache_stats: RwLock<HashMap<String, Arc<CacheStatisticsInner>>>,
+    /// The per-node circuit breaker `RemoteCache`'s dispatch loop
+    /// consults when building a retry candidate list and updates on
+    /// every attempt's outcome. See `docs/adr/0011-retry-policy-and-node-health.md`.
+    pub(crate) node_health: NodeHealth,
+    /// How long a node stays quarantined after `node_health` records a
+    /// failure against it. `None` disables quarantine.
+    pub(crate) server_failure_timeout: RwLock<Option<Duration>>,
+    /// How many times `RemoteCache`'s dispatch loop retries an
+    /// operation, beyond its first attempt, before surfacing the last
+    /// attempt's error.
+    pub(crate) max_retries: RwLock<usize>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation
@@ -338,6 +363,9 @@ impl HotRodClient {
                         tls,
                         timeout: RwLock::new(timeout),
                         cache_stats: RwLock::new(HashMap::new()),
+                        node_health: NodeHealth::default(),
+                        server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+                        max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
                     })));
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -389,6 +417,50 @@ impl HotRodClient {
         {
             pool.set_idle_timeouts(timeout);
         }
+    }
+
+    /// How many times `RemoteCache`'s dispatch loop retries an
+    /// operation, beyond its first attempt, before surfacing the last
+    /// attempt's error. See
+    /// `docs/adr/0011-retry-policy-and-node-health.md`.
+    pub fn max_retries(&self) -> usize {
+        *self.0.max_retries.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Overrides `max_retries` from this call onward.
+    pub fn set_max_retries(&self, max_retries: usize) {
+        *self
+            .0
+            .max_retries
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = max_retries;
+    }
+
+    /// How long a node stays quarantined (skipped as a retry candidate)
+    /// after it fails, or `None` if quarantine is disabled. See
+    /// `docs/adr/0011-retry-policy-and-node-health.md`.
+    pub fn server_failure_timeout(&self) -> Option<Duration> {
+        *self
+            .0
+            .server_failure_timeout
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Overrides `server_failure_timeout` from this call onward. `None`
+    /// disables quarantine: every candidate is tried regardless of
+    /// recent failures.
+    pub fn set_server_failure_timeout(&self, server_failure_timeout: Option<Duration>) {
+        *self
+            .0
+            .server_failure_timeout
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = server_failure_timeout;
+    }
+
+    /// `pub(crate)` accessor for `remote_cache.rs`'s dispatch loop.
+    pub(crate) fn node_health(&self) -> &NodeHealth {
+        &self.0.node_health
     }
 
     /// Authenticates using SASL PLAIN. See
@@ -502,13 +574,12 @@ impl HotRodClient {
             .map_or(DEFAULT_TOPOLOGY_ID, |topology| topology.topology_id)
     }
 
-    /// The address to route `key` to, and the topology server it came
-    /// from: the segment's primary owner once a topology is known,
-    /// otherwise the seed connection with no origin.
-    pub(crate) async fn owner_addr(
-        &self,
-        key: &[u8],
-    ) -> Result<(SocketAddr, Option<TopologyServer>)> {
+    /// `active_seed_addr` and a clone of the current topology, if any,
+    /// read together: the preamble `owner_addr`,
+    /// `owner_and_backup_addrs` and `nodes_and_owned_segments` each
+    /// start with, shared so a future change to it cannot silently
+    /// drift between the three copies it would otherwise be.
+    fn active_seed_and_topology(&self) -> (SocketAddr, Option<Arc<ClusterTopology>>) {
         let active_seed = *self
             .0
             .active_seed_addr
@@ -520,6 +591,17 @@ impl HotRodClient {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        (active_seed, topology)
+    }
+
+    /// The address to route `key` to, and the topology server it came
+    /// from: the segment's primary owner once a topology is known,
+    /// otherwise the seed connection with no origin.
+    pub(crate) async fn owner_addr(
+        &self,
+        key: &[u8],
+    ) -> Result<(SocketAddr, Option<TopologyServer>)> {
+        let (active_seed, topology) = self.active_seed_and_topology();
         let Some(topology) = topology else {
             return Ok((active_seed, None));
         };
@@ -541,6 +623,51 @@ impl HotRodClient {
         Ok((addr, Some(server)))
     }
 
+    /// Every owner of `key`'s segment, primary first then backups in
+    /// the order `segment_owners` lists them, with the active seed
+    /// always appended last as the final fallback, or just the active
+    /// seed alone if no topology is known yet: the retry candidate
+    /// list `RemoteCache`'s dispatch loop builds for a keyed operation
+    /// (`docs/adr/0011-retry-policy-and-node-health.md`). Unlike
+    /// `owner_addr`, used by `get_stream`/`put_stream`, which pin to
+    /// one connection and never retry, so resolving backups for them
+    /// would be wasted work.
+    ///
+    /// An owner whose host fails to resolve is skipped rather than
+    /// aborting the whole list: a single bad backup should not discard
+    /// a primary owner that already resolved successfully, or the
+    /// active seed this always falls back to.
+    pub(crate) async fn owner_and_backup_addrs(
+        &self,
+        key: &[u8],
+    ) -> Result<Vec<(SocketAddr, Option<TopologyServer>)>> {
+        let (active_seed, topology) = self.active_seed_and_topology();
+        let Some(topology) = topology else {
+            return Ok(vec![(active_seed, None)]);
+        };
+        if topology.segment_owners.is_empty() {
+            return Ok(vec![(active_seed, None)]);
+        }
+        let segment = hash::segment(
+            key,
+            topology.segment_owners.len() as u32,
+            topology.hash_function_version,
+        )?;
+        let owners = &topology.segment_owners[segment as usize];
+        let mut result = Vec::with_capacity(owners.len() + 1);
+        for &owner in owners {
+            // Safe: `topology::read_topology_update` rejects any owner
+            // index that is out of range for `servers` before this
+            // type is built.
+            let server = topology.servers[owner as usize].clone();
+            if let Ok(addr) = resolve_cached_addr(&topology, owner).await {
+                result.push((addr, Some(server)));
+            }
+        }
+        result.push((active_seed, None));
+        Ok(result)
+    }
+
     /// Every node that primary-owns at least one segment, each paired with
     /// the segments it owns: the fan-out plan for `CacheIterator` (see
     /// `iteration.rs`), which opens one server-side iterator per entry here,
@@ -554,17 +681,7 @@ impl HotRodClient {
     pub(crate) async fn nodes_and_owned_segments(
         &self,
     ) -> Result<Vec<(SocketAddr, Option<TopologyServer>, Vec<u32>)>> {
-        let active_seed = *self
-            .0
-            .active_seed_addr
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let topology = self
-            .0
-            .topology
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let (active_seed, topology) = self.active_seed_and_topology();
         let Some(topology) = topology else {
             return Ok(vec![(active_seed, None, Vec::new())]);
         };
@@ -805,11 +922,18 @@ impl HotRodClient {
     /// closed and dropped rather than kept open forever. The seed address
     /// is always kept regardless, since it is the permanent retry
     /// fallback.
+    ///
+    /// Also lifts every node's quarantine (`node_health.clear_all()`)
+    /// when the topology id actually changed: a new topology already
+    /// means the cluster's membership view changed, so stale quarantine
+    /// state from before it should not outlive it
+    /// (`docs/adr/0011-retry-policy-and-node-health.md`).
     pub(crate) fn record_topology_update(&self, conn: &mut HotRodConnection) {
         let Some(update) = conn.take_pending_topology_update() else {
             return;
         };
 
+        let old_topology_id = self.current_topology_id();
         let new_topology = Arc::new(ClusterTopology {
             topology_id: update.topology_id as i32,
             servers: update.servers,
@@ -817,6 +941,9 @@ impl HotRodClient {
             segment_owners: update.segment_owners,
             resolved_addrs: RwLock::new(HashMap::new()),
         });
+        if new_topology.topology_id != old_topology_id {
+            self.0.node_health.clear_all();
+        }
         *self.0.topology.write().unwrap_or_else(|p| p.into_inner()) = Some(new_topology.clone());
 
         let active_seed = *self
@@ -939,6 +1066,36 @@ pub(crate) mod tests {
     async fn connect_fails_with_no_seed_addresses() {
         let result = HotRodClient::connect(&[]).await;
         assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn max_retries_and_server_failure_timeout_default_and_can_be_overridden() {
+        let client = HotRodClient::from_inner(ClientInner {
+            seed_addrs: vec![],
+            active_seed_addr: RwLock::new("127.0.0.1:1".parse().unwrap()),
+            topology: RwLock::new(None),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(None),
+            tls: None,
+            timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+        });
+
+        assert_eq!(client.max_retries(), DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            client.server_failure_timeout(),
+            Some(DEFAULT_SERVER_FAILURE_TIMEOUT)
+        );
+
+        client.set_max_retries(7);
+        client.set_server_failure_timeout(None);
+
+        assert_eq!(client.max_retries(), 7);
+        assert_eq!(client.server_failure_timeout(), None);
     }
 
     /// Binds a listener and immediately drops it, so the returned address
@@ -1252,6 +1409,9 @@ pub(crate) mod tests {
             tls: None,
             timeout: RwLock::new(Duration::from_secs(5)),
             cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
         });
 
         client
@@ -1329,6 +1489,9 @@ pub(crate) mod tests {
             tls: None,
             timeout: RwLock::new(Duration::from_secs(5)),
             cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
         });
 
         client
@@ -1376,6 +1539,9 @@ pub(crate) mod tests {
             tls: None,
             timeout: RwLock::new(Duration::from_millis(200)),
             cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
         });
 
         // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed

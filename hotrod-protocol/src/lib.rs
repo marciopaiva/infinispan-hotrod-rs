@@ -42,6 +42,7 @@ mod digest;
 mod error;
 mod hash;
 mod header;
+mod health;
 mod iteration;
 mod listener;
 mod near_cache;
