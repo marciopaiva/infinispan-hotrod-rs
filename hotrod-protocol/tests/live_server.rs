@@ -833,6 +833,49 @@ async fn typed_cache_put_get_remove_roundtrip_with_utf8_marshaller() {
 
 #[tokio::test]
 #[ignore]
+async fn query_round_trips_against_a_real_server_after_registering_a_schema() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    client
+        .register_proto_schema(
+            "live-server-test.proto",
+            "package live_server_test;\nmessage Widget {\n   optional string name = 1;\n}\n",
+        )
+        .await
+        .expect("register schema");
+
+    // No `Widget` was ever stored (and this crate has no Protobuf
+    // marshaller of its own to store one with, per
+    // docs/adr/0013-remote-query.md): this only exercises the wire
+    // round-trip itself (the query envelope's own Protobuf encoding,
+    // real against a real server, not just this crate's own fake one)
+    // and schema registration, both confirmed empirically to need
+    // `application/x-protostream` declared, never that an entry is
+    // actually found.
+    let result = client
+        .cache("")
+        .query("FROM live_server_test.Widget")
+        .execute()
+        .await
+        .expect("query should round-trip against a real server");
+
+    assert_eq!(result.rows, Vec::new());
+    assert_eq!(result.hit_count, 0);
+}
+
+#[tokio::test]
+#[ignore]
 async fn cluster_contains_key_reflects_presence() {
     let _guard = lock_live_server();
     let cluster = connect_cluster().await;

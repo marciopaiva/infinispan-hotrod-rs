@@ -37,6 +37,7 @@ use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
 use crate::header::OpCode;
 use crate::listener::{write_factory_params, ServerFactory, MAX_FACTORY_PARAMS};
+use crate::query::{decode_query_response, QueryResult};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::tls::{self, TlsConfig, Transport};
@@ -780,6 +781,30 @@ impl HotRodConnection {
         result
     }
 
+    /// Runs a remote query (Ickle), `docs/adr/0013-remote-query.md`.
+    /// `request_bytes` is already the Protobuf-encoded `QueryRequest`
+    /// body (`query::encode_query_request`); wrapped here in a Hot Rod
+    /// array the same way the Java client carries it
+    /// (`QueryOperation.writeOperationRequest` calls `ByteBufUtil.
+    /// writeArray`, never writing the Protobuf bytes to the Hot Rod
+    /// buffer directly), and the response read back the same way.
+    pub(crate) async fn query(&mut self, request_bytes: &[u8]) -> Result<QueryResult> {
+        self.begin_operation()?;
+        let timeout = self.timeout;
+        let result = with_timeout(timeout, async {
+            let mut body = Vec::new();
+            write_array(&mut body, request_bytes);
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::Query, &body)
+                .await?;
+            let response_bytes = read_array(&mut self.stream).await?;
+            decode_query_response(&response_bytes)
+        })
+        .await;
+        self.end_operation(result.is_ok());
+        result
+    }
+
     /// Fetches every key in `keys` that exists, in one request. A key with
     /// no entry is simply missing from the result map, the same as `get`
     /// returning `None` for it.
@@ -1256,6 +1281,29 @@ impl HotRodConnection {
         let message_id = self.next_message_id;
         self.next_message_id += 1;
 
+        // Query is the one operation whose request/response bodies are
+        // themselves Protobuf, and the server picks how to decode them
+        // based on this declared media type
+        // (`docs/adr/0013-remote-query.md`). `___protobuf_metadata`'s
+        // own storage is fixed to protostream server-side regardless
+        // of what a request declares, confirmed empirically (a write
+        // declaring "none" was rejected outright); this applies to
+        // every operation against that cache, not just
+        // `register_proto_schema`'s write, since a read would need the
+        // same declaration to correctly interpret what comes back.
+        // `PROTOBUF_METADATA_CACHE_NAME`'s triple-underscore prefix is
+        // Infinispan's own reserved-name convention for internal
+        // caches, not something a real user cache plausibly collides
+        // with. Every other operation, against every other cache,
+        // still declares "none", unchanged.
+        let media_type = if matches!(opcode, OpCode::Query)
+            || cache_name == crate::client::PROTOBUF_METADATA_CACHE_NAME.as_bytes()
+        {
+            crate::header::RequestMediaType::Protostream
+        } else {
+            crate::header::RequestMediaType::None
+        };
+
         let mut header = crate::header::write_and_read_header(
             &mut self.stream,
             message_id,
@@ -1264,6 +1312,7 @@ impl HotRodConnection {
             self.intelligence,
             self.topology_id,
             body,
+            media_type,
         )
         .await?;
         if let Some(update) = &header.topology_update {
@@ -1332,8 +1381,13 @@ mod tests {
         let _flags = crate::varint::read_vint(stream).await.unwrap();
         let _intelligence = stream.read_u8().await.unwrap();
         let _topology_id = crate::varint::read_vint(stream).await.unwrap();
-        let _key_media_type = stream.read_u8().await.unwrap();
-        let _value_media_type = stream.read_u8().await.unwrap();
+        // Not two bare bytes: most requests declare "none" (one zero
+        // byte each), but the query operation and any operation
+        // against `___protobuf_metadata` declare a real predefined
+        // media type (`docs/adr/0013-remote-query.md`), which is
+        // longer. `skip_media_type` already knows the real format.
+        crate::wire::skip_media_type(stream).await.unwrap();
+        crate::wire::skip_media_type(stream).await.unwrap();
         let _additional_params = crate::varint::read_vint(stream).await.unwrap();
         (message_id, opcode)
     }

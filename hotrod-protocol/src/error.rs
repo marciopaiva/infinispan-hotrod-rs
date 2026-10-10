@@ -46,6 +46,9 @@ pub enum Error {
     #[error("malformed server-side iteration response: {0}")]
     MalformedIterationResponse(String),
 
+    #[error("malformed query request or response: {0}")]
+    MalformedQueryResponse(String),
+
     /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
     /// knows this cursor, most likely because it sat idle past the
     /// server's five-minute reaper. No retry is attempted; see

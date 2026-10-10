@@ -22,6 +22,7 @@ use crate::iteration::{CacheIterator, IterationOptions, NodeIterator};
 use crate::listener::{CacheListener, ListenOptions};
 use crate::marshall::Marshaller;
 use crate::near_cache::{NearCacheOptions, NearCachedCache};
+use crate::query::{Query, QueryResult};
 use crate::stats::ClientStatistics;
 use crate::streaming::{GetStream, PutStream};
 use crate::topology::TopologyServer;
@@ -51,6 +52,7 @@ enum Operation {
     Stats,
     GetAll(Vec<Vec<u8>>),
     PutAll(Vec<(Vec<u8>, Vec<u8>)>, Expiration, Expiration),
+    Query(Vec<u8>),
 }
 
 impl Operation {
@@ -76,6 +78,7 @@ impl Operation {
             Operation::Stats => "stats",
             Operation::GetAll(_) => "get_all",
             Operation::PutAll(..) => "put_all",
+            Operation::Query(_) => "query",
         }
     }
 }
@@ -92,6 +95,7 @@ enum OperationResult {
     Stats(HashMap<String, String>),
     GetAll(HashMap<Vec<u8>, Vec<u8>>),
     PutAll,
+    Query(QueryResult),
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -144,6 +148,9 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
             )
             .await?;
             Ok(OperationResult::PutAll)
+        }
+        Operation::Query(request_bytes) => {
+            Ok(OperationResult::Query(conn.query(request_bytes).await?))
         }
     }
 }
@@ -410,6 +417,21 @@ impl RemoteCache {
         value_marshaller: MV,
     ) -> TypedCache<MK, MV> {
         TypedCache::new(self.clone(), key_marshaller, value_marshaller)
+    }
+
+    /// Runs `query` (Ickle) against this cache, see
+    /// `docs/adr/0013-remote-query.md`. No key to route by, same as
+    /// `get_all`/`put_all`/`size`/`clear`: always goes to the seed, which
+    /// is free to run the query cluster-wide or forward it as needed.
+    pub fn query(&self, query: impl Into<String>) -> Query<'_> {
+        Query::new(self, query.into())
+    }
+
+    pub(crate) async fn run_query(&self, request_bytes: Vec<u8>) -> Result<QueryResult> {
+        match self.call_seed(Operation::Query(request_bytes)).await? {
+            OperationResult::Query(result) => Ok(result),
+            _ => unreachable!("Operation::Query always yields OperationResult::Query"),
+        }
     }
 
     /// Opens a stream to read `key`'s value in chunks of up to
@@ -852,8 +874,13 @@ pub(crate) mod tests {
         DEFAULT_SERVER_FAILURE_TIMEOUT,
     };
     use crate::health::NodeHealth;
+    use crate::protobuf_wire::{read_length_delimited, read_tag, WIRE_TYPE_VARINT};
+    use crate::query::test_support::{
+        query_response_bytes, wrapped_entity_bytes, wrapped_scalar_bytes,
+    };
+    use crate::query::{QueryRow, QueryValue};
     use crate::topology::TopologyServer;
-    use crate::varint::{read_vint, write_vint};
+    use crate::varint::{read_vint, read_vlong, write_vint};
     use crate::wire::{read_array, write_array};
 
     /// Builds a client with a fixed seed list and active seed, bypassing
@@ -1611,6 +1638,192 @@ pub(crate) mod tests {
         cache.clear().await.expect("clear");
         cache.ping().await.expect("ping");
         assert!(cache.stats().await.expect("stats").is_empty());
+
+        seed_task.await.unwrap();
+    }
+
+    /// `register_proto_schema`'s wire format was confirmed only
+    /// "empirically" against a live server
+    /// (`docs/adr/0013-remote-query.md`); this is its fake-server
+    /// regression coverage: a predefined `application/x-protostream`
+    /// media type (id 12) declared for both key and value, both
+    /// `WrappedMessage`-wrapped as strings, not sent as raw bytes.
+    #[tokio::test]
+    async fn register_proto_schema_declares_protostream_and_wraps_key_and_value() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            assert_eq!(
+                stream.read_u8().await.unwrap(),
+                0xA0,
+                "expected a request magic byte"
+            );
+            let id = read_vlong(&mut stream).await.unwrap();
+            let _version = stream.read_u8().await.unwrap();
+            let opcode = stream.read_u8().await.unwrap();
+            assert_eq!(opcode, 0x01, "expected a Put request");
+            let cache_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(cache_name, b"___protobuf_metadata");
+            let _flags = read_vint(&mut stream).await.unwrap();
+            let _intelligence = stream.read_u8().await.unwrap();
+            let _topology_id = read_vint(&mut stream).await.unwrap();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    stream.read_u8().await.unwrap(),
+                    1,
+                    "expected a predefined media type, not \"none\""
+                );
+                assert_eq!(
+                    read_vint(&mut stream).await.unwrap(),
+                    12,
+                    "expected application/x-protostream's predefined id"
+                );
+                assert_eq!(
+                    read_vint(&mut stream).await.unwrap(),
+                    0,
+                    "expected no media type parameters"
+                );
+            }
+            let _additional_params = read_vint(&mut stream).await.unwrap();
+
+            let key = read_array(&mut stream).await.unwrap();
+            let _time_units = stream.read_u8().await.unwrap();
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(
+                key,
+                wrapped_scalar_bytes(&QueryValue::String("my-schema.proto".to_string()))
+            );
+            assert_eq!(
+                value,
+                wrapped_scalar_bytes(&QueryValue::String("message Foo {}".to_string()))
+            );
+
+            let resp = response_header(id, 0x02, 0x00);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        client
+            .register_proto_schema("my-schema.proto", "message Foo {}")
+            .await
+            .expect("register_proto_schema should succeed");
+
+        seed_task.await.unwrap();
+    }
+
+    /// `docs/adr/0013-remote-query.md`: no key to route by, so `query`
+    /// always targets the seed, same as `size`/`clear`/`ping`/`stats`.
+    /// Without a projection, each result is a whole entity.
+    #[tokio::test]
+    async fn query_targets_the_seed_and_returns_whole_entities() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let request_body = read_array(&mut stream).await.unwrap();
+            assert!(String::from_utf8_lossy(&request_body).contains("FROM org.example.User"));
+
+            let response = query_response_bytes(
+                0,
+                &[wrapped_entity_bytes("org.example.User", b"entity-bytes")],
+                1,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let result = client
+            .cache("my-cache")
+            .query("FROM org.example.User")
+            .execute()
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(
+            result.rows,
+            vec![QueryRow::Entity(b"entity-bytes".to_vec())]
+        );
+        assert_eq!(result.hit_count, 1);
+
+        seed_task.await.unwrap();
+    }
+
+    /// With a projection (`SELECT a, b`), results group into one row per
+    /// `projection_size` consecutive `WrappedMessage`s.
+    #[tokio::test]
+    async fn query_with_projection_returns_columns() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let request_body = read_array(&mut stream).await.unwrap();
+            assert!(String::from_utf8_lossy(&request_body).contains("SELECT name, age"));
+            // Confirm the named parameter made it into the request too,
+            // rather than only checking the response path.
+            let mut pos = 0;
+            let mut saw_named_parameters = false;
+            while let Some((field, wire_type)) = read_tag(&request_body, &mut pos).unwrap() {
+                if field == 5 {
+                    saw_named_parameters = true;
+                    read_length_delimited(&request_body, &mut pos).unwrap();
+                } else if wire_type == WIRE_TYPE_VARINT {
+                    crate::protobuf_wire::read_varint(&request_body, &mut pos).unwrap();
+                } else {
+                    read_length_delimited(&request_body, &mut pos).unwrap();
+                }
+            }
+            assert!(
+                saw_named_parameters,
+                "expected namedParameters in the request"
+            );
+
+            let response = query_response_bytes(
+                2,
+                &[
+                    wrapped_scalar_bytes(&QueryValue::String("Alice".to_string())),
+                    wrapped_scalar_bytes(&QueryValue::Int32(30)),
+                    wrapped_scalar_bytes(&QueryValue::String("Bob".to_string())),
+                    wrapped_scalar_bytes(&QueryValue::Int32(40)),
+                ],
+                2,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let result = client
+            .cache("my-cache")
+            .query("SELECT name, age FROM org.example.User WHERE age >= :minAge")
+            .param("minAge", QueryValue::Int32(18))
+            .execute()
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(
+            result.rows,
+            vec![
+                QueryRow::Columns(vec![
+                    QueryValue::String("Alice".to_string()),
+                    QueryValue::Int32(30)
+                ]),
+                QueryRow::Columns(vec![
+                    QueryValue::String("Bob".to_string()),
+                    QueryValue::Int32(40)
+                ]),
+            ]
+        );
+        assert_eq!(result.hit_count, 2);
 
         seed_task.await.unwrap();
     }

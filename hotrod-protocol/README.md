@@ -30,7 +30,7 @@ for release notes.
 | Multimap cache | Yes | No |
 | Counters | Yes | No |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
-| Remote query (Protobuf / Ickle) | Yes | No |
+| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; no DELETE/UPDATE statements yet) |
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
@@ -173,6 +173,29 @@ this costs nothing:
 ```rust
 tracing_subscriber::fmt::init(); // or any other subscriber
 cache.get(b"key").await?; // now shows up as a span in whatever the subscriber does with it
+```
+
+`register_proto_schema` registers a `.proto` schema with the server;
+`query` runs an Ickle query, with named parameters and paging, against
+entries stored in that schema's format:
+
+```rust
+client
+    .register_proto_schema("book.proto", "package demo;\nmessage Book {\n  optional string title = 1;\n}\n")
+    .await?;
+
+let result = cache
+    .query("FROM demo.Book WHERE title = :title")
+    .param("title", QueryValue::String("Dune".to_string()))
+    .max_results(10)
+    .execute()
+    .await?;
+
+for row in result.rows {
+    if let QueryRow::Entity(bytes) = row {
+        // decode `bytes` with whatever Marshaller matches the Book schema
+    }
+}
 ```
 
 ## License
