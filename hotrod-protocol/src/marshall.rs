@@ -35,12 +35,15 @@ pub trait Marshaller: Send + Sync {
     /// implement `std::error::Error`, not this crate's own `Error`.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Converts `value` into the bytes a `RemoteCache` operation
-    /// sends as a key or a value.
+    /// The direction `TypedCache` needs before sending anything: every
+    /// typed write marshals both the key and the value this way before
+    /// the underlying `RemoteCache` ever touches the network.
     fn marshall(&self, value: &Self::Value) -> Result<Vec<u8>, Self::Error>;
 
-    /// Converts bytes a `RemoteCache` operation received back as a
-    /// key or a value into a typed value.
+    /// The reverse direction, needed for any typed read: a key or
+    /// value `RemoteCache` gets back from the server is always raw
+    /// bytes, never something this crate can hand back typed on its
+    /// own.
     fn unmarshall(&self, bytes: &[u8]) -> Result<Self::Value, Self::Error>;
 }
 
@@ -75,7 +78,7 @@ impl Marshaller for Utf8Marshaller {
     type Error = FromUtf8Error;
 
     fn marshall(&self, value: &String) -> Result<Vec<u8>, FromUtf8Error> {
-        Ok(value.clone().into_bytes())
+        Ok(value.as_bytes().to_vec())
     }
 
     fn unmarshall(&self, bytes: &[u8]) -> Result<String, FromUtf8Error> {

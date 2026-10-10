@@ -99,11 +99,18 @@ Java client's `IdentityMarshaller`/`BytesOnlyMarshaller`) and
 `Utf8Marshaller` (`Value = String`, `Error = FromUtf8Error`,
 mirroring `UTF8StringMarshaller`).
 
-`Error::Marshalling(Box<dyn std::error::Error + Send + Sync>)` added
-to `error.rs`: `TypedCache` wraps any `MK::Error`/`MV::Error` into
-this, so every method still returns this crate's own `Result<T>`
-rather than forcing a specific error type on every marshaller
-implementor.
+`Error::Marshalling { side: MarshallingSide, source: Box<dyn
+std::error::Error + Send + Sync> }` added to `error.rs`: `TypedCache`
+wraps any `MK::Error`/`MV::Error` into this, so every method still
+returns this crate's own `Result<T>` rather than forcing a specific
+error type on every marshaller implementor. `side` says whether the
+failure happened on the key or the value, so a caller with
+differently-fallible key/value marshallers does not have to
+string-match the inner error's message to tell them apart. No
+`#[from]` on this variant: it is constructed only by `TypedCache`'s
+own `wrap` helper, so an unrelated future `Box<dyn Error + Send +
+Sync>` elsewhere in the crate can never silently convert into it
+through a bare `?`.
 
 **`TypedCache<MK, MV>` (`typed_cache.rs`), `Arc`-wrapped marshallers,
 not a `Clone` bound on `MK`/`MV` themselves**, so a marshaller can hold

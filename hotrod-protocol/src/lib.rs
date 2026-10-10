@@ -62,7 +62,7 @@ mod wire;
 
 pub use client::HotRodClient;
 pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_TIMEOUT};
-pub use error::{Error, Result};
+pub use error::{Error, MarshallingSide, Result};
 pub use iteration::{CacheIterator, IterationEntry, IterationOptions};
 pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions, ServerFactory};
 pub use marshall::{BytesMarshaller, Marshaller, Utf8Marshaller};

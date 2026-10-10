@@ -141,13 +141,38 @@ pub enum Error {
     #[error("invalid TLS certificate or key material: {0}")]
     InvalidTlsMaterial(String),
 
-    /// A `Marshaller::marshall`/`unmarshall` call failed, wrapped from
-    /// whatever error type that marshaller uses
+    /// A `Marshaller::marshall`/`unmarshall` call failed on `side`,
+    /// wrapped from whatever error type that marshaller uses
     /// (`docs/adr/0012-serialization-abstraction.md`). `TypedCache` is
     /// the only thing that produces this; nothing byte-oriented ever
-    /// does.
-    #[error("failed to marshall or unmarshall a value: {0}")]
-    Marshalling(#[from] Box<dyn std::error::Error + Send + Sync>),
+    /// does. No `#[from]`: `TypedCache::wrap` is the only place this is
+    /// ever constructed, deliberately, so an unrelated future
+    /// `Box<dyn Error + Send + Sync>` elsewhere in the crate can never
+    /// silently convert into this variant through a bare `?`.
+    #[error("failed to marshall or unmarshall a {side}: {source}")]
+    Marshalling {
+        side: MarshallingSide,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Which side of a `TypedCache` operation a `Error::Marshalling`
+/// failure happened on: the key or the value. A caller with
+/// differently-fallible key and value marshallers can match on this
+/// without resorting to string-matching the inner error's message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarshallingSide {
+    Key,
+    Value,
+}
+
+impl std::fmt::Display for MarshallingSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MarshallingSide::Key => "key",
+            MarshallingSide::Value => "value",
+        })
+    }
 }
 
 /// Result alias for `hotrod_protocol::Error`.

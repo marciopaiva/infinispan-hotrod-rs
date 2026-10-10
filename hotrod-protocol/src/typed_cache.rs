@@ -23,13 +23,16 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::connection::VersionedResult;
-use crate::error::{Error, Result};
+use crate::error::{Error, MarshallingSide, Result};
 use crate::marshall::Marshaller;
 use crate::remote_cache::RemoteCache;
 use crate::wire::Expiration;
 
-fn wrap<E: std::error::Error + Send + Sync + 'static>(err: E) -> Error {
-    Error::Marshalling(Box::new(err))
+fn wrap<E: std::error::Error + Send + Sync + 'static>(side: MarshallingSide, err: E) -> Error {
+    Error::Marshalling {
+        side,
+        source: Box::new(err),
+    }
 }
 
 /// `VersionedValue`'s typed equivalent: `get_with_version`'s metadata,
@@ -52,11 +55,25 @@ pub struct TypedVersionedValue<V> {
 /// requiring `MK`/`MV` themselves to be `Clone`, so a marshaller can
 /// hold state that is not cheap (or not possible) to clone, such as a
 /// compiled schema.
-#[derive(Clone)]
 pub struct TypedCache<MK: Marshaller, MV: Marshaller> {
     cache: RemoteCache,
     key_marshaller: Arc<MK>,
     value_marshaller: Arc<MV>,
+}
+
+// Not `#[derive(Clone)]`: that adds a `Clone` bound on every generic
+// parameter of the struct regardless of how it is actually stored, so
+// a derived impl would require `MK: Clone`/`MV: Clone` even though the
+// only `MK`/`MV`-typed fields are behind an `Arc`, contradicting this
+// type's own doc comment above.
+impl<MK: Marshaller, MV: Marshaller> Clone for TypedCache<MK, MV> {
+    fn clone(&self) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            key_marshaller: self.key_marshaller.clone(),
+            value_marshaller: self.value_marshaller.clone(),
+        }
+    }
 }
 
 impl<MK: Marshaller, MV: Marshaller> Deref for TypedCache<MK, MV> {
@@ -76,14 +93,37 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         }
     }
 
+    /// Shared by every method below instead of each repeating
+    /// `self.key_marshaller.marshall(key).map_err(...)`: also the one
+    /// place that attaches `MarshallingSide::Key` to a failure.
+    fn marshall_key(&self, key: &MK::Value) -> Result<Vec<u8>> {
+        self.key_marshaller
+            .marshall(key)
+            .map_err(|err| wrap(MarshallingSide::Key, err))
+    }
+
+    fn unmarshall_key(&self, bytes: &[u8]) -> Result<MK::Value> {
+        self.key_marshaller
+            .unmarshall(bytes)
+            .map_err(|err| wrap(MarshallingSide::Key, err))
+    }
+
+    fn marshall_value(&self, value: &MV::Value) -> Result<Vec<u8>> {
+        self.value_marshaller
+            .marshall(value)
+            .map_err(|err| wrap(MarshallingSide::Value, err))
+    }
+
+    fn unmarshall_value(&self, bytes: &[u8]) -> Result<MV::Value> {
+        self.value_marshaller
+            .unmarshall(bytes)
+            .map_err(|err| wrap(MarshallingSide::Value, err))
+    }
+
     pub async fn get(&self, key: &MK::Value) -> Result<Option<MV::Value>> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
         match self.cache.get(&key_bytes).await? {
-            Some(value_bytes) => Ok(Some(
-                self.value_marshaller
-                    .unmarshall(&value_bytes)
-                    .map_err(wrap)?,
-            )),
+            Some(value_bytes) => Ok(Some(self.unmarshall_value(&value_bytes)?)),
             None => Ok(None),
         }
     }
@@ -95,8 +135,8 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
-        let value_bytes = self.value_marshaller.marshall(value).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
+        let value_bytes = self.marshall_value(value)?;
         self.cache
             .put(&key_bytes, &value_bytes, lifespan, max_idle)
             .await
@@ -109,8 +149,8 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<bool> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
-        let value_bytes = self.value_marshaller.marshall(value).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
+        let value_bytes = self.marshall_value(value)?;
         self.cache
             .put_if_absent(&key_bytes, &value_bytes, lifespan, max_idle)
             .await
@@ -123,15 +163,15 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<bool> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
-        let value_bytes = self.value_marshaller.marshall(value).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
+        let value_bytes = self.marshall_value(value)?;
         self.cache
             .replace(&key_bytes, &value_bytes, lifespan, max_idle)
             .await
     }
 
     pub async fn remove(&self, key: &MK::Value) -> Result<bool> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
         self.cache.remove(&key_bytes).await
     }
 
@@ -139,13 +179,10 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         &self,
         key: &MK::Value,
     ) -> Result<Option<TypedVersionedValue<MV::Value>>> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
         match self.cache.get_with_version(&key_bytes).await? {
             Some(versioned) => Ok(Some(TypedVersionedValue {
-                value: self
-                    .value_marshaller
-                    .unmarshall(&versioned.value)
-                    .map_err(wrap)?,
+                value: self.unmarshall_value(&versioned.value)?,
                 version: versioned.version,
                 created: versioned.created,
                 lifespan: versioned.lifespan,
@@ -164,8 +201,8 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<VersionedResult> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
-        let value_bytes = self.value_marshaller.marshall(value).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
+        let value_bytes = self.marshall_value(value)?;
         self.cache
             .replace_if_unmodified(&key_bytes, &value_bytes, version, lifespan, max_idle)
             .await
@@ -176,12 +213,12 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         key: &MK::Value,
         version: u64,
     ) -> Result<VersionedResult> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
         self.cache.remove_if_unmodified(&key_bytes, version).await
     }
 
     pub async fn contains_key(&self, key: &MK::Value) -> Result<bool> {
-        let key_bytes = self.key_marshaller.marshall(key).map_err(wrap)?;
+        let key_bytes = self.marshall_key(key)?;
         self.cache.contains_key(&key_bytes).await
     }
 
@@ -196,18 +233,16 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
     where
         MK::Value: Eq + Hash + 'k,
     {
-        let mut key_bytes_list = Vec::new();
+        let keys = keys.into_iter();
+        let mut key_bytes_list = Vec::with_capacity(keys.size_hint().0);
         for key in keys {
-            key_bytes_list.push(self.key_marshaller.marshall(key).map_err(wrap)?);
+            key_bytes_list.push(self.marshall_key(key)?);
         }
         let raw = self.cache.get_all(key_bytes_list).await?;
         let mut result = HashMap::with_capacity(raw.len());
         for (key_bytes, value_bytes) in raw {
-            let key = self.key_marshaller.unmarshall(&key_bytes).map_err(wrap)?;
-            let value = self
-                .value_marshaller
-                .unmarshall(&value_bytes)
-                .map_err(wrap)?;
+            let key = self.unmarshall_key(&key_bytes)?;
+            let value = self.unmarshall_value(&value_bytes)?;
             result.insert(key, value);
         }
         Ok(result)
@@ -222,10 +257,11 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
         lifespan: Expiration,
         max_idle: Expiration,
     ) -> Result<()> {
-        let mut entry_bytes_list = Vec::new();
+        let entries = entries.into_iter();
+        let mut entry_bytes_list = Vec::with_capacity(entries.size_hint().0);
         for (key, value) in entries {
-            let key_bytes = self.key_marshaller.marshall(&key).map_err(wrap)?;
-            let value_bytes = self.value_marshaller.marshall(&value).map_err(wrap)?;
+            let key_bytes = self.marshall_key(&key)?;
+            let value_bytes = self.marshall_value(&value)?;
             entry_bytes_list.push((key_bytes, value_bytes));
         }
         self.cache
@@ -466,7 +502,41 @@ mod tests {
 
         let result = typed.get(&vec![1, 2, 3]).await;
 
-        assert!(matches!(result, Err(Error::Marshalling(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Marshalling {
+                side: crate::error::MarshallingSide::Key,
+                ..
+            })
+        ));
+    }
+
+    /// Same as above, but the value marshaller is the one that fails:
+    /// `Error::Marshalling`'s `side` correctly says `Value`, not `Key`.
+    #[tokio::test]
+    async fn a_failing_value_marshaller_reports_the_value_side() {
+        let unreachable: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = client_with_seeds(vec![unreachable], unreachable);
+        let typed = client
+            .cache("my-cache")
+            .typed(BytesMarshaller, FailingMarshaller);
+
+        let result = typed
+            .put(
+                &vec![1, 2, 3],
+                &vec![4, 5, 6],
+                Expiration::Default,
+                Expiration::Default,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Marshalling {
+                side: crate::error::MarshallingSide::Value,
+                ..
+            })
+        ));
     }
 
     /// A typed key routes to the same owner a byte key would, since
