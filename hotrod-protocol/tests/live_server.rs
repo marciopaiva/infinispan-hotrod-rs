@@ -50,8 +50,9 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use hotrod_protocol::{
-    AdminFlag, CacheConfig, CacheEvent, Expiration, HotRodClient, HotRodConnection,
-    NearCacheOptions, RemoteCache, TlsConfig, Utf8Marshaller, VersionedResult,
+    AdminFlag, CacheConfig, CacheEvent, CounterConfiguration, CounterType, Error, Expiration,
+    HotRodClient, HotRodConnection, NearCacheOptions, RemoteCache, Storage, TlsConfig,
+    Utf8Marshaller, VersionedResult,
 };
 
 /// Larger than any single chunk below, so a roundtrip exercises more
@@ -955,6 +956,177 @@ async fn administration_create_cache_names_and_remove_round_trip_against_a_real_
         !names.contains(&cache_name.to_string()),
         "expected {cache_name:?} to be gone from {names:?}"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn strong_counter_round_trips_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    let counters = client.counters();
+    let counter_name = "ci-strong-counter";
+
+    // Best-effort cleanup from a previous run that may have failed
+    // partway through.
+    let _ = counters.strong_counter(counter_name).remove().await;
+
+    let created = counters
+        .define(
+            counter_name,
+            CounterConfiguration {
+                counter_type: CounterType::BoundedStrong {
+                    lower_bound: 0,
+                    upper_bound: 10,
+                },
+                initial_value: 5,
+                storage: Storage::Volatile,
+            },
+        )
+        .await
+        .expect("define should succeed against a real server");
+    assert!(created, "expected the counter to be created now");
+
+    assert!(counters.is_defined(counter_name).await.expect("is_defined"));
+    assert!(!counters
+        .is_defined("ci-strong-counter-does-not-exist")
+        .await
+        .expect("is_defined on a missing counter should not error"));
+
+    let config = counters
+        .get_configuration(counter_name)
+        .await
+        .expect("get_configuration")
+        .expect("configuration should be present");
+    assert_eq!(
+        config.counter_type,
+        CounterType::BoundedStrong {
+            lower_bound: 0,
+            upper_bound: 10
+        }
+    );
+
+    let names = counters.names().await.expect("names");
+    assert!(names.contains(&counter_name.to_string()));
+
+    let strong = counters.strong_counter(counter_name);
+    assert_eq!(strong.get_value().await.expect("get_value"), 5);
+    assert_eq!(strong.increment_and_get().await.expect("increment"), 6);
+    assert_eq!(strong.decrement_and_get().await.expect("decrement"), 5);
+    assert_eq!(
+        strong
+            .compare_and_swap(5, 8)
+            .await
+            .expect("compare_and_swap"),
+        5
+    );
+    assert!(strong.compare_and_set(8, 9).await.expect("compare_and_set"));
+    assert!(!strong
+        .compare_and_set(8, 9)
+        .await
+        .expect("compare_and_set should fail: current value is 9, not 8"));
+    assert_eq!(strong.get_and_set(2).await.expect("get_and_set"), 9);
+    assert_eq!(strong.get_value().await.expect("get_value"), 2);
+
+    // The counter is bounded 0..=10: this pushes it past the upper
+    // bound.
+    let err = strong
+        .add_and_get(100)
+        .await
+        .expect_err("expected CounterOutOfBounds");
+    assert!(matches!(err, Error::CounterOutOfBounds));
+
+    strong.reset().await.expect("reset");
+    assert_eq!(strong.get_value().await.expect("get_value after reset"), 5);
+
+    // `remove` clears the counter's value but, confirmed against this
+    // real server, does not undefine it: it stays defined and the
+    // next read sees its configured initial value again, exactly as
+    // `StrongCounter::remove`'s doc comment describes.
+    strong.remove().await.expect("remove");
+    assert!(counters
+        .is_defined(counter_name)
+        .await
+        .expect("is_defined after remove"));
+    assert_eq!(strong.get_value().await.expect("get_value after remove"), 5);
+
+    // `Error::CounterNotFound` is reachable only for a name that was
+    // genuinely never defined, since nothing in this protocol erases
+    // a definition once made.
+    let err = counters
+        .strong_counter("ci-strong-counter-does-not-exist")
+        .get_value()
+        .await
+        .expect_err("expected CounterNotFound for a name that was never defined");
+    assert!(
+        matches!(err, Error::CounterNotFound(name) if name == "ci-strong-counter-does-not-exist")
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn weak_counter_round_trips_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    let counters = client.counters();
+    let counter_name = "ci-weak-counter";
+
+    let _ = counters.weak_counter(counter_name).remove().await;
+
+    counters
+        .define(
+            counter_name,
+            CounterConfiguration {
+                counter_type: CounterType::Weak {
+                    concurrency_level: 16,
+                },
+                initial_value: 0,
+                storage: Storage::Volatile,
+            },
+        )
+        .await
+        .expect("define should succeed against a real server");
+
+    let weak = counters.weak_counter(counter_name);
+    assert_eq!(weak.get_value().await.expect("get_value"), 0);
+
+    weak.increment().await.expect("increment");
+    weak.increment().await.expect("increment");
+    weak.decrement().await.expect("decrement");
+    assert_eq!(weak.get_value().await.expect("get_value"), 1);
+
+    weak.reset().await.expect("reset");
+    assert_eq!(weak.get_value().await.expect("get_value after reset"), 0);
+
+    // Same confirmed behavior as the strong counter test: remove
+    // clears the value, it does not undefine the counter.
+    weak.remove().await.expect("remove");
+    assert!(counters
+        .is_defined(counter_name)
+        .await
+        .expect("is_defined after remove"));
+    assert_eq!(weak.get_value().await.expect("get_value after remove"), 0);
 }
 
 #[tokio::test]

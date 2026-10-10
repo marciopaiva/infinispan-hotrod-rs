@@ -57,6 +57,41 @@ pub enum Error {
     #[error("malformed remote administration response: {0}")]
     MalformedAdminResponse(String),
 
+    /// A counter configuration's flags byte
+    /// (`docs/adr/0015-distributed-counters.md`) used the reserved
+    /// `0x03` combination for its type bits, or this client does not
+    /// recognize some other bit pattern the server sent back from
+    /// `get_configuration`.
+    #[error("malformed counter configuration: {0}")]
+    MalformedCounterConfiguration(String),
+
+    /// `add_and_get`/`compare_and_swap`/`get_and_set` on a bounded
+    /// strong counter would have taken it past its configured lower
+    /// or upper bound. The counter's value is unchanged; the status
+    /// this is inferred from (`NOT_EXECUTED_WITH_PREVIOUS`) carries no
+    /// body, so there is no "the value would have been" to report.
+    /// See `docs/adr/0015-distributed-counters.md`.
+    #[error(
+        "counter update was rejected: it would have moved the counter past its configured bound"
+    )]
+    CounterOutOfBounds,
+
+    /// A counter operation that assumes a counter already exists
+    /// (`get_value`/`add_and_get`/`compare_and_swap`/`get_and_set`/
+    /// `reset`/`remove`) targeted a name that was never defined. On
+    /// the wire this is the same silent, message-less status
+    /// (`KEY_DOES_NOT_EXIST`) a normal cache uses for a missing key,
+    /// confirmed against the server's own `missingCounterResponse`;
+    /// the Java client itself is inconsistent about whether this is
+    /// an exception or a silent empty result (throws for three of
+    /// these operations, returns `null` silently for a fourth,
+    /// `get_configuration`), so this crate makes its own, consistent
+    /// choice instead of replicating that split. `get_configuration`
+    /// does not use this: it returns `Ok(None)`, the same shape every
+    /// other "might not exist" read in this crate already uses.
+    #[error("counter {0:?} is not defined")]
+    CounterNotFound(String),
+
     /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
     /// knows this cursor, most likely because it sat idle past the
     /// server's five-minute reaper. No retry is attempted; see

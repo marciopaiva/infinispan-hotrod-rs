@@ -28,7 +28,7 @@ for release notes.
 | Near caching | Yes | Yes |
 | Transactions | Yes | No |
 | Multimap cache | Yes | No |
-| Counters | Yes | No |
+| Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
 | Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; no DELETE/UPDATE statements yet) |
 | Remote task execution | Yes | No |
@@ -214,6 +214,30 @@ client
 
 let names = client.administration().cache_names().await?;
 client.administration().remove_cache("sessions").await?;
+```
+
+`counters` defines and uses distributed counters. A `StrongCounter`
+is atomic and, if bounded, rejects an update that would cross its
+configured bound; a `WeakCounter` is cheaper but does not support
+`compare_and_swap`/`get_and_set`:
+
+```rust
+use hotrod_protocol::{CounterConfiguration, CounterType, Storage};
+
+let counters = client.counters();
+counters
+    .define(
+        "requests-served",
+        CounterConfiguration {
+            counter_type: CounterType::UnboundedStrong,
+            initial_value: 0,
+            storage: Storage::Persistent,
+        },
+    )
+    .await?;
+
+let counter = counters.strong_counter("requests-served");
+let total = counter.increment_and_get().await?;
 ```
 
 ## License

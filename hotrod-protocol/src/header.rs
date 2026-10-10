@@ -66,6 +66,31 @@ pub(crate) enum OpCode {
     Exec = 0x2B,
     PutAll = 0x2D,
     GetAll = 0x2F,
+    // Distributed counters (see docs/adr/0015-distributed-counters.md),
+    // confirmed against HotRodConstants.java on both the client and
+    // server side. Every one of these targets the fixed cache
+    // "org.infinispan.COUNTER", never a user's own cache.
+    CounterCreate = 0x4B,
+    CounterGetConfiguration = 0x4D,
+    // The one counter opcode that is not "request + 1": 0x50 is
+    // ERROR_RESPONSE, the real, actively-used opcode the server
+    // sends back for any failed operation's response, documented
+    // and tested further down in this file (see
+    // read_response_header's own handling of it, confirmed against
+    // a live server). It is not itself a counter opcode, but its
+    // value happens to sit between this request and its response,
+    // pushing the response to +2 instead of +1. See
+    // expected_response_opcode.
+    CounterIsDefined = 0x4F,
+    CounterAddAndGet = 0x52,
+    CounterReset = 0x54,
+    CounterGet = 0x56,
+    CounterCompareAndSwap = 0x58,
+    // Counter listeners (0x5A/0x5B add, 0x5C/0x5D remove) are
+    // deliberately out of scope for this phase.
+    CounterRemove = 0x5E,
+    CounterGetNames = 0x64,
+    CounterGetAndSet = 0x7F,
     // Streaming (protocol 4.1, Infinispan 15.1+): not the discontinued
     // GET_STREAM/PUT_STREAM pair from Hot Rod 2.6 (0x37/0x39), which this
     // crate never implements. These six, confirmed against
@@ -100,6 +125,10 @@ impl OpCode {
             | OpCode::PutStreamStart
             | OpCode::PutStreamNext
             | OpCode::PutStreamEnd => self as u8 - 1,
+            // See this opcode's own doc comment: 0x50, between this
+            // request and its response, is ERROR_RESPONSE's own
+            // value, confirmed against HotRodConstants.java.
+            OpCode::CounterIsDefined => self as u8 + 2,
             _ => self as u8 + 1,
         }
     }
@@ -297,6 +326,29 @@ mod tests {
         .expect("read_response_header");
         assert!(header.status.is_success());
         assert!(header.topology_update.is_none());
+    }
+
+    /// `CounterIsDefined`'s response opcode is `request + 2` (0x51),
+    /// not the otherwise universal `request + 1` (0x50, reserved):
+    /// confirmed against `HotRodConstants.java`, see this opcode's own
+    /// doc comment.
+    #[tokio::test]
+    async fn counter_is_defined_expects_a_response_opcode_two_past_the_request() {
+        let mut resp = vec![0xA1]; // magic
+        resp.push(7); // message id
+        resp.push(0x51); // CounterIsDefined response, request (0x4F) + 2
+        resp.push(0x00); // status: success
+        resp.push(0x00); // no topology change
+
+        let header = read_response_header(
+            &mut resp.as_slice(),
+            7,
+            OpCode::CounterIsDefined,
+            ClientIntelligence::Basic,
+        )
+        .await
+        .expect("read_response_header should accept the +2 opcode");
+        assert!(header.status.is_success());
     }
 
     #[tokio::test]
