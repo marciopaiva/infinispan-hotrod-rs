@@ -11,13 +11,29 @@ use crate::error::{Error, Result};
 use crate::status::Status;
 use crate::topology::{read_topology_update, ClientIntelligence, TopologyUpdate};
 use crate::varint::{read_vlong, write_vint, write_vlong};
-use crate::wire::{read_string, write_array, write_no_media_type_pair};
+use crate::wire::{
+    read_string, write_array, write_no_media_type_pair, write_protostream_media_type_pair,
+};
 
 const REQUEST_MAGIC: u8 = 0xA0;
 pub(crate) const RESPONSE_MAGIC: u8 = 0xA1;
 
 /// Hot Rod protocol version 4.1, the version targeted by ADR 0001.
 const PROTOCOL_VERSION: u8 = 41;
+
+/// Which key/value media type pair a request declares
+/// (`docs/adr/0013-remote-query.md`): almost every operation is
+/// `None` (opaque bytes both ways, unchanged from before this
+/// existed). `Protostream` (both key and value declared
+/// `application/x-protostream`) is for the two operations confirmed
+/// empirically to need it: the query envelope itself, and
+/// `HotRodClient::register_proto_schema`'s key/value written to
+/// `___protobuf_metadata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestMediaType {
+    None,
+    Protostream,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpCode {
@@ -33,6 +49,11 @@ pub(crate) enum OpCode {
     Stats = 0x15,
     Ping = 0x17,
     GetWithMetadata = 0x1B,
+    // Remote query (Ickle), confirmed against HotRodConstants.java on
+    // both the client and server side (see
+    // docs/adr/0013-remote-query.md). Normal "response = request + 1"
+    // convention.
+    Query = 0x1F,
     AuthMechList = 0x21,
     Auth = 0x23,
     AddClientListener = 0x25,
@@ -86,6 +107,7 @@ pub(crate) fn write_request_header(
     opcode: OpCode,
     intelligence: ClientIntelligence,
     topology_id: i32,
+    media_type: RequestMediaType,
 ) {
     buf.push(REQUEST_MAGIC);
     write_vlong(buf, message_id);
@@ -95,7 +117,10 @@ pub(crate) fn write_request_header(
     write_vint(buf, 0); // flags: none set in phase 1
     buf.push(intelligence.as_byte());
     write_vint(buf, topology_id as u32);
-    write_no_media_type_pair(buf);
+    match media_type {
+        RequestMediaType::None => write_no_media_type_pair(buf),
+        RequestMediaType::Protostream => write_protostream_media_type_pair(buf),
+    }
     write_vint(buf, 0); // additional params (protocol 4.0+): none
 }
 
@@ -185,6 +210,7 @@ pub(crate) async fn read_response_header<R: AsyncRead + Unpin>(
 /// `HotRodConnection` does on top of this: a caller that cares about
 /// those (only `HotRodConnection` does) reads them off the returned
 /// `ResponseHeader` itself and updates its own state.
+#[allow(clippy::too_many_arguments)] // every argument is a distinct, already-documented field of the request header itself; bundling them into a struct here would not make any call site clearer
 pub(crate) async fn write_and_read_header<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     message_id: u64,
@@ -193,6 +219,7 @@ pub(crate) async fn write_and_read_header<S: AsyncRead + AsyncWrite + Unpin>(
     intelligence: ClientIntelligence,
     topology_id: i32,
     body: &[u8],
+    media_type: RequestMediaType,
 ) -> Result<ResponseHeader> {
     let mut request = Vec::with_capacity(32 + body.len());
     write_request_header(
@@ -202,6 +229,7 @@ pub(crate) async fn write_and_read_header<S: AsyncRead + AsyncWrite + Unpin>(
         opcode,
         intelligence,
         topology_id,
+        media_type,
     );
     request.extend_from_slice(body);
 
@@ -226,6 +254,7 @@ mod tests {
             OpCode::Get,
             ClientIntelligence::Basic,
             -1,
+            RequestMediaType::None,
         );
 
         let mut expected = Vec::new();

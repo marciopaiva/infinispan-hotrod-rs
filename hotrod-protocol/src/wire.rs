@@ -41,12 +41,42 @@ pub(crate) async fn read_string<R: AsyncRead + Unpin>(reader: &mut R) -> Result<
     Ok(String::from_utf8(bytes)?)
 }
 
-/// No key/value media type is negotiated in phase 1: both key and value
-/// travel as opaque bytes. Wire form is a single zero byte per Codec30's
-/// `writeMediaType`: type 0 ("none") carries no id and no parameters.
+/// No key/value media type is negotiated for most operations: both key
+/// and value travel as opaque bytes. Wire form is a single zero byte per
+/// Codec30's `writeMediaType`: type 0 ("none") carries no id and no
+/// parameters.
 pub(crate) fn write_no_media_type_pair(buf: &mut Vec<u8>) {
     buf.push(0); // key media type
     buf.push(0); // value media type
+}
+
+/// `application/x-protostream`'s predefined id, confirmed against the
+/// Java client's `MediaTypeIds.java` (`idByType.put(APPLICATION_PROTOSTREAM,
+/// (short) 12)`), not guessed.
+const MEDIA_TYPE_ID_PROTOSTREAM: u32 = 12;
+
+/// `docs/adr/0013-remote-query.md`: both the query operation's request
+/// and response bodies, and `HotRodClient::register_proto_schema`'s
+/// key/value in `___protobuf_metadata`, need this declared instead of
+/// "none" (every other operation's default) for the server to decode
+/// them at all. Confirmed empirically against a live server before
+/// either existed: with "none" declared, the query operation failed
+/// with `IllegalStateException: Unexpected tag` at the very first byte
+/// of an otherwise byte-correct `QueryRequest`, and schema registration
+/// failed with `CacheException: The key must be a String: class
+/// java.lang.Integer` for a key that already was one. Wire form, per
+/// `skip_media_type`'s own doc comment: definition byte 1 (predefined),
+/// then the id as a vInt, then a vInt parameter count of 0.
+pub(crate) fn write_protostream_media_type_pair(buf: &mut Vec<u8>) {
+    for _ in 0..2 {
+        write_predefined_media_type(buf, MEDIA_TYPE_ID_PROTOSTREAM);
+    }
+}
+
+fn write_predefined_media_type(buf: &mut Vec<u8>, id: u32) {
+    buf.push(1); // predefined type
+    write_vint(buf, id);
+    write_vint(buf, 0); // no parameters
 }
 
 /// Consumes one `MediaType` from the wire without keeping its value.

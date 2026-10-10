@@ -6,6 +6,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Remote query (Ickle): `RemoteCache::query(query_string)` returns a
+  `Query` builder (named parameters via `.param()`, `.start_offset()`,
+  `.max_results()`, `.execute()`), yielding whole matching entities or
+  projected columns depending on the query. `HotRodClient::
+  register_proto_schema(name, content)` registers a `.proto` schema
+  with the server. The query operation's own request/response
+  envelope is real Protobuf, a small fixed schema Infinispan itself
+  defines; hand-encoded, no new dependency (`protobuf_wire.rs`,
+  reusing `varint.rs`'s own varint/zigzag encoding and `wire.rs`'s
+  length-delimited framing). A caller's own entity bytes inside a
+  result stay opaque, decoded by their own `Marshaller`. See
+  `docs/adr/0013-remote-query.md` (#50).
+
 ## [0.6.0] - 2026-10-10
 
 ### Added

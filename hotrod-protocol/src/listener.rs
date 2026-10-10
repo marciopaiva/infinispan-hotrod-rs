@@ -299,6 +299,7 @@ impl CacheListener {
                 ClientIntelligence::Basic,
                 DEFAULT_TOPOLOGY_ID,
                 &body,
+                crate::header::RequestMediaType::None,
             )
             .await?;
             Ok(())

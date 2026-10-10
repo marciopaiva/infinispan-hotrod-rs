@@ -37,6 +37,7 @@ use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
 use crate::header::OpCode;
 use crate::listener::{write_factory_params, ServerFactory, MAX_FACTORY_PARAMS};
+use crate::query::{decode_query_response, QueryResult};
 use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
 use crate::scram::ScramSha512Mechanism;
 use crate::tls::{self, TlsConfig, Transport};
@@ -780,6 +781,30 @@ impl HotRodConnection {
         result
     }
 
+    /// Runs a remote query (Ickle), `docs/adr/0013-remote-query.md`.
+    /// `request_bytes` is already the Protobuf-encoded `QueryRequest`
+    /// body (`query::encode_query_request`); wrapped here in a Hot Rod
+    /// array the same way the Java client carries it
+    /// (`QueryOperation.writeOperationRequest` calls `ByteBufUtil.
+    /// writeArray`, never writing the Protobuf bytes to the Hot Rod
+    /// buffer directly), and the response read back the same way.
+    pub(crate) async fn query(&mut self, request_bytes: &[u8]) -> Result<QueryResult> {
+        self.begin_operation()?;
+        let timeout = self.timeout;
+        let result = with_timeout(timeout, async {
+            let mut body = Vec::new();
+            write_array(&mut body, request_bytes);
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::Query, &body)
+                .await?;
+            let response_bytes = read_array(&mut self.stream).await?;
+            decode_query_response(&response_bytes)
+        })
+        .await;
+        self.end_operation(result.is_ok());
+        result
+    }
+
     /// Fetches every key in `keys` that exists, in one request. A key with
     /// no entry is simply missing from the result map, the same as `get`
     /// returning `None` for it.
@@ -1256,6 +1281,21 @@ impl HotRodConnection {
         let message_id = self.next_message_id;
         self.next_message_id += 1;
 
+        // Query is the one operation whose request/response bodies are
+        // themselves Protobuf, and the server picks how to decode them
+        // based on this declared media type; `___protobuf_metadata`'s
+        // value needs the same declaration to be stored as a schema at
+        // all, confirmed empirically against a live server before
+        // either existed (`docs/adr/0013-remote-query.md`). Every
+        // other operation still declares "none", unchanged.
+        let media_type = if matches!(opcode, OpCode::Query)
+            || cache_name == crate::client::PROTOBUF_METADATA_CACHE_NAME.as_bytes()
+        {
+            crate::header::RequestMediaType::Protostream
+        } else {
+            crate::header::RequestMediaType::None
+        };
+
         let mut header = crate::header::write_and_read_header(
             &mut self.stream,
             message_id,
@@ -1264,6 +1304,7 @@ impl HotRodConnection {
             self.intelligence,
             self.topology_id,
             body,
+            media_type,
         )
         .await?;
         if let Some(update) = &header.topology_update {

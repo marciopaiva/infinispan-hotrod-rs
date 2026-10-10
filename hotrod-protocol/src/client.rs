@@ -56,6 +56,7 @@ use crate::remote_cache::RemoteCache;
 use crate::stats::{CacheStatisticsInner, PoolStatistics};
 use crate::tls::TlsConfig;
 use crate::topology::TopologyServer;
+use crate::wire::Expiration;
 
 /// Default cap on how many connections `HotRodClient` keeps open to one
 /// node for one cache at once, idle plus checked out. Not configurable
@@ -76,6 +77,13 @@ pub(crate) const DEFAULT_MAX_RETRIES: usize = 3;
 /// quarantine entirely, the idiomatic equivalent of the Java client's
 /// `-1` sentinel.
 pub(crate) const DEFAULT_SERVER_FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The cache name the server reserves for Protobuf schema storage
+/// (`docs/adr/0013-remote-query.md`), confirmed against the Java
+/// client's `InternalCacheNames.PROTOBUF_METADATA_CACHE_NAME`. An
+/// ordinary cache name, not a sentinel this crate treats specially in
+/// any other way.
+pub(crate) const PROTOBUF_METADATA_CACHE_NAME: &str = "___protobuf_metadata";
 
 /// Credentials for one SASL mechanism, kept so a connection opened later
 /// to any node, for any cache, can be authenticated the same way as the
@@ -393,6 +401,29 @@ impl HotRodClient {
     /// shares this client's topology, pools and authentication.
     pub fn cache(&self, name: impl Into<String>) -> RemoteCache {
         RemoteCache::new(self.clone(), name.into())
+    }
+
+    /// Registers (or replaces) a Protobuf schema, used by remote query
+    /// (`docs/adr/0013-remote-query.md`). `___protobuf_metadata` is an
+    /// ordinary cache, confirmed against the Java client's own source
+    /// (`InternalCacheNames.PROTOBUF_METADATA_CACHE_NAME`) to need no
+    /// dedicated opcode: a convenience over `self.cache(...).put(...)`
+    /// against that name, named for discoverability. Both `name` and
+    /// `content` are sent `WrappedMessage`-wrapped
+    /// (`query::wrap_string`), confirmed empirically to be required:
+    /// this cache's own storage is fixed to `application/x-protostream`
+    /// regardless of what a request declares, and an unwrapped scalar
+    /// carries no type of its own for the server to recognize it as a
+    /// string rather than, say, an integer.
+    pub async fn register_proto_schema(&self, name: &str, content: &str) -> Result<()> {
+        self.cache(PROTOBUF_METADATA_CACHE_NAME)
+            .put(
+                &crate::query::wrap_string(name),
+                &crate::query::wrap_string(content),
+                Expiration::Default,
+                Expiration::Default,
+            )
+            .await
     }
 
     /// The timeout currently bounding every operation on this instance's
@@ -1608,8 +1639,14 @@ pub(crate) mod tests {
         let _flags = read_vint(stream).await.unwrap();
         let _intelligence = stream.read_u8().await.unwrap();
         let _topology_id = read_vint(stream).await.unwrap();
-        let _key_media_type = stream.read_u8().await.unwrap();
-        let _value_media_type = stream.read_u8().await.unwrap();
+        // Not two bare bytes: most requests declare "none" (a single
+        // zero byte each), but the query operation declares a real
+        // predefined media type (`docs/adr/0013-remote-query.md`),
+        // which is longer. `skip_media_type` already knows the real
+        // format (used to stay in sync with a response that carries
+        // one); reused here so this helper stays correct for both.
+        crate::wire::skip_media_type(stream).await.unwrap();
+        crate::wire::skip_media_type(stream).await.unwrap();
         let _additional_params = read_vint(stream).await.unwrap();
         (message_id, opcode)
     }

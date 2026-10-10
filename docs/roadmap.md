@@ -73,11 +73,12 @@ multi-node CI fixture (#78), client listeners (#4), near caching
 (#5), streaming (#52), server-side iteration (#53) and client
 statistics and tracing (#54). All seven are done, and so is every
 other item each theme below marks `(done)`: fuzzing, retry policy and
-node health tracking (#97), and the serialization abstraction (#99).
-What is left groups into five themes, each independent of the
-others, so any of them can go next in whatever order is actually
-needed. Within a theme, order matters more, since later items there
-tend to build on earlier ones.
+node health tracking (#97), the serialization abstraction (#99), and
+remote query (#50). Three of the five themes below are now fully
+done (Large data access, Reliability and observability, Typed data);
+what is left of the other two, High availability and Specialized
+data structures and administration, is independent of everything
+above, so either can go next in whatever order is actually needed.
 
 ### Large data access
 
@@ -129,6 +130,8 @@ Every item in this theme is done.
 
 ### Typed data
 
+Both items in this theme are done.
+
 * ~~Serialization abstraction (#99)~~ (done). `Marshaller` (an
   associated-type trait, `marshall.rs`) plus `TypedCache`
   (`typed_cache.rs`), a typed façade that wraps the existing
@@ -137,8 +140,18 @@ Every item in this theme is done.
   marshallers (`BytesMarshaller`, `Utf8Marshaller`); see
   `docs/adr/0012-serialization-abstraction.md` for why a `serde_json`
   or Protobuf one is left for a separate proposal instead.
-* **Remote query, Ickle/Protobuf (#50).** Depends on the marshaller
-  above and on Protobuf schema registration against the server.
+* ~~Remote query, Ickle/Protobuf (#50)~~ (done). `RemoteCache::query`
+  runs an Ickle query with named parameters, offset/limit, returning
+  whole entities or projected columns; `HotRodClient::register_proto_schema`
+  registers a `.proto` schema with the server. The query operation's
+  own envelope (`QueryRequest`/`QueryResponse`, a small fixed Protobuf
+  schema Infinispan itself defines, not the caller's own data) is
+  hand-encoded, no new dependency; a caller's own entity bytes inside
+  a result stay opaque, decoded by their own `Marshaller`. See
+  `docs/adr/0013-remote-query.md`, including a real, live-server-only
+  gap the initial research missed: making a caller's own writes
+  queryable needs their cache configured for protostream encoding
+  server-side, not something this phase negotiates per request.
 
 ### High availability
 
