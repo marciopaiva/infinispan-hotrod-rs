@@ -51,7 +51,7 @@ use std::sync::Mutex;
 
 use hotrod_protocol::{
     CacheEvent, Expiration, HotRodClient, HotRodConnection, NearCacheOptions, RemoteCache,
-    TlsConfig, VersionedResult,
+    TlsConfig, Utf8Marshaller, VersionedResult,
 };
 
 /// Larger than any single chunk below, so a roundtrip exercises more
@@ -802,6 +802,33 @@ async fn get_all_and_put_all_roundtrip() {
     for key in &keys {
         conn.remove(key).await.expect("cleanup");
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn typed_cache_put_get_remove_roundtrip_with_utf8_marshaller() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+    let typed = cache.typed(Utf8Marshaller, Utf8Marshaller);
+
+    let key = "ci-typed-key".to_string();
+    let value = "valor com acento".to_string();
+
+    typed.remove(&key).await.expect("cleanup");
+
+    typed
+        .put(&key, &value, Expiration::Default, Expiration::Default)
+        .await
+        .expect("put");
+
+    let fetched = typed.get(&key).await.expect("get");
+    assert_eq!(fetched, Some(value));
+
+    let removed = typed.remove(&key).await.expect("remove");
+    assert!(removed);
+
+    let fetched = typed.get(&key).await.expect("get after remove");
+    assert_eq!(fetched, None);
 }
 
 #[tokio::test]

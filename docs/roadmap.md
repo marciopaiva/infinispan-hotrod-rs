@@ -126,11 +126,14 @@ Every item in this theme is done.
 
 ### Typed data
 
-* **Serialization abstraction.** `hotrod-protocol` is deliberately
-  byte-oriented today, with no built-in notion of typed values; a
-  `Marshaller`-shaped trait would let a caller work with typed values
-  without baking a specific format into the protocol layer. No issue
-  filed yet; precedes remote query.
+* ~~Serialization abstraction (#99)~~ (done). `Marshaller` (an
+  associated-type trait, `marshall.rs`) plus `TypedCache`
+  (`typed_cache.rs`), a typed façade that wraps the existing
+  byte-oriented `RemoteCache` via `Deref`, the same pattern
+  `NearCachedCache` already uses. Ships with two dependency-free
+  marshallers (`BytesMarshaller`, `Utf8Marshaller`); see
+  `docs/adr/0012-serialization-abstraction.md` for why a `serde_json`
+  or Protobuf one is left for a separate proposal instead.
 * **Remote query, Ickle/Protobuf (#50).** Depends on the marshaller
   above and on Protobuf schema registration against the server.
 
