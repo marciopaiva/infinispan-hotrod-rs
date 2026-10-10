@@ -805,6 +805,42 @@ impl HotRodConnection {
         result
     }
 
+    /// Executes a named task (`docs/adr/0014-remote-administration.md`):
+    /// the mechanism remote administration (`@@cache@create`, etc) and,
+    /// if ever revisited, user-defined remote task execution (#51) both
+    /// build on. Every parameter is sent as a plain byte array, never
+    /// through a `Marshaller`: confirmed against the Java client's own
+    /// `NoCacheExecuteOperation`, which always UTF-8-encodes its string
+    /// parameters by hand rather than marshalling them. Targets no
+    /// specific cache, the same way `AuthMechList`/`Auth` already use an
+    /// empty cache name rather than `self.cache_name`: the task runs at
+    /// the cache-manager level, not against whichever cache this
+    /// connection happens to be pooled for.
+    pub(crate) async fn execute_task(
+        &mut self,
+        task_name: &str,
+        params: &[(String, Vec<u8>)],
+    ) -> Result<Vec<u8>> {
+        self.begin_operation()?;
+        let timeout = self.timeout;
+        let result = with_timeout(timeout, async {
+            let mut body = Vec::new();
+            write_array(&mut body, task_name.as_bytes());
+            write_vint(&mut body, params.len() as u32);
+            for (name, value) in params {
+                write_array(&mut body, name.as_bytes());
+                write_array(&mut body, value);
+            }
+            let empty_cache_name: Vec<u8> = Vec::new();
+            self.write_and_read_header(&empty_cache_name, OpCode::Exec, &body)
+                .await?;
+            read_array(&mut self.stream).await
+        })
+        .await;
+        self.end_operation(result.is_ok());
+        result
+    }
+
     /// Fetches every key in `keys` that exists, in one request. A key with
     /// no entry is simply missing from the result map, the same as `get`
     /// returning `None` for it.
@@ -1570,6 +1606,94 @@ mod tests {
             .await
             .expect("connect");
         conn.clear().await.expect("clear");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_task_sends_task_name_and_params_and_returns_the_response_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@cache@create");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 2);
+            let name0 = read_array(&mut stream).await.unwrap();
+            let value0 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name0, b"name");
+            assert_eq!(value0, b"my-new-cache");
+            let name1 = read_array(&mut stream).await.unwrap();
+            let value1 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name1, b"template");
+            assert_eq!(value1, b"org.infinispan.DIST_SYNC");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, br#""ok""#);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "my-cache")
+            .await
+            .expect("connect");
+        let params = vec![
+            ("name".to_string(), b"my-new-cache".to_vec()),
+            ("template".to_string(), b"org.infinispan.DIST_SYNC".to_vec()),
+        ];
+        let response = conn
+            .execute_task("@@cache@create", &params)
+            .await
+            .expect("execute_task");
+        assert_eq!(response, br#""ok""#);
+
+        server.await.unwrap();
+    }
+
+    /// `execute_task` runs at the cache-manager level, not against
+    /// whichever cache this connection happens to be pooled for: it
+    /// must declare an empty cache name on the wire even though this
+    /// connection was opened against a real, non-empty one.
+    #[tokio::test]
+    async fn execute_task_declares_an_empty_cache_name_regardless_of_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(stream.read_u8().await.unwrap(), 0xA0);
+            let id = read_vlong(&mut stream).await.unwrap();
+            let _version = stream.read_u8().await.unwrap();
+            let opcode = stream.read_u8().await.unwrap();
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let cache_name = read_array(&mut stream).await.unwrap();
+            assert!(
+                cache_name.is_empty(),
+                "exec runs at the cache-manager level, not against this connection's own cache"
+            );
+            let _flags = read_vint(&mut stream).await.unwrap();
+            let _intelligence = stream.read_u8().await.unwrap();
+            let _topology_id = read_vint(&mut stream).await.unwrap();
+            crate::wire::skip_media_type(&mut stream).await.unwrap();
+            crate::wire::skip_media_type(&mut stream).await.unwrap();
+            let _additional_params = read_vint(&mut stream).await.unwrap();
+            let _task_name = read_array(&mut stream).await.unwrap();
+            let _param_count = read_vint(&mut stream).await.unwrap();
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"[]");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "a-real-cache-name")
+            .await
+            .expect("connect");
+        conn.execute_task("@@cache@names", &[])
+            .await
+            .expect("execute_task");
 
         server.await.unwrap();
     }

@@ -37,7 +37,7 @@ for release notes.
 | Client statistics | Yes | Yes |
 | Tracing: local spans (via the `tracing` crate) | No | Yes |
 | Tracing: trace-context propagation to the server | Yes | No |
-| Remote administration | Yes | No |
+| Remote administration (create/remove/list caches) | Yes | Yes |
 | Multi-cluster failover | Yes | No |
 
 ## Usage
@@ -196,6 +196,24 @@ for row in result.rows {
         // decode `bytes` with whatever Marshaller matches the Book schema
     }
 }
+```
+
+`administration` creates, removes and lists caches, no shell or REST
+access to the server needed. `CacheConfig::Template` names an
+existing template, `CacheConfig::Definition` passes a full
+configuration document (XML, JSON or YAML, auto-detected server-side):
+
+```rust
+use hotrod_protocol::{AdminFlag, CacheConfig};
+
+client
+    .administration()
+    .with_flags([AdminFlag::Volatile])
+    .create_cache("sessions", CacheConfig::Template("org.infinispan.DIST_SYNC".to_string()))
+    .await?;
+
+let names = client.administration().cache_names().await?;
+client.administration().remove_cache("sessions").await?;
 ```
 
 ## License

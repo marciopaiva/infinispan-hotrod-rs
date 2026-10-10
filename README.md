@@ -35,7 +35,7 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Client statistics | Yes | Yes |
 | Tracing: local spans (via the `tracing` crate) | No | Yes |
 | Tracing: trace-context propagation to the server | Yes | No ([#54](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/54)) |
-| Remote administration | Yes | No ([#55](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/55)) |
+| Remote administration (create/remove/list caches) | Yes | Yes |
 | Multi-cluster failover | Yes | No ([#56](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/56)) |
 
 The PHP extension has not started yet.

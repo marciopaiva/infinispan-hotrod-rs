@@ -50,8 +50,8 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use hotrod_protocol::{
-    CacheEvent, Expiration, HotRodClient, HotRodConnection, NearCacheOptions, RemoteCache,
-    TlsConfig, Utf8Marshaller, VersionedResult,
+    AdminFlag, CacheConfig, CacheEvent, Expiration, HotRodClient, HotRodConnection,
+    NearCacheOptions, RemoteCache, TlsConfig, Utf8Marshaller, VersionedResult,
 };
 
 /// Larger than any single chunk below, so a roundtrip exercises more
@@ -872,6 +872,89 @@ async fn query_round_trips_against_a_real_server_after_registering_a_schema() {
 
     assert_eq!(result.rows, Vec::new());
     assert_eq!(result.hit_count, 0);
+}
+
+/// A minimal cache configuration fragment, confirmed against a real
+/// server to need no enclosing `<infinispan>`/`<cache-container>` or
+/// `name` attribute (the task's own `name` parameter supplies that):
+/// the server rejected both `org.infinispan.DIST_SYNC` and
+/// `org.infinispan.LOCAL` as "no such template", so templates appear
+/// not to be preregistered on this image without extra configuration.
+/// A definition sidesteps that assumption entirely.
+const ADMIN_TEST_CACHE_DEFINITION: &str =
+    "<distributed-cache><encoding media-type=\"application/octet-stream\"/></distributed-cache>";
+
+#[tokio::test]
+#[ignore]
+async fn administration_create_cache_names_and_remove_round_trip_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    let cache_name = "ci-admin-test-cache";
+
+    // Best-effort cleanup from a previous run that may have failed
+    // partway through: removing a cache that does not exist is not
+    // confirmed to be an error either way (the research for
+    // docs/adr/0014-remote-administration.md found no documented or
+    // tested behavior for it), so this ignores whatever comes back.
+    let _ = client.administration().remove_cache(cache_name).await;
+
+    client
+        .administration()
+        .with_flags([AdminFlag::Volatile])
+        .create_cache(
+            cache_name,
+            CacheConfig::Definition(ADMIN_TEST_CACHE_DEFINITION.to_string()),
+        )
+        .await
+        .expect("create_cache should succeed against a real server");
+
+    let names = client
+        .administration()
+        .cache_names()
+        .await
+        .expect("cache_names should succeed");
+    assert!(
+        names.contains(&cache_name.to_string()),
+        "expected {cache_name:?} in {names:?}"
+    );
+
+    // get_or_create_cache must not fail just because the cache
+    // already exists.
+    client
+        .administration()
+        .get_or_create_cache(
+            cache_name,
+            CacheConfig::Definition(ADMIN_TEST_CACHE_DEFINITION.to_string()),
+        )
+        .await
+        .expect("get_or_create_cache should succeed on an existing cache");
+
+    client
+        .administration()
+        .remove_cache(cache_name)
+        .await
+        .expect("remove_cache should succeed against a real server");
+
+    let names = client
+        .administration()
+        .cache_names()
+        .await
+        .expect("cache_names should succeed after removal");
+    assert!(
+        !names.contains(&cache_name.to_string()),
+        "expected {cache_name:?} to be gone from {names:?}"
+    );
 }
 
 #[tokio::test]

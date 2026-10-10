@@ -73,12 +73,13 @@ multi-node CI fixture (#78), client listeners (#4), near caching
 (#5), streaming (#52), server-side iteration (#53) and client
 statistics and tracing (#54). All seven are done, and so is every
 other item each theme below marks `(done)`: fuzzing, retry policy and
-node health tracking (#97), the serialization abstraction (#99), and
-remote query (#50). Three of the five themes below are now fully
-done (Large data access, Reliability and observability, Typed data);
-what is left of the other two, High availability and Specialized
-data structures and administration, is independent of everything
-above, so either can go next in whatever order is actually needed.
+node health tracking (#97), the serialization abstraction (#99),
+remote query (#50) and remote administration (#55). Three of the
+five themes below are now fully done (Large data access, Reliability
+and observability, Typed data); what is left of the other two, High
+availability and Specialized data structures and administration, is
+independent of everything above, so either can go next in whatever
+order is actually needed.
 
 ### Large data access
 
@@ -166,8 +167,13 @@ Each of these has its own dedicated Hot Rod operations, independent of
 
 * **Multimap cache (#48)**
 * **Distributed counters (#49)**
-* **Remote administration (#55)**, create/remove caches: a management
-  plane, kept separate from the data-plane work above.
+* ~~Remote administration (#55)~~ (done). `HotRodClient::administration()`
+  creates, removes and lists caches
+  (`create_cache`/`get_or_create_cache`/`remove_cache`/`cache_names`),
+  with `AdminFlag::Volatile`/`AdminFlag::Update`. No dedicated
+  administration opcodes: built on the same generic named-task
+  mechanism (`EXEC_REQUEST`/`EXEC_RESPONSE`) the Java client itself
+  uses for this. See `docs/adr/0014-remote-administration.md`.
 
 ### Deferred
 
