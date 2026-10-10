@@ -574,13 +574,12 @@ impl HotRodClient {
             .map_or(DEFAULT_TOPOLOGY_ID, |topology| topology.topology_id)
     }
 
-    /// The address to route `key` to, and the topology server it came
-    /// from: the segment's primary owner once a topology is known,
-    /// otherwise the seed connection with no origin.
-    pub(crate) async fn owner_addr(
-        &self,
-        key: &[u8],
-    ) -> Result<(SocketAddr, Option<TopologyServer>)> {
+    /// `active_seed_addr` and a clone of the current topology, if any,
+    /// read together: the preamble `owner_addr`,
+    /// `owner_and_backup_addrs` and `nodes_and_owned_segments` each
+    /// start with, shared so a future change to it cannot silently
+    /// drift between the three copies it would otherwise be.
+    fn active_seed_and_topology(&self) -> (SocketAddr, Option<Arc<ClusterTopology>>) {
         let active_seed = *self
             .0
             .active_seed_addr
@@ -592,6 +591,17 @@ impl HotRodClient {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        (active_seed, topology)
+    }
+
+    /// The address to route `key` to, and the topology server it came
+    /// from: the segment's primary owner once a topology is known,
+    /// otherwise the seed connection with no origin.
+    pub(crate) async fn owner_addr(
+        &self,
+        key: &[u8],
+    ) -> Result<(SocketAddr, Option<TopologyServer>)> {
+        let (active_seed, topology) = self.active_seed_and_topology();
         let Some(topology) = topology else {
             return Ok((active_seed, None));
         };
@@ -614,28 +624,24 @@ impl HotRodClient {
     }
 
     /// Every owner of `key`'s segment, primary first then backups in
-    /// the order `segment_owners` lists them, or just the active seed
-    /// if no topology is known yet: the retry candidate list
-    /// `RemoteCache`'s dispatch loop builds for a keyed operation
+    /// the order `segment_owners` lists them, with the active seed
+    /// always appended last as the final fallback, or just the active
+    /// seed alone if no topology is known yet: the retry candidate
+    /// list `RemoteCache`'s dispatch loop builds for a keyed operation
     /// (`docs/adr/0011-retry-policy-and-node-health.md`). Unlike
     /// `owner_addr`, used by `get_stream`/`put_stream`, which pin to
     /// one connection and never retry, so resolving backups for them
     /// would be wasted work.
+    ///
+    /// An owner whose host fails to resolve is skipped rather than
+    /// aborting the whole list: a single bad backup should not discard
+    /// a primary owner that already resolved successfully, or the
+    /// active seed this always falls back to.
     pub(crate) async fn owner_and_backup_addrs(
         &self,
         key: &[u8],
     ) -> Result<Vec<(SocketAddr, Option<TopologyServer>)>> {
-        let active_seed = *self
-            .0
-            .active_seed_addr
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let topology = self
-            .0
-            .topology
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let (active_seed, topology) = self.active_seed_and_topology();
         let Some(topology) = topology else {
             return Ok(vec![(active_seed, None)]);
         };
@@ -648,18 +654,17 @@ impl HotRodClient {
             topology.hash_function_version,
         )?;
         let owners = &topology.segment_owners[segment as usize];
-        if owners.is_empty() {
-            return Ok(vec![(active_seed, None)]);
-        }
-        let mut result = Vec::with_capacity(owners.len());
+        let mut result = Vec::with_capacity(owners.len() + 1);
         for &owner in owners {
             // Safe: `topology::read_topology_update` rejects any owner
             // index that is out of range for `servers` before this
             // type is built.
             let server = topology.servers[owner as usize].clone();
-            let addr = resolve_cached_addr(&topology, owner).await?;
-            result.push((addr, Some(server)));
+            if let Ok(addr) = resolve_cached_addr(&topology, owner).await {
+                result.push((addr, Some(server)));
+            }
         }
+        result.push((active_seed, None));
         Ok(result)
     }
 
@@ -676,17 +681,7 @@ impl HotRodClient {
     pub(crate) async fn nodes_and_owned_segments(
         &self,
     ) -> Result<Vec<(SocketAddr, Option<TopologyServer>, Vec<u32>)>> {
-        let active_seed = *self
-            .0
-            .active_seed_addr
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let topology = self
-            .0
-            .topology
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let (active_seed, topology) = self.active_seed_and_topology();
         let Some(topology) = topology else {
             return Ok(vec![(active_seed, None, Vec::new())]);
         };

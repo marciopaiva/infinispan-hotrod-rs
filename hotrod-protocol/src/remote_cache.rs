@@ -617,25 +617,44 @@ impl RemoteCache {
             self.client.server_failure_timeout(),
         );
         let mut tried: HashSet<SocketAddr> = HashSet::new();
-        let mut attempts_left = self.client.max_retries() + 1;
+        // `saturating_add`, not `+`: `max_retries` is a public setter
+        // taking a plain `usize`, so `usize::MAX` must not wrap this to
+        // zero (which would refuse even the first attempt) or panic in
+        // a debug build.
+        let mut attempts_left = self.client.max_retries().saturating_add(1);
         let mut last_err: Option<Error> = None;
 
         loop {
             if attempts_left == 0 {
                 return Err(last_err.unwrap_or_else(exhausted_candidates_error));
             }
-            let (addr, origin) = loop {
-                if let Some(candidate) = queue.pop_front() {
-                    if tried.contains(&candidate.0) {
-                        continue;
-                    }
-                    break candidate;
+
+            // At most one `failover_seed` dial per outer iteration:
+            // once the pre-built `queue` runs out, exactly one more
+            // candidate is sought there. A result already in `tried`
+            // (every remaining configured seed down to the one this
+            // chain already attempted) ends the chain the same as
+            // `queue` and `failover_seed` both having nothing left,
+            // rather than dialing again and risking never terminating
+            // against a cluster that keeps failing back to the same
+            // handful of seeds.
+            let mut next = None;
+            while let Some(candidate) = queue.pop_front() {
+                if !tried.contains(&candidate.0) {
+                    next = Some(candidate);
+                    break;
                 }
-                match self.client.failover_seed(&self.cache_name).await {
-                    Ok(new_seed) if !tried.contains(&new_seed) => break (new_seed, None),
-                    _ => return Err(last_err.unwrap_or_else(exhausted_candidates_error)),
-                }
+            }
+            if next.is_none() {
+                next = match self.client.failover_seed(&self.cache_name).await {
+                    Ok(new_seed) if !tried.contains(&new_seed) => Some((new_seed, None)),
+                    _ => None,
+                };
+            }
+            let Some((addr, origin)) = next else {
+                return Err(last_err.unwrap_or_else(exhausted_candidates_error));
             };
+
             attempts_left -= 1;
             tried.insert(addr);
 
@@ -1055,6 +1074,72 @@ pub(crate) mod tests {
         backup_task.await.unwrap();
     }
 
+    /// Regression test for a review finding on this change:
+    /// `owner_and_backup_addrs` initially never appended the active
+    /// seed to a keyed operation's candidate list at all, so once
+    /// every owner was exhausted, `dispatch` fell straight to
+    /// `failover_seed`, which excludes the current active seed and so
+    /// never actually tried it, unlike the pre-rewrite `run_seed_op`,
+    /// which guaranteed the seed as a real second attempt.
+    #[tokio::test]
+    async fn retry_reaches_the_active_seed_after_primary_and_backup_owners_both_fail() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = primary_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup_addr = backup_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = backup_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, b"from seed");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        set_topology(
+            &client,
+            ClusterTopology {
+                topology_id: 9,
+                servers: vec![
+                    TopologyServer {
+                        host: primary_addr.ip().to_string(),
+                        port: primary_addr.port(),
+                    },
+                    TopologyServer {
+                        host: backup_addr.ip().to_string(),
+                        port: backup_addr.port(),
+                    },
+                ],
+                hash_function_version: 3,
+                segment_owners: vec![vec![0, 1]],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+
+        let result =
+            client.cache("my-cache").get(b"key").await.expect(
+                "get should fail over to the active seed once primary and backup both fail",
+            );
+
+        assert_eq!(result, Some(b"from seed".to_vec()));
+
+        seed_task.await.unwrap();
+    }
+
     /// `docs/adr/0011-retry-policy-and-node-health.md`: `max_retries`
     /// bounds the chain even when more candidates are available.
     #[tokio::test]
@@ -1102,6 +1187,40 @@ pub(crate) mod tests {
             vec![0, 1],
             "only max_retries + 1 candidates should ever be attempted"
         );
+    }
+
+    /// Regression test for a review finding on this change:
+    /// `attempts_left` used to be computed as `max_retries() + 1`,
+    /// which overflows (panics in a debug build, wraps to 0 in
+    /// release) when a caller sets `max_retries` to `usize::MAX`
+    /// intending effectively unlimited retries; a wrap to 0 would
+    /// refuse even the first attempt, the opposite of that intent.
+    #[tokio::test]
+    async fn max_retries_set_to_usize_max_does_not_overflow_or_refuse_the_first_attempt() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x17, "expected a Ping request");
+            let mut resp = response_header(id, 0x18, 0x00);
+            resp.push(0);
+            resp.push(0);
+            resp.push(41);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        client.set_max_retries(usize::MAX);
+
+        client
+            .cache("my-cache")
+            .ping()
+            .await
+            .expect("usize::MAX retries must not overflow attempts_left to zero");
+
+        seed_task.await.unwrap();
     }
 
     /// `docs/adr/0011-retry-policy-and-node-health.md`: a candidate

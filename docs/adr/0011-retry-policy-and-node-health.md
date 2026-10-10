@@ -157,3 +157,21 @@ should not outlive it.
   are both exhausted; backoff between attempts (the Java client has
   none either); anything about multi-cluster/cross-site failover,
   which is the separate #56.
+* **A chain can end in error despite `failover_seed` just having
+  proven a seed reachable, if that seed is already in `tried` from
+  earlier in the same chain.** This only matters with more than two
+  configured seeds, enough retry budget to have already bounced
+  between them once, and one recovering mid-chain: accepted rather
+  than retried again, since repeatedly calling `failover_seed` until
+  it returns something genuinely new has no bound in a cluster that
+  keeps failing back to the same handful of seeds, and the connection
+  it opened is not wasted either way, since it is left pooled and
+  `active_seed_addr` promoted for the next call to use.
+* `owner_and_backup_addrs` resolves and clones every backup owner's
+  address on every keyed call, not just the primary that is almost
+  always the one `dispatch` actually ends up using. `resolve_cached_addr`
+  already caches each lookup (a lock and a `HashMap` read after the
+  first), so this is not a repeated DNS lookup, but it is still work
+  done for backups most calls never reach. Accepted for now; revisit
+  with lazy per-candidate resolution if it turns out to measurably
+  cost something.
