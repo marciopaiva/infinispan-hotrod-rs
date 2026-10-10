@@ -44,6 +44,20 @@ impl Status {
         self.0 == Self::KEY_DOES_NOT_EXIST
     }
 
+    /// Mirrors the Java client's own `hasPrevious()` predicate: true for
+    /// the two statuses whose name says a "previous" value is involved
+    /// (`SUCCESS_WITH_PREVIOUS`, `NOT_EXECUTED_WITH_PREVIOUS`). Used by
+    /// `counter_define` to tell "created now" from "already defined"
+    /// (`docs/adr/0015-distributed-counters.md`): the Java client
+    /// derives that boolean from exactly this distinction, not from a
+    /// response body (`COUNTER_CREATE` carries none either way).
+    pub(crate) fn has_previous(self) -> bool {
+        matches!(
+            self.0,
+            Self::SUCCESS_WITH_PREVIOUS | Self::NOT_EXECUTED_WITH_PREVIOUS
+        )
+    }
+
     pub(crate) fn is_invalid_iteration(self) -> bool {
         self.0 == Self::INVALID_ITERATION
     }
@@ -102,5 +116,14 @@ mod tests {
         assert!(s.is_known());
         assert!(s.is_invalid_iteration());
         assert!(!s.is_error());
+    }
+
+    #[test]
+    fn has_previous_covers_exactly_the_two_with_previous_statuses() {
+        assert!(!Status(0x00).has_previous());
+        assert!(Status(0x03).has_previous());
+        assert!(Status(0x04).has_previous());
+        assert!(!Status(0x01).has_previous());
+        assert!(!Status(0x02).has_previous());
     }
 }

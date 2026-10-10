@@ -74,10 +74,11 @@ multi-node CI fixture (#78), client listeners (#4), near caching
 statistics and tracing (#54). All seven are done, and so is every
 other item each theme below marks `(done)`: fuzzing, retry policy and
 node health tracking (#97), the serialization abstraction (#99),
-remote query (#50) and remote administration (#55). Three of the
-five themes below are now fully done (Large data access, Reliability
-and observability, Typed data); what is left of the other two, High
-availability and Specialized data structures and administration, is
+remote query (#50), remote administration (#55) and distributed
+counters (#49). Three of the five themes below are now fully done
+(Large data access, Reliability and observability, Typed data); what
+is left of the other two, High availability and Specialized data
+structures and administration (now just multimap cache, #48), is
 independent of everything above, so either can go next in whatever
 order is actually needed.
 
@@ -166,7 +167,13 @@ Each of these has its own dedicated Hot Rod operations, independent of
 `RemoteCache` and of each other; small individual surfaces.
 
 * **Multimap cache (#48)**
-* **Distributed counters (#49)**
+* ~~Distributed counters (#49)~~ (done). `HotRodClient::counters()`
+  defines, inspects and lists strong (atomic, optionally bounded) and
+  weak (cheaper, non-atomic) counters. Every operation goes to the
+  seed rather than hash-routed by counter name like the Java client
+  does for strong counters, a deliberate simplification (correctness
+  unaffected, a cluster deployment pays an extra hop the Java client
+  would not). See `docs/adr/0015-distributed-counters.md`.
 * ~~Remote administration (#55)~~ (done). `HotRodClient::administration()`
   creates, removes and lists caches
   (`create_cache`/`get_or_create_cache`/`remove_cache`/`cache_names`),

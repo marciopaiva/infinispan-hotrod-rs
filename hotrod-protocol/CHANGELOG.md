@@ -28,6 +28,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
   administration operation already uses server-side
   (`EXEC_REQUEST`/`EXEC_RESPONSE`), no dedicated administration
   opcodes. See `docs/adr/0014-remote-administration.md` (#55).
+- Distributed counters: `HotRodClient::counters()` returns a
+  `CounterManager` to define, inspect and list counters, plus
+  `strong_counter`/`weak_counter` handles.
+  `StrongCounter` supports `get_value`/`add_and_get`/
+  `increment_and_get`/`decrement_and_get`/`compare_and_swap`/
+  `compare_and_set`/`get_and_set`/`reset`/`remove`; `WeakCounter`
+  the same minus `compare_and_swap`/`get_and_set`, matching the Java
+  client's own split. A bounded strong counter update that would
+  cross its configured bound returns `Error::CounterOutOfBounds`
+  instead of a value. See
+  `docs/adr/0015-distributed-counters.md` (#49).
 
 ## [0.6.0] - 2026-10-10
 
