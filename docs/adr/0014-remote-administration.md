@@ -175,6 +175,28 @@ fire; it is never used for anything the server already reports as an
   be confirmed either way during this phase's research (no test
   found, nothing documented): this client passes the call through
   unchanged and surfaces whatever the server returns.
+* **`create_cache`/`remove_cache` are not retry-safe**, the same
+  trade-off ADR 0011 already accepted for every conditional
+  operation: `dispatch`'s retry chain only distinguishes a transport
+  failure (`Io`/`Timeout`) from a real server response, never
+  operation semantics, matching the Java client's own
+  `OperationDispatcher`. A connection dropping after the server
+  already applied a `create_cache` (without `AdminFlag::Update`) or a
+  `remove_cache` means the retried attempt sees the already-changed
+  state and surfaces a server error for an operation that, from the
+  caller's point of view, already succeeded. Nothing in this phase
+  changes that general policy for administration specifically; a
+  caller that cannot tolerate it should check `cache_names()` before
+  treating a failure as final.
+* **`with_flags` does not check that a flag applies to the call it
+  ends up on.** `AdminFlag::Update` only has documented meaning for
+  `create_cache`/`get_or_create_cache`; nothing stops a caller from
+  setting it on a handle later used for `remove_cache`, which simply
+  forwards it as that task's `flags` parameter with unconfirmed
+  effect. Left as a documentation note (`Administration::with_flags`'s
+  own doc comment) rather than a type-level restriction, since
+  splitting `Administration` into per-operation handles just to
+  enforce this would be a bigger API change than the risk warrants.
 * Not implemented, left for later if it turns out to matter:
   `@@cache@reindex`, `@@cache@updateindexschema`,
   `@@cache@updateConfigurationAttribute`, `@@cache@assignAlias`,

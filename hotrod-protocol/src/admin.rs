@@ -64,7 +64,14 @@ impl<'a> Administration<'a> {
 
     /// Returns a copy of this handle that passes `flags` on every
     /// `create_cache`/`get_or_create_cache`/`remove_cache` call it
-    /// makes from here on.
+    /// makes from here on. Nothing here checks that a flag is
+    /// meaningful for the call it ends up on: `AdminFlag::Update`
+    /// only means something to `create_cache`/`get_or_create_cache`
+    /// (see `AdminFlag`'s own docs), and setting it on a handle later
+    /// used for `remove_cache` just forwards it as that task's
+    /// `flags` parameter, whatever the server then does with it
+    /// (`docs/adr/0014-remote-administration.md` notes this was
+    /// never confirmed against a live server).
     pub fn with_flags(mut self, flags: impl IntoIterator<Item = AdminFlag>) -> Self {
         self.flags = flags.into_iter().collect();
         self
@@ -208,6 +215,18 @@ fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
+/// Reads exactly 4 hex digits, the fixed width a JSON `\u` escape
+/// always uses.
+fn read_hex4(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<u32> {
+    (0..4)
+        .map(|_| chars.next())
+        .collect::<Option<String>>()
+        .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
+        .ok_or_else(|| {
+            Error::MalformedAdminResponse("invalid \\u escape in JSON string".to_string())
+        })
+}
+
 fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<String> {
     if chars.next() != Some('"') {
         return Err(Error::MalformedAdminResponse(
@@ -228,17 +247,37 @@ fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Re
                 Some('b') => value.push('\u{8}'),
                 Some('f') => value.push('\u{c}'),
                 Some('u') => {
-                    let code = (0..4)
-                        .map(|_| chars.next())
-                        .collect::<Option<String>>()
-                        .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
-                        .and_then(char::from_u32)
-                        .ok_or_else(|| {
-                            Error::MalformedAdminResponse(
-                                "invalid \\u escape in JSON string".to_string(),
-                            )
-                        })?;
-                    value.push(code);
+                    let unit = read_hex4(chars)?;
+                    let code = if (0xD800..=0xDBFF).contains(&unit) {
+                        // A high surrogate never stands for a scalar
+                        // value on its own: JSON (like UTF-16) only
+                        // represents a character outside the Basic
+                        // Multilingual Plane as a surrogate pair, two
+                        // consecutive `\u` escapes. Confirmed to be a
+                        // real gap, not a hypothetical one: a lone
+                        // `char::from_u32(0xD800..=0xDBFF)` call
+                        // always returns `None`.
+                        if chars.next() != Some('\\') || chars.next() != Some('u') {
+                            return Err(Error::MalformedAdminResponse(
+                                "expected a low surrogate \\u escape after a high surrogate"
+                                    .to_string(),
+                            ));
+                        }
+                        let low = read_hex4(chars)?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return Err(Error::MalformedAdminResponse(
+                                "expected a low surrogate in the range 0xDC00..=0xDFFF".to_string(),
+                            ));
+                        }
+                        0x10000 + (unit - 0xD800) * 0x400 + (low - 0xDC00)
+                    } else {
+                        unit
+                    };
+                    value.push(char::from_u32(code).ok_or_else(|| {
+                        Error::MalformedAdminResponse(
+                            "invalid \\u escape in JSON string".to_string(),
+                        )
+                    })?);
                 }
                 other => {
                     return Err(Error::MalformedAdminResponse(format!(
@@ -290,6 +329,31 @@ mod tests {
     #[test]
     fn rejects_a_truncated_array() {
         assert!(parse_json_string_array(br#"["one""#).is_err());
+    }
+
+    /// A character outside the Basic Multilingual Plane (here, an
+    /// emoji) is encoded as a surrogate pair: two consecutive `\u`
+    /// escapes that only make sense combined, never decoded one at a
+    /// time.
+    #[test]
+    fn parses_a_surrogate_pair() {
+        // Built at runtime, not typed as a literal escape sequence
+        // in this source file: a backslash directly followed by
+        // "u" and four hex digits is JSON's own escape syntax, and
+        // some tooling that handles this file as text normalizes it
+        // on sight, which would silently turn the test input into
+        // something other than what it is meant to exercise.
+        let backslash = '\\';
+        let input = format!("[\"caf{backslash}u00e9-{backslash}ud83d{backslash}ude00\"]");
+        let names = parse_json_string_array(input.as_bytes()).unwrap();
+        assert_eq!(names, vec!["caf\u{e9}-\u{1f600}".to_string()]);
+    }
+
+    #[test]
+    fn rejects_a_lone_high_surrogate() {
+        let backslash = '\\';
+        let input = format!("[\"{backslash}ud83d\"]");
+        assert!(parse_json_string_array(input.as_bytes()).is_err());
     }
 
     /// `create_cache` sends `name` and, since a template was given,
