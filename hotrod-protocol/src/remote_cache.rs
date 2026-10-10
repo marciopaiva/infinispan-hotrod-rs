@@ -9,13 +9,15 @@
 //! `HotRodClient`'s own locking, not behind a borrow this type would have
 //! to serialize.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::client::HotRodClient;
 use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
 use crate::error::{Error, Result};
+use crate::health::NodeHealth;
 use crate::iteration::{CacheIterator, IterationOptions, NodeIterator};
 use crate::listener::{CacheListener, ListenOptions};
 use crate::near_cache::{NearCacheOptions, NearCachedCache};
@@ -557,100 +559,107 @@ impl RemoteCache {
         self.client.stats_for(&self.cache_name).reset();
     }
 
-    /// Routes `key` to its computed owner, checking out a connection for
-    /// this cache (opening and authenticating one first if needed) and
-    /// running `op` against it. On an I/O or timeout error, the checked
-    /// out connection is left to `PooledGuard::drop` to evict (it comes
-    /// back from a failed operation poisoned, see `connection.rs`'s
-    /// module docs), and `op` is retried once: against the seed if the
-    /// owner was a computed node (`run_seed_op`, itself subject to
-    /// failover), or straight to `failover_and_retry` if the owner
-    /// already was the seed. Any other error, or a failure with nowhere
-    /// left to retry, is returned as is.
-    ///
-    /// `checkout` itself failing (the owner refuses the connection
-    /// outright, rather than a request on an already-open one timing
-    /// out) goes through this same retry decision, not a bare `?`: an
-    /// earlier version propagated a `checkout` failure immediately,
-    /// skipping failover whenever a node could not even be connected to,
-    /// which is exactly the case failover exists for.
+    /// Routes `key` to its segment's owners and dispatches `op` through
+    /// `dispatch`'s retry chain: primary owner first, then each backup
+    /// owner, then the active seed, then every other configured seed
+    /// (`docs/adr/0011-retry-policy-and-node-health.md`).
     async fn call(&self, key: &[u8], op: Operation) -> Result<OperationResult> {
-        let (addr, origin) = self.client.owner_addr(key).await?;
-        let outcome = match self.client.checkout(addr, &self.cache_name, origin).await {
-            Ok(mut guard) => self.run_and_record(&mut guard, &op).await.inspect(|_| {
-                self.client.record_topology_update(&mut guard);
-            }),
-            Err(err) => Err(err),
-        };
-        let err = match outcome {
-            Ok(value) => return Ok(value),
-            Err(err) => err,
-        };
-        if !matches!(err, Error::Io(_) | Error::Timeout(_)) {
-            return Err(err);
-        }
-        if addr == self.active_seed_addr() {
-            return self.failover_and_retry(&op, err).await;
-        }
-        self.run_seed_op(&op).await
+        let candidates = self.client.owner_and_backup_addrs(key).await?;
+        self.dispatch(candidates, op).await
     }
 
-    /// Runs `op` against the seed connection, for an operation with no
-    /// key to route by. On `Error::Io`/`Error::Timeout`, `failover_and_retry`
-    /// takes over.
+    /// Dispatches `op` through `dispatch`'s retry chain starting from
+    /// the active seed, for an operation with no key to route by.
     async fn call_seed(&self, op: Operation) -> Result<OperationResult> {
-        self.run_seed_op(&op).await
+        self.dispatch(vec![(self.active_seed_addr(), None)], op)
+            .await
     }
 
-    /// Shared by `call_seed` and `call`'s owner-to-seed retry: runs `op`
-    /// against a connection to the seed, for this cache. On
-    /// `Error::Io`/`Error::Timeout`, hands off to `failover_and_retry`.
-    /// Any other error is returned as is. Like `call`, a `checkout`
-    /// failure goes through the same retry decision as a failed `op`,
-    /// not a bare `?`, so failover still triggers when the seed refuses
-    /// the connection outright.
-    async fn run_seed_op(&self, op: &Operation) -> Result<OperationResult> {
-        let seed = self.active_seed_addr();
-        let attempt = match self.client.checkout(seed, &self.cache_name, None).await {
-            Ok(mut guard) => self.run_and_record(&mut guard, op).await.inspect(|_| {
-                self.client.record_topology_update(&mut guard);
-            }),
-            Err(err) => Err(err),
-        };
-        match attempt {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                if !matches!(err, Error::Io(_) | Error::Timeout(_)) {
-                    return Err(err);
+    /// Shared retry chain for `call`/`call_seed`
+    /// (`docs/adr/0011-retry-policy-and-node-health.md`). `candidates`
+    /// is tried in order, skipping an address currently quarantined by
+    /// `node_health` unless that would leave none at all to try (a
+    /// client should never refuse to attempt anything just because
+    /// every known node recently failed, since that might no longer be
+    /// true). Once `candidates` is exhausted, falls back to
+    /// `failover_seed`, which can be called more than once in the same
+    /// chain as `active_seed_addr` keeps advancing through the
+    /// configured seed list.
+    ///
+    /// Bounded by `max_retries` attempts beyond the first, the same
+    /// default as the Java client. On `Error::Io`/`Error::Timeout`
+    /// (the server never answered, as opposed to answering with an
+    /// application error), marks the attempted address failed
+    /// (`node_health.mark_failed`) and moves to the next candidate;
+    /// this never distinguishes by operation type, matching the Java
+    /// client's own `supportRetry()`, which does not either (see the
+    /// ADR). Any other error returns immediately. On success, clears
+    /// the address's quarantine and returns.
+    ///
+    /// `tried` makes sure no address is attempted twice in one chain,
+    /// including ones `failover_seed` returns: without it, a cluster
+    /// with only two seeds both down could bounce back and forth
+    /// between them instead of exhausting `max_retries` and stopping.
+    /// When `failover_seed` itself cannot reach any other seed, or
+    /// only offers one already in `tried`, the chain ends and returns
+    /// the last real operation error, not `failover_seed`'s own
+    /// connection error, which is about reachability, not about what
+    /// the caller's operation actually hit.
+    async fn dispatch(
+        &self,
+        candidates: Vec<(SocketAddr, Option<TopologyServer>)>,
+        op: Operation,
+    ) -> Result<OperationResult> {
+        let node_health = self.client.node_health();
+        let mut queue = filter_quarantined(
+            candidates,
+            node_health,
+            self.client.server_failure_timeout(),
+        );
+        let mut tried: HashSet<SocketAddr> = HashSet::new();
+        let mut attempts_left = self.client.max_retries() + 1;
+        let mut last_err: Option<Error> = None;
+
+        loop {
+            if attempts_left == 0 {
+                return Err(last_err.unwrap_or_else(exhausted_candidates_error));
+            }
+            let (addr, origin) = loop {
+                if let Some(candidate) = queue.pop_front() {
+                    if tried.contains(&candidate.0) {
+                        continue;
+                    }
+                    break candidate;
                 }
-                self.failover_and_retry(op, err).await
+                match self.client.failover_seed(&self.cache_name).await {
+                    Ok(new_seed) if !tried.contains(&new_seed) => break (new_seed, None),
+                    _ => return Err(last_err.unwrap_or_else(exhausted_candidates_error)),
+                }
+            };
+            attempts_left -= 1;
+            tried.insert(addr);
+
+            let outcome = match self.client.checkout(addr, &self.cache_name, origin).await {
+                Ok(mut guard) => self.run_and_record(&mut guard, &op).await.inspect(|_| {
+                    self.client.record_topology_update(&mut guard);
+                }),
+                Err(err) => Err(err),
+            };
+
+            match outcome {
+                Ok(value) => {
+                    node_health.clear(addr);
+                    return Ok(value);
+                }
+                Err(err) => {
+                    if !matches!(err, Error::Io(_) | Error::Timeout(_)) {
+                        return Err(err);
+                    }
+                    node_health.mark_failed(addr);
+                    last_err = Some(err);
+                }
             }
         }
-    }
-
-    /// Called once the current seed connection has just failed with
-    /// `Error::Io`/`Error::Timeout`. Tries every other seed address and,
-    /// if one accepts a connection, retries `op` against it once,
-    /// promoting it to the active seed. If no other seed is reachable
-    /// either, `original_err`, the failure that triggered this in the
-    /// first place, is returned rather than whatever `failover_seed`
-    /// itself failed with: that is the error the caller's operation
-    /// actually hit.
-    async fn failover_and_retry(
-        &self,
-        op: &Operation,
-        original_err: Error,
-    ) -> Result<OperationResult> {
-        let Ok(new_seed) = self.client.failover_seed(&self.cache_name).await else {
-            return Err(original_err);
-        };
-        let mut guard = self
-            .client
-            .checkout(new_seed, &self.cache_name, None)
-            .await?;
-        self.run_and_record(&mut guard, op).await.inspect(|_| {
-            self.client.record_topology_update(&mut guard);
-        })
     }
 
     /// Runs `op`, wrapped in one `tracing` span covering every
@@ -660,25 +669,24 @@ impl RemoteCache {
     /// `conn` themselves carry, which is exactly why those two
     /// arguments are skipped rather than auto-captured. `WARN`, not
     /// the macro's own `ERROR` default: this span covers one attempt,
-    /// and `call`/`run_seed_op`/`failover_and_retry` retry an
-    /// `Error::Io`/`Error::Timeout` attempt against another node
-    /// before giving up, so a transient failure that a retry then
-    /// recovers from would otherwise emit the same severity an
-    /// operation that truly failed does, indistinguishable to an
-    /// observability pipeline that pages on `ERROR`. One retried
-    /// logical call still opens more than one span this way, with no
-    /// shared id linking them back together: see the ADR's
-    /// Consequences section for why that is an accepted limitation,
-    /// not something this phase fixes. Separately, only if `op`
-    /// succeeds, records its timing into this cache's statistics
+    /// and `dispatch` retries an `Error::Io`/`Error::Timeout` attempt
+    /// against another node, up to `max_retries` times, before giving
+    /// up (`docs/adr/0011-retry-policy-and-node-health.md`), so a
+    /// transient failure that a retry then recovers from would
+    /// otherwise emit the same severity an operation that truly failed
+    /// does, indistinguishable to an observability pipeline that pages
+    /// on `ERROR`. One retried logical call still opens more than one
+    /// span this way, with no shared id linking them back together:
+    /// see ADR 0010's Consequences section for why that is an accepted
+    /// limitation, not something this phase fixes. Separately, only if
+    /// `op` succeeds, records its timing into this cache's statistics
     /// (part 1): a failed attempt (timed out, I/O error, retried)
     /// measures nothing there, since what matters to the counters is
     /// the cost of an operation that actually worked; the span's own
-    /// `duration_us` is recorded either way. The one place every one
-    /// of `call`'s four dispatch paths routes `op` through a
-    /// connection, so this is also the one place that needs either
-    /// kind of instrumentation, rather than each of the four
-    /// repeating it.
+    /// `duration_us` is recorded either way. `dispatch` is the one
+    /// place every operation routes `op` through a connection, so this
+    /// is also the one place that needs either kind of instrumentation,
+    /// rather than each candidate attempt repeating it.
     #[tracing::instrument(
         name = "hotrod_operation",
         skip(self, conn, op),
@@ -748,6 +756,45 @@ impl RemoteCache {
     }
 }
 
+/// Drops every candidate `node_health` currently quarantines, unless
+/// that would leave none at all, in which case `candidates` is kept
+/// as given: trying something is always better than refusing outright
+/// just because every known node recently failed, which might no
+/// longer be true by now. `quarantine: None` (quarantine disabled)
+/// skips the filter entirely.
+fn filter_quarantined(
+    candidates: Vec<(SocketAddr, Option<TopologyServer>)>,
+    node_health: &NodeHealth,
+    quarantine: Option<Duration>,
+) -> VecDeque<(SocketAddr, Option<TopologyServer>)> {
+    let Some(quarantine) = quarantine else {
+        return candidates.into();
+    };
+    let healthy: Vec<_> = candidates
+        .iter()
+        .filter(|(addr, _)| !node_health.is_quarantined(*addr, quarantine))
+        .cloned()
+        .collect();
+    if healthy.is_empty() {
+        candidates.into()
+    } else {
+        healthy.into()
+    }
+}
+
+/// Built only for the case `dispatch`'s own doc comment calls out as
+/// unreachable in practice (`call`/`call_seed` always seed `dispatch`
+/// with at least the active seed as a candidate): kept as a real,
+/// typed fallback rather than a `panic!`/`unreachable!`, since nothing
+/// here actually guarantees a caller can never construct an empty
+/// candidate list.
+fn exhausted_candidates_error() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "no node available to dispatch this operation",
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -763,7 +810,11 @@ pub(crate) mod tests {
         read_request_opcode, response_header, response_header_with_topology, serve_plain_auth,
         unreachable_addr,
     };
-    use crate::client::{AuthMethod, ClientInner, ClusterTopology, HotRodClient};
+    use crate::client::{
+        AuthMethod, ClientInner, ClusterTopology, HotRodClient, DEFAULT_MAX_RETRIES,
+        DEFAULT_SERVER_FAILURE_TIMEOUT,
+    };
+    use crate::health::NodeHealth;
     use crate::topology::TopologyServer;
     use crate::varint::{read_vint, write_vint};
     use crate::wire::{read_array, write_array};
@@ -790,6 +841,9 @@ pub(crate) mod tests {
             tls: None,
             timeout: RwLock::new(timeout),
             cache_stats: RwLock::new(StdHashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
         })
     }
 
@@ -938,6 +992,250 @@ pub(crate) mod tests {
             seed_addr,
             "active seed stays unchanged when no other seed is reachable"
         );
+    }
+
+    /// `docs/adr/0011-retry-policy-and-node-health.md`: a keyed
+    /// operation's retry chain tries the segment's backup owner before
+    /// ever falling back to the seed.
+    #[tokio::test]
+    async fn retry_tries_the_backup_owner_before_falling_over_to_the_seed() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = primary_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup_addr = backup_listener.local_addr().unwrap();
+        let backup_task = tokio::spawn(async move {
+            let (mut stream, _) = backup_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, b"from backup");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        // Never bound to anything: if the chain wrongly reached the seed
+        // before trying the backup owner, this would fail fast with
+        // `Error::Io` instead of the backup's response succeeding.
+        let seed_addr = unreachable_addr().await;
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        set_topology(
+            &client,
+            ClusterTopology {
+                topology_id: 9,
+                servers: vec![
+                    TopologyServer {
+                        host: primary_addr.ip().to_string(),
+                        port: primary_addr.port(),
+                    },
+                    TopologyServer {
+                        host: backup_addr.ip().to_string(),
+                        port: backup_addr.port(),
+                    },
+                ],
+                hash_function_version: 3,
+                segment_owners: vec![vec![0, 1]],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+
+        let result = client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should fail over to the backup owner");
+
+        assert_eq!(result, Some(b"from backup".to_vec()));
+
+        backup_task.await.unwrap();
+    }
+
+    /// `docs/adr/0011-retry-policy-and-node-health.md`: `max_retries`
+    /// bounds the chain even when more candidates are available.
+    #[tokio::test]
+    async fn retry_stops_after_max_retries_attempts_even_with_more_candidates_available() {
+        let touched = Arc::new(Mutex::new(Vec::new()));
+        let mut addrs = Vec::new();
+        for i in 0..5u32 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            let touched = touched.clone();
+            tokio::spawn(async move {
+                if let Ok((_stream, _)) = listener.accept().await {
+                    touched.lock().unwrap().push(i);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+        }
+
+        let seed_addr = unreachable_addr().await;
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        client.set_max_retries(1); // first attempt + one retry = 2 total
+
+        set_topology(
+            &client,
+            ClusterTopology {
+                topology_id: 9,
+                servers: addrs
+                    .iter()
+                    .map(|addr| TopologyServer {
+                        host: addr.ip().to_string(),
+                        port: addr.port(),
+                    })
+                    .collect(),
+                hash_function_version: 3,
+                segment_owners: vec![(0..5u32).collect()],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+
+        let result = client.cache("my-cache").get(b"key").await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert_eq!(
+            *touched.lock().unwrap(),
+            vec![0, 1],
+            "only max_retries + 1 candidates should ever be attempted"
+        );
+    }
+
+    /// `docs/adr/0011-retry-policy-and-node-health.md`: a candidate
+    /// `node_health` currently quarantines is skipped in favor of the
+    /// next one, as long as skipping it still leaves something to try.
+    #[tokio::test]
+    async fn retry_skips_a_quarantined_candidate_in_favor_of_the_next_one() {
+        let touched_quarantined = Arc::new(Mutex::new(false));
+        let quarantined_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let quarantined_addr = quarantined_listener.local_addr().unwrap();
+        let touched_quarantined_in_task = touched_quarantined.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = quarantined_listener.accept().await.unwrap();
+            *touched_quarantined_in_task.lock().unwrap() = true;
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, b"wrong");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let healthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy_listener.local_addr().unwrap();
+        let healthy_task = tokio::spawn(async move {
+            let (mut stream, _) = healthy_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let mut resp = response_header(id, 0x04, 0x00);
+            write_array(&mut resp, b"right");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let seed_addr = unreachable_addr().await;
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        client.inner().node_health.mark_failed(quarantined_addr);
+
+        set_topology(
+            &client,
+            ClusterTopology {
+                topology_id: 9,
+                servers: vec![
+                    TopologyServer {
+                        host: quarantined_addr.ip().to_string(),
+                        port: quarantined_addr.port(),
+                    },
+                    TopologyServer {
+                        host: healthy_addr.ip().to_string(),
+                        port: healthy_addr.port(),
+                    },
+                ],
+                hash_function_version: 3,
+                segment_owners: vec![vec![0, 1]],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+
+        let result = client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should succeed via the non-quarantined backup");
+
+        assert_eq!(result, Some(b"right".to_vec()));
+        assert!(
+            !*touched_quarantined.lock().unwrap(),
+            "the quarantined primary owner must not be attempted while a healthy candidate is available"
+        );
+
+        healthy_task.await.unwrap();
+    }
+
+    /// `docs/adr/0011-retry-policy-and-node-health.md`: a topology
+    /// update that actually changes the topology id lifts every
+    /// quarantine, not just the ones for addresses it lists.
+    #[tokio::test]
+    async fn topology_update_clears_every_quarantine() {
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = owner_listener.local_addr().unwrap();
+        let owner_task = tokio::spawn(async move {
+            let (mut stream, _) = owner_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header_with_topology(
+                id,
+                0x04,
+                0x02, // KEY_DOES_NOT_EXIST
+                &[(&owner_addr.ip().to_string(), owner_addr.port())],
+            );
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![owner_addr], owner_addr);
+        set_topology(
+            &client,
+            ClusterTopology {
+                // Different from `response_header_with_topology`'s
+                // hardcoded new id (9), so the update below is a real
+                // topology id change.
+                topology_id: 1,
+                servers: vec![TopologyServer {
+                    host: owner_addr.ip().to_string(),
+                    port: owner_addr.port(),
+                }],
+                hash_function_version: 3,
+                segment_owners: vec![vec![0]],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+
+        let quarantined = unreachable_addr().await;
+        client.inner().node_health.mark_failed(quarantined);
+        assert!(client
+            .inner()
+            .node_health
+            .is_quarantined(quarantined, Duration::from_secs(30)));
+
+        client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get against the owner");
+
+        assert!(
+            !client
+                .inner()
+                .node_health
+                .is_quarantined(quarantined, Duration::from_secs(30)),
+            "a topology update that changes the topology id should clear every quarantine"
+        );
+
+        owner_task.await.unwrap();
     }
 
     #[tokio::test]

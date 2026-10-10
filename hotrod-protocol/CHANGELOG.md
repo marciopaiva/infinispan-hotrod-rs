@@ -8,6 +8,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Retry policy and node health tracking: `RemoteCache`'s retry chain
+  tries the primary owner, then each backup owner, then the active
+  seed, then every other configured seed, bounded by a configurable
+  `HotRodClient::max_retries`/`set_max_retries` (default 3, matching
+  the Java client), per
+  `docs/adr/0011-retry-policy-and-node-health.md` (#97). A new
+  TTL-based circuit breaker, configured through
+  `HotRodClient::server_failure_timeout`/
+  `set_server_failure_timeout` (default 30 seconds, `None` disables
+  it), skips a node that failed recently instead of paying its full
+  timeout again on every operation routed to it. Pinned against the
+  Java client's own source: it does not special-case conditional
+  operations (`put_if_absent`/`replace_if_unmodified`/
+  `remove_if_unmodified`) under retry either, so neither does this.
 - `fuzz/`: a `cargo-fuzz` dev tool (never part of the normal build,
   tests or CI) covering the wire parsers (`read_vint`/`read_vlong`,
   `read_array`/`read_string`/`read_string_map`,

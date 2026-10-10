@@ -95,7 +95,7 @@ Both items in this theme are done.
 
 ### Reliability and observability
 
-Both halves of #54 are done.
+Every item in this theme is done.
 
 * ~~Client statistics (#54, part 1 of 2)~~ (done). `RemoteCache::
   statistics`/`reset_statistics`, `NearCachedCache::
@@ -107,13 +107,17 @@ Both halves of #54 are done.
   propagation to the server (what the Java client itself calls
   "telemetry"): that is a bigger, separate feature, left for its own
   proposal if it turns out to matter.
-* Retry policy, node health tracking and circuit breaking are natural
-  extensions of this theme (an operation-aware retry policy in
-  particular, since blindly retrying `put`/`replace`/the versioned
-  operations risks silent duplicate writes), but none of them has an
-  issue filed yet. Worth proposing once #54 gives a concrete picture of
-  what is actually failing in practice, rather than designing retry
-  behavior against a guess.
+* ~~Retry policy, node health tracking and circuit breaking (#97)~~
+  (done). `RemoteCache`'s retry chain now tries the primary owner,
+  then each backup owner, then the active seed, then every other
+  configured seed, bounded by a configurable `max_retries` (default
+  3, matching the Java client); a new TTL-based `NodeHealth` circuit
+  breaker (`HotRodClient::server_failure_timeout`) skips a node that
+  failed recently instead of paying its full timeout again. See
+  `docs/adr/0011-retry-policy-and-node-health.md`: pinned against the
+  Java client's own source, it turned out the reference client does
+  not special-case conditional operations under retry either, so this
+  phase mirrors that instead of inventing a stricter policy.
 * ~~Fuzzing the wire parsers~~ (done). `fuzz/` (`cargo-fuzz`, dev-only,
   never part of the normal build or CI) covers `read_vint`/
   `read_vlong`, `read_array`/`read_string`/`read_string_map`,
