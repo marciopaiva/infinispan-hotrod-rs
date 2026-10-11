@@ -107,6 +107,16 @@ pub(crate) enum OpCode {
     MultimapContainsEntry = 0x73,
     MultimapContainsKey = 0x75,
     MultimapContainsValue = 0x77,
+    // Transactions (see docs/adr/0018-transactions-non-xa-one-phase.md),
+    // confirmed against HotRodConstants.java on both sides. Only the
+    // one-phase prepare path is implemented this phase: a plain
+    // "request + 1" response, like every opcode above except the
+    // streaming group below. `COMMIT_REQUEST`/`ROLLBACK_REQUEST`
+    // (0x3D/0x3F), `FORGET_TX_REQUEST` (0x79) and
+    // `FETCH_TX_RECOVERY_REQUEST` (0x7B) are confirmed real but
+    // deliberately out of scope: see that ADR's own "Consequences"
+    // section.
+    PrepareTx = 0x7D,
     // Streaming (protocol 4.1, Infinispan 15.1+): not the discontinued
     // GET_STREAM/PUT_STREAM pair from Hot Rod 2.6 (0x37/0x39), which this
     // crate never implements. These six, confirmed against

@@ -1241,6 +1241,80 @@ async fn multimap_cache_round_trips_against_a_real_server() {
         .expect("remove_key on an already-removed key"));
 }
 
+#[tokio::test]
+#[ignore]
+async fn transaction_commit_and_rollback_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    // Pre-provisioned as a transactional cache in
+    // ci/infinispan/infinispan.xml: there is no opcode to configure
+    // transactionality from the client, so an ordinary cache would
+    // fail every prepare.
+    let cache = client.cache("transactional-test");
+    let key = b"ci-transaction-key";
+    let _ = cache.remove(key).await;
+
+    // A transaction's own writes are visible to its own later reads
+    // without a round trip, and committing actually persists them.
+    let mut tx = cache.begin_transaction();
+    assert_eq!(tx.get(key).await.expect("get on a missing key"), None);
+    tx.put(key, b"one", Expiration::Default, Expiration::Default);
+    assert_eq!(
+        tx.get(key).await.expect("read-your-own-write"),
+        Some(b"one".to_vec())
+    );
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        cache.get(key).await.expect("get after commit"),
+        Some(b"one".to_vec())
+    );
+
+    // rollback() discards local state: nothing it recorded ever
+    // reaches the server.
+    let mut tx = cache.begin_transaction();
+    tx.put(key, b"two", Expiration::Default, Expiration::Default);
+    tx.rollback();
+    assert_eq!(
+        cache.get(key).await.expect("get after rollback"),
+        Some(b"one".to_vec()),
+        "a rolled-back transaction must not have changed the stored value"
+    );
+
+    // Write-skew: two transactions both read the same key, then both
+    // try to write it. The one that commits first wins; the second
+    // commit must be rejected rather than silently overwrite it.
+    let mut tx1 = cache.begin_transaction();
+    let mut tx2 = cache.begin_transaction();
+    assert_eq!(tx1.get(key).await.expect("tx1 get"), Some(b"one".to_vec()));
+    assert_eq!(tx2.get(key).await.expect("tx2 get"), Some(b"one".to_vec()));
+    tx1.put(key, b"from-tx1", Expiration::Default, Expiration::Default);
+    tx2.put(key, b"from-tx2", Expiration::Default, Expiration::Default);
+
+    tx1.commit().await.expect("tx1 commit should win the race");
+    let tx2_result = tx2.commit().await;
+    assert!(
+        matches!(tx2_result, Err(Error::TransactionRolledBack)),
+        "tx2 read a now-stale version, so its commit must be rolled back, got {tx2_result:?}"
+    );
+    assert_eq!(
+        cache.get(key).await.expect("get after the conflict"),
+        Some(b"from-tx1".to_vec())
+    );
+
+    cache.remove(key).await.expect("cleanup");
+}
+
 /// The DR/alternate cluster's address, needed only by the
 /// `multicluster_*` tests below: a genuinely independent second
 /// server, not another node of the same cluster like

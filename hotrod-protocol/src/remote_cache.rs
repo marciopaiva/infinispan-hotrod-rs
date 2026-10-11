@@ -27,6 +27,7 @@ use crate::query::{Query, QueryResult};
 use crate::stats::ClientStatistics;
 use crate::streaming::{GetStream, PutStream};
 use crate::topology::TopologyServer;
+use crate::transaction::{Modification, Transaction, Xid};
 use crate::typed_cache::TypedCache;
 use crate::wire::Expiration;
 
@@ -74,6 +75,7 @@ enum Operation {
     MultimapContainsEntry(Vec<u8>, Vec<u8>, bool),
     MultimapContainsKey(Vec<u8>, bool),
     MultimapContainsValue(Vec<u8>, bool),
+    PrepareTransaction(Xid, Vec<Modification>),
 }
 
 impl Operation {
@@ -120,6 +122,7 @@ impl Operation {
             Operation::MultimapContainsEntry(..) => "multimap_contains_entry",
             Operation::MultimapContainsKey(..) => "multimap_contains_key",
             Operation::MultimapContainsValue(..) => "multimap_contains_value",
+            Operation::PrepareTransaction(..) => "prepare_transaction",
         }
     }
 }
@@ -148,6 +151,7 @@ enum OperationResult {
     MultimapEntry(Option<crate::multimap::MultimapEntry>),
     MultimapPut,
     MultimapSize(u64),
+    PrepareTransaction,
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -280,6 +284,11 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
             conn.multimap_contains_value(value, *supports_duplicates)
                 .await?,
         )),
+        Operation::PrepareTransaction(xid, modifications) => {
+            conn.prepare_transaction_one_phase(xid, modifications)
+                .await?;
+            Ok(OperationResult::PrepareTransaction)
+        }
     }
 }
 
@@ -559,6 +568,38 @@ impl RemoteCache {
         match self.call_seed(Operation::Query(request_bytes)).await? {
             OperationResult::Query(result) => Ok(result),
             _ => unreachable!("Operation::Query always yields OperationResult::Query"),
+        }
+    }
+
+    /// Starts a local, optimistic transaction against this cache
+    /// (`docs/adr/0018-transactions-non-xa-one-phase.md`). No
+    /// network call: see `Transaction`'s own docs.
+    pub fn begin_transaction(&self) -> Transaction {
+        Transaction::new(self.clone())
+    }
+
+    /// Sends `modifications` as one `PREPARE_TX_2` request under
+    /// `xid`, generated once by `Transaction::commit` so the same id
+    /// is replayed on every retry attempt `call_seed` makes. No key
+    /// to route by: a transaction can span several keys with
+    /// different owners, and the server resolves that internally
+    /// regardless of which node receives the request (confirmed
+    /// against the Java client: its own first-key-owner routing is a
+    /// latency heuristic, not a protocol requirement). Always goes to
+    /// the seed, the same as `query`/`size`/`clear`.
+    pub(crate) async fn run_prepare_transaction(
+        &self,
+        xid: Xid,
+        modifications: Vec<Modification>,
+    ) -> Result<()> {
+        match self
+            .call_seed(Operation::PrepareTransaction(xid, modifications))
+            .await?
+        {
+            OperationResult::PrepareTransaction => Ok(()),
+            _ => unreachable!(
+                "Operation::PrepareTransaction always yields OperationResult::PrepareTransaction"
+            ),
         }
     }
 

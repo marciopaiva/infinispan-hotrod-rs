@@ -26,7 +26,7 @@ for release notes.
 | Configurable retry policy, per-node circuit breaker | Yes | Yes |
 | Client listeners (cache events) | Yes | Yes |
 | Near caching | Yes | Yes |
-| Transactions | Yes | No |
+| Transactions | Yes | Yes (`NON_XA`, one-phase commit only; real XA and recovery not yet implemented) |
 | Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
@@ -249,6 +249,19 @@ let tags = client.multimap_cache("tags-by-user", true);
 tags.put(b"user:42", b"admin", Expiration::Default, Expiration::Default).await?;
 tags.put(b"user:42", b"beta-tester", Expiration::Default, Expiration::Default).await?;
 let values = tags.get(b"user:42").await?; // every value stored under this key
+```
+
+`begin_transaction` starts a local, optimistic transaction against a
+cache configured transactional (`NON_XA`) server-side.
+`get`/`put`/`remove` stay local until `commit` sends every pending
+write in one request; a conflicting concurrent write rolls the whole
+transaction back instead of committing either side's change:
+
+```rust
+let mut tx = cache.begin_transaction();
+tx.put(b"key", b"value", Expiration::Default, Expiration::Default);
+let value = tx.get(b"key").await?; // read-your-own-writes within the transaction
+tx.commit().await?; // or tx.rollback() to discard everything above
 ```
 
 ## License

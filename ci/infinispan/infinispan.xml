@@ -20,6 +20,12 @@
            before any test's first keyed call, so this is the only
            one that would ever hit it. -->
       <local-cache name="multimap-test"/>
+      <!-- Transactions (docs/adr/0018-transactions-non-xa-one-phase.md)
+           need a cache configured as transactional server-side; a
+           plain cache's PREPARE_TX_2 would fail every time. -->
+      <local-cache name="transactional-test">
+         <transaction mode="NON_XA"/>
+      </local-cache>
       <security>
          <authorization/>
       </security>

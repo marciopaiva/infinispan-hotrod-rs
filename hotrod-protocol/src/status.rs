@@ -58,6 +58,22 @@ impl Status {
         self.0 == Self::NOT_EXECUTED_WITH_PREVIOUS
     }
 
+    /// True only for `NOT_PUT_REMOVED_REPLACED` (`0x01`), never for
+    /// `NOT_EXECUTED_WITH_PREVIOUS` (`0x04`), the opposite split from
+    /// `is_not_executed_with_previous`.
+    /// `prepare_transaction_one_phase`
+    /// (`docs/adr/0018-transactions-non-xa-one-phase.md`) needs this
+    /// exact distinction: the server is only confirmed to use `0x01`
+    /// for `PREPARE_TX_2`'s no-body conflict response. `0x04` is
+    /// confirmed for a bounded strong counter's out-of-bounds
+    /// rejection elsewhere in this crate, a status this opcode has
+    /// never been confirmed to send; treating it the same as `0x01`
+    /// here would read a body that was never sent if the server ever
+    /// did.
+    pub(crate) fn is_not_put_removed_replaced(self) -> bool {
+        self.0 == Self::NOT_PUT_REMOVED_REPLACED
+    }
+
     /// Mirrors the Java client's own `hasPrevious()` predicate: true for
     /// the two statuses whose name says a "previous" value is involved
     /// (`SUCCESS_WITH_PREVIOUS`, `NOT_EXECUTED_WITH_PREVIOUS`). Used by
