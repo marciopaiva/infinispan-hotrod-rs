@@ -64,7 +64,11 @@ jobs:
         run: ci/infinispan-cluster/setup.sh
 
       - name: Cluster tests
-        run: cargo test --test live_server cluster_ -- --ignored
+        # `cluster_` as a cargo test-name filter also matches
+        # `multicluster_`, a separate fixture (ci/infinispan-multicluster/,
+        # multicluster-test below): excluded explicitly so that job's
+        # own tests do not run here against the wrong servers.
+        run: cargo test --test live_server -- --ignored cluster_ --skip multicluster_
 
       - name: Stop Infinispan cluster
         if: always()
