@@ -33,8 +33,12 @@ caching (`docs/adr/0007-near-caching.md`, #5), released together as
 v0.5.0. Streaming (`docs/adr/0008-streaming.md`, #52), server-side
 iteration (`docs/adr/0009-server-side-iteration.md`, #53) and client
 statistics and tracing
-(`docs/adr/0010-client-statistics-and-tracing.md`, #54) are done too,
-unreleased. Typed serialization and the PHP bridge are still open.
+(`docs/adr/0010-client-statistics-and-tracing.md`, #54) are done too.
+Every theme below is now done as well: typed serialization and
+remote query, remote administration, distributed counters, multimap
+cache and multi-cluster failover. The PHP bridge is still open; it
+is its own, separate layer (`php-ext/`), not tracked by the themes
+below.
 
 ## The structural change that gated the rest (done, #77)
 
@@ -75,11 +79,8 @@ statistics and tracing (#54). All seven are done, and so is every
 other item each theme below marks `(done)`: fuzzing, retry policy and
 node health tracking (#97), the serialization abstraction (#99),
 remote query (#50), remote administration (#55), distributed
-counters (#49) and multimap cache (#48). Four of the five themes
-below are now fully done (Large data access, Reliability and
-observability, Typed data, Specialized data structures and
-administration); what is left, High availability, is independent of
-everything above.
+counters (#49), multimap cache (#48) and multi-cluster failover
+(#56). All five themes below are now fully done.
 
 ### Large data access
 
@@ -156,9 +157,16 @@ Both items in this theme are done.
 
 ### High availability
 
-* **Multi-cluster failover (#56).** Disaster-recovery feature, not
-  needed for a single-cluster deployment; independent of the themes
-  above.
+Every item in this theme is done.
+
+* ~~Multi-cluster failover (#56)~~ (done). `HotRodClient::add_cluster`/
+  `switch_to_cluster`/`active_cluster_name` configure and move
+  between alternate clusters; every operation also fails over to a
+  live alternate automatically once every seed of the active cluster
+  becomes unreachable, reusing the retry chain from
+  `docs/adr/0011-retry-policy-and-node-health.md`. Entirely
+  client-side, no new opcodes. See
+  `docs/adr/0017-multi-cluster-failover.md`.
 
 ### Specialized data structures and administration
 

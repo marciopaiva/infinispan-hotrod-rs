@@ -1241,6 +1241,116 @@ async fn multimap_cache_round_trips_against_a_real_server() {
         .expect("remove_key on an already-removed key"));
 }
 
+/// The DR/alternate cluster's address, needed only by the
+/// `multicluster_*` tests below: a genuinely independent second
+/// server, not another node of the same cluster like
+/// `cluster_seed_addrs` points at. See
+/// `ci/infinispan-multicluster/setup.sh` for why
+/// `ci/infinispan-cluster/`'s fixture would not do: its two nodes
+/// share one logical cluster's data, so a failover test against them
+/// could pass by accident.
+fn multicluster_dr_addr() -> SocketAddr {
+    env_or("INFINISPAN_DR_ADDR", "127.0.0.1:11233")
+        .parse()
+        .expect("valid socket address")
+}
+
+/// `switch_to_cluster` moved to a second, real, independent server:
+/// confirmed by writing a key before the switch and finding it
+/// absent after (the DR server has never seen it, unlike a second
+/// node of the same real cluster, which would). Covers the
+/// configuration and manual-switch API end to end against real
+/// servers; `automatic_cluster_failover_completes_the_operation_on_a_live_alternate`
+/// in `remote_cache.rs` already covers the automatic trigger itself
+/// against a fake server, where killing a node mid-test is simply a
+/// matter of never answering it, not something this live test needs
+/// to replicate by actually stopping a container.
+#[tokio::test]
+#[ignore]
+async fn multicluster_switch_to_cluster_moves_traffic_to_an_independent_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+    client
+        .add_cluster("dr", vec![multicluster_dr_addr()])
+        .expect("add_cluster should succeed");
+
+    let key = b"ci-multicluster-key";
+    client
+        .cache("")
+        .put(
+            key,
+            b"primary-value",
+            Expiration::Default,
+            Expiration::Default,
+        )
+        .await
+        .expect("put against the primary cluster");
+
+    assert_eq!(
+        client.active_cluster_name(),
+        HotRodClient::DEFAULT_CLUSTER_NAME
+    );
+    client
+        .switch_to_cluster("dr")
+        .expect("switch_to_cluster should succeed");
+    assert_eq!(client.active_cluster_name(), "dr");
+
+    // Authenticating again: switching clusters does not carry over
+    // any pooled connection from the old one (there is none yet for
+    // this new seed), and the DR server has its own independent SASL
+    // realm, even though in this fixture it happens to accept the
+    // same credentials.
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate against the dr cluster");
+
+    let on_dr = client
+        .cache("")
+        .get(key)
+        .await
+        .expect("get against the dr cluster");
+    assert_eq!(
+        on_dr, None,
+        "the dr cluster must not already have a key only ever written to the primary"
+    );
+
+    client
+        .cache("")
+        .put(key, b"dr-value", Expiration::Default, Expiration::Default)
+        .await
+        .expect("put against the dr cluster");
+
+    client
+        .switch_to_cluster(HotRodClient::DEFAULT_CLUSTER_NAME)
+        .expect("switch_to_cluster back to the primary should succeed");
+    assert_eq!(
+        client.active_cluster_name(),
+        HotRodClient::DEFAULT_CLUSTER_NAME
+    );
+
+    let back_on_primary = client
+        .cache("")
+        .get(key)
+        .await
+        .expect("get against the primary cluster after switching back");
+    assert_eq!(
+        back_on_primary,
+        Some(b"primary-value".to_vec()),
+        "the primary cluster's own value should still be there, untouched by the dr write"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn cluster_contains_key_reflects_presence() {

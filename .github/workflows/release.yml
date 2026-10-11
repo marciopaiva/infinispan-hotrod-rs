@@ -33,14 +33,15 @@ jobs:
         # The cluster_* tests need a real multi-node cluster with a
         # distributed-cache (see docs/adr/0003-hash-aware-routing-scope.md);
         # the tls_* tests need a TLS-enabled server
-        # (ci/infinispan-tls/setup.sh); this single-node, plain-TCP fixture
-        # is neither, so both run instead as their own jobs in ci.yml
-        # (cluster-test, tls-test) rather than here. This same selection
-        # already runs on every push and PR too, as the live-test job in
-        # ci.yml; running it again here is a release-time confidence
-        # check against a freshly started server, not the only place it
-        # runs.
-        run: cargo test --test live_server -- --ignored --skip cluster_ --skip tls_
+        # (ci/infinispan-tls/setup.sh); the multicluster_* tests need two
+        # independent servers (ci/infinispan-multicluster/setup.sh); this
+        # single-node, plain-TCP fixture is none of those, so all three
+        # run instead as their own jobs in ci.yml (cluster-test, tls-test,
+        # multicluster-test) rather than here. This same selection already
+        # runs on every push and PR too, as the live-test job in ci.yml;
+        # running it again here is a release-time confidence check
+        # against a freshly started server, not the only place it runs.
+        run: cargo test --test live_server -- --ignored --skip cluster_ --skip tls_ --skip multicluster_
         env:
           INFINISPAN_ADDR: 127.0.0.1:11222
           INFINISPAN_USER: testuser

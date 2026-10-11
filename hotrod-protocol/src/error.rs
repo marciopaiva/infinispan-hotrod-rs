@@ -92,6 +92,20 @@ pub enum Error {
     #[error("counter {0:?} is not defined")]
     CounterNotFound(String),
 
+    /// `HotRodClient::switch_to_cluster` was given a name that is
+    /// neither `HotRodClient::DEFAULT_CLUSTER_NAME` nor one already
+    /// configured through `add_cluster`. See
+    /// `docs/adr/0017-multi-cluster-failover.md`.
+    #[error("no cluster named {0:?} is configured")]
+    UnknownCluster(String),
+
+    /// `HotRodClient::add_cluster` was called with no seed addresses,
+    /// or with a name already in use (`HotRodClient::DEFAULT_CLUSTER_NAME`
+    /// or an earlier `add_cluster` call). See
+    /// `docs/adr/0017-multi-cluster-failover.md`.
+    #[error("invalid cluster configuration: {0}")]
+    InvalidClusterConfig(String),
+
     /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
     /// knows this cursor, most likely because it sat idle past the
     /// server's five-minute reaper. No retry is attempted; see

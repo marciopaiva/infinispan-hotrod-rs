@@ -454,7 +454,7 @@ mod tests {
         let seed_addr = unreachable_addr().await;
         let client =
             client_with_seeds_and_timeout(vec![seed_addr], seed_addr, Duration::from_secs(5));
-        *client.inner().topology.write().unwrap() = Some(Arc::new(ClusterTopology {
+        client.inner().active.write().unwrap().topology = Some(Arc::new(ClusterTopology {
             topology_id: 9,
             servers: vec![
                 TopologyServer {

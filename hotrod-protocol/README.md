@@ -38,7 +38,7 @@ for release notes.
 | Tracing: local spans (via the `tracing` crate) | No | Yes |
 | Tracing: trace-context propagation to the server | Yes | No |
 | Remote administration (create/remove/list caches) | Yes | Yes |
-| Multi-cluster failover | Yes | No |
+| Multi-cluster failover | Yes | Yes |
 
 ## Usage
 

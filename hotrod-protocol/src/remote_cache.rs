@@ -1101,6 +1101,30 @@ impl RemoteCache {
                     _ => None,
                 };
             }
+            // Every seed of the active cluster, including every one
+            // `failover_seed` just tried, is now exhausted: before
+            // giving up, see whether another configured cluster
+            // responds (`docs/adr/0017-multi-cluster-failover.md`).
+            // On success this has already switched the active
+            // cluster, so `addr` belongs to it, not to whatever
+            // `self.cache_name`'s pool was keyed against a moment
+            // ago. Unlike `failover_seed` just above, this never
+            // checks `tried`: that set only tracks addresses already
+            // attempted within the cluster this chain started
+            // against, and by this point the switch has already
+            // happened regardless, so discarding a live result here
+            // over a coincidental address collision between two
+            // clusters would report failure despite the client now
+            // genuinely being connected elsewhere (found by review
+            // before merge).
+            if next.is_none() {
+                next = self
+                    .client
+                    .try_failover_to_live_cluster(&self.cache_name)
+                    .await
+                    .ok()
+                    .map(|new_seed| (new_seed, None));
+            }
             let Some((addr, origin)) = next else {
                 return Err(last_err.unwrap_or_else(exhausted_candidates_error));
             };
@@ -1216,12 +1240,12 @@ impl RemoteCache {
     }
 
     fn active_seed_addr(&self) -> std::net::SocketAddr {
-        *self
-            .client
+        self.client
             .inner()
-            .active_seed_addr
+            .active
             .read()
             .unwrap_or_else(|p| p.into_inner())
+            .active_seed_addr
     }
 }
 
@@ -1280,7 +1304,7 @@ pub(crate) mod tests {
         unreachable_addr,
     };
     use crate::client::{
-        AuthMethod, ClientInner, ClusterTopology, HotRodClient, DEFAULT_MAX_RETRIES,
+        ActiveCluster, AuthMethod, ClientInner, ClusterTopology, HotRodClient, DEFAULT_MAX_RETRIES,
         DEFAULT_SERVER_FAILURE_TIMEOUT,
     };
     use crate::health::NodeHealth;
@@ -1306,9 +1330,16 @@ pub(crate) mod tests {
         timeout: Duration,
     ) -> HotRodClient {
         HotRodClient::from_inner(ClientInner {
-            seed_addrs,
-            active_seed_addr: RwLock::new(active_seed_addr),
-            topology: RwLock::new(None),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                seed_addrs.clone(),
+            )]),
+            active: RwLock::new(ActiveCluster {
+                name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                seed_addrs,
+                active_seed_addr,
+                topology: None,
+            }),
             node_origin: RwLock::new(StdHashMap::new()),
             pools: RwLock::new(StdHashMap::new()),
             auth: RwLock::new(None),
@@ -1333,7 +1364,7 @@ pub(crate) mod tests {
     /// Shared with `typed_cache.rs`'s own tests, same reason as
     /// `client_with_seeds_and_timeout`.
     pub(crate) fn set_topology(client: &HotRodClient, topology: ClusterTopology) {
-        *client.inner().topology.write().unwrap() = Some(Arc::new(topology));
+        client.inner().active.write().unwrap().topology = Some(Arc::new(topology));
     }
 
     #[tokio::test]
@@ -1403,7 +1434,10 @@ pub(crate) mod tests {
             .expect("get should fail over to the other seed");
 
         assert_eq!(result, None);
-        assert_eq!(*client.inner().active_seed_addr.read().unwrap(), other_addr);
+        assert_eq!(
+            client.inner().active.read().unwrap().active_seed_addr,
+            other_addr
+        );
 
         other_task.await.unwrap();
     }
@@ -1442,9 +1476,54 @@ pub(crate) mod tests {
             .await
             .expect("ping should fail over when the seed refuses the connection outright");
 
-        assert_eq!(*client.inner().active_seed_addr.read().unwrap(), other_addr);
+        assert_eq!(
+            client.inner().active.read().unwrap().active_seed_addr,
+            other_addr
+        );
 
         other_task.await.unwrap();
+    }
+
+    /// Every seed of the active cluster refuses the connection outright,
+    /// but a configured alternate cluster has one live seed. The
+    /// automatic failover in `HotRodClient::try_failover_to_live_cluster`
+    /// (`docs/adr/0017-multi-cluster-failover.md`) must find it and let
+    /// this `get` complete, without the caller doing anything beyond
+    /// the call itself.
+    #[tokio::test]
+    async fn automatic_cluster_failover_completes_the_operation_on_a_live_alternate() {
+        let dead_seed_addr = unreachable_addr().await;
+
+        let dr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dr_addr = dr_listener.local_addr().unwrap();
+        let dr_task = tokio::spawn(async move {
+            let (mut stream, _) = dr_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![dead_seed_addr], dead_seed_addr);
+        client
+            .add_cluster("dr", vec![dr_addr])
+            .expect("add_cluster should succeed");
+
+        let result = client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should fail over to the alternate cluster");
+
+        assert_eq!(result, None);
+        assert_eq!(client.active_cluster_name(), "dr");
+        assert_eq!(
+            client.inner().active.read().unwrap().active_seed_addr,
+            dr_addr
+        );
+
+        dr_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1466,7 +1545,7 @@ pub(crate) mod tests {
             "should surface the seed's own timeout, not failover_seed's connect error"
         );
         assert_eq!(
-            *client.inner().active_seed_addr.read().unwrap(),
+            client.inner().active.read().unwrap().active_seed_addr,
             seed_addr,
             "active seed stays unchanged when no other seed is reachable"
         );
@@ -1926,9 +2005,10 @@ pub(crate) mod tests {
         assert_eq!(
             client
                 .inner()
-                .topology
+                .active
                 .read()
                 .unwrap()
+                .topology
                 .as_ref()
                 .unwrap()
                 .servers,
