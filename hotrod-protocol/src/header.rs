@@ -91,6 +91,22 @@ pub(crate) enum OpCode {
     CounterRemove = 0x5E,
     CounterGetNames = 0x64,
     CounterGetAndSet = 0x7F,
+    // Multimap cache (protocol 2.7+, see
+    // docs/adr/0016-multimap-cache.md), confirmed against
+    // MultimapHotRodConstants.java (client) and HotRodConstants.java
+    // (server). Not a special cache type: an ordinary cache, reached
+    // through these opcodes instead of the main cache API's. All
+    // nine follow the normal "response = request + 1" convention,
+    // unlike the counter opcodes above.
+    MultimapGet = 0x67,
+    MultimapGetWithMetadata = 0x69,
+    MultimapPut = 0x6B,
+    MultimapRemoveKey = 0x6D,
+    MultimapRemoveEntry = 0x6F,
+    MultimapSize = 0x71,
+    MultimapContainsEntry = 0x73,
+    MultimapContainsKey = 0x75,
+    MultimapContainsValue = 0x77,
     // Streaming (protocol 4.1, Infinispan 15.1+): not the discontinued
     // GET_STREAM/PUT_STREAM pair from Hot Rod 2.6 (0x37/0x39), which this
     // crate never implements. These six, confirmed against

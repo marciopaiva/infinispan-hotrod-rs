@@ -27,7 +27,7 @@ for release notes.
 | Client listeners (cache events) | Yes | Yes |
 | Near caching | Yes | Yes |
 | Transactions | Yes | No |
-| Multimap cache | Yes | No |
+| Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
 | Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; no DELETE/UPDATE statements yet) |
@@ -238,6 +238,17 @@ counters
 
 let counter = counters.strong_counter("requests-served");
 let total = counter.increment_and_get().await?;
+```
+
+`multimap_cache` is a cache where each key maps to a collection of
+values instead of one. Not a special cache type server-side: the
+named cache still has to exist, the same as any other:
+
+```rust
+let tags = client.multimap_cache("tags-by-user", true);
+tags.put(b"user:42", b"admin", Expiration::Default, Expiration::Default).await?;
+tags.put(b"user:42", b"beta-tester", Expiration::Default, Expiration::Default).await?;
+let values = tags.get(b"user:42").await?; // every value stored under this key
 ```
 
 ## License

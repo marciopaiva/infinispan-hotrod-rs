@@ -8,6 +8,18 @@
    <cache-container name="default" statistics="true" default-cache="default">
       <transport cluster="${infinispan.cluster.name:cluster}" stack="${infinispan.cluster.stack:tcp}" node-name="${infinispan.node.name:}"/>
       <local-cache name="default"/>
+      <!-- Pre-provisioned, rather than created mid-test via
+           administration, for hotrod-protocol/tests/live_server.rs's
+           multimap test: a cache created mid-test and used right away
+           for topology-aware keyed routing can hit this single-node
+           server's own topology update advertising an address the
+           test's network cannot reach, paying a one-time retry
+           timeout before the existing circuit breaker quarantines it
+           (docs/adr/0011-retry-policy-and-node-health.md); every
+           other cache already exists from server startup, long
+           before any test's first keyed call, so this is the only
+           one that would ever hit it. -->
+      <local-cache name="multimap-test"/>
       <security>
          <authorization/>
       </security>

@@ -1131,6 +1131,118 @@ async fn weak_counter_round_trips_against_a_real_server() {
 
 #[tokio::test]
 #[ignore]
+async fn multimap_cache_round_trips_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    // Not a special cache type server-side (confirmed against a real
+    // server, not just the Java client's source): a multimap cache
+    // has to exist like any other named cache before it can be used.
+    // Pre-provisioned in ci/infinispan/infinispan.xml, not created
+    // here via administration: see that file's own comment for why
+    // (a cache created and immediately used mid-test can hit a real,
+    // unrelated topology quirk of this single-node server).
+    let multimap = client.multimap_cache("multimap-test", true);
+    assert!(multimap.supports_duplicates());
+
+    let key = b"ci-multimap-key";
+
+    // Best-effort cleanup from a previous run that may have failed
+    // partway through.
+    let _ = multimap.remove_key(key).await;
+
+    assert_eq!(
+        multimap.get(key).await.expect("get on a missing key"),
+        Vec::<Vec<u8>>::new()
+    );
+    assert_eq!(
+        multimap
+            .get_with_metadata(key)
+            .await
+            .expect("get_with_metadata on a missing key"),
+        None
+    );
+    assert!(!multimap
+        .contains_key(key)
+        .await
+        .expect("contains_key on a missing key"));
+
+    multimap
+        .put(key, b"one", Expiration::Default, Expiration::Default)
+        .await
+        .expect("put");
+    multimap
+        .put(key, b"two", Expiration::Default, Expiration::Default)
+        .await
+        .expect("put");
+
+    let mut values = multimap.get(key).await.expect("get");
+    values.sort();
+    assert_eq!(values, vec![b"one".to_vec(), b"two".to_vec()]);
+
+    let entry = multimap
+        .get_with_metadata(key)
+        .await
+        .expect("get_with_metadata")
+        .expect("entry should be present");
+    let mut entry_values = entry.values;
+    entry_values.sort();
+    assert_eq!(entry_values, vec![b"one".to_vec(), b"two".to_vec()]);
+
+    assert!(multimap.contains_key(key).await.expect("contains_key"));
+    assert!(multimap
+        .contains_entry(key, b"one")
+        .await
+        .expect("contains_entry"));
+    assert!(!multimap
+        .contains_entry(key, b"three")
+        .await
+        .expect("contains_entry for a value that was never added"));
+    assert!(multimap
+        .contains_value(b"two")
+        .await
+        .expect("contains_value"));
+    assert!(!multimap
+        .contains_value(b"this-value-was-never-stored")
+        .await
+        .expect("contains_value for a value that was never added"));
+
+    let size_before = multimap.size().await.expect("size");
+    assert!(size_before >= 2);
+
+    let removed = multimap
+        .remove_entry(key, b"one")
+        .await
+        .expect("remove_entry");
+    assert!(removed);
+    let mut remaining = multimap.get(key).await.expect("get after remove_entry");
+    remaining.sort();
+    assert_eq!(remaining, vec![b"two".to_vec()]);
+
+    let removed = multimap.remove_key(key).await.expect("remove_key");
+    assert!(removed);
+    assert_eq!(
+        multimap.get(key).await.expect("get after remove_key"),
+        Vec::<Vec<u8>>::new()
+    );
+    assert!(!multimap
+        .remove_key(key)
+        .await
+        .expect("remove_key on an already-removed key"));
+}
+
+#[tokio::test]
+#[ignore]
 async fn cluster_contains_key_reflects_presence() {
     let _guard = lock_live_server();
     let cluster = connect_cluster().await;
