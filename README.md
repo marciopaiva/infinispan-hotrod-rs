@@ -24,7 +24,7 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Configurable retry policy, per-node circuit breaker | Yes | Yes |
 | Client listeners (cache events) | Yes | Yes |
 | Near caching | Yes | Yes |
-| Transactions | Yes | No ([#47](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/47)) |
+| Transactions | Yes | Yes (`NON_XA`, one-phase commit only; real XA and recovery not yet implemented) |
 | Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |

@@ -56,6 +56,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
   retry chain from `docs/adr/0011-retry-policy-and-node-health.md`.
   Entirely client-side, no new opcodes. See
   `docs/adr/0017-multi-cluster-failover.md` (#56).
+- Transactions: `RemoteCache::begin_transaction()` returns a
+  `Transaction` (`get`/`put`/`remove`/`commit`/`rollback`): local,
+  optimistic, one-phase commit against a cache configured
+  transactional (`NON_XA`) server-side. `get`/`put`/`remove` never
+  touch the network until `commit`, which sends every pending write
+  in one `PREPARE_TX_2` request; a conflicting concurrent write
+  rolls the whole transaction back (`Error::TransactionRolledBack`).
+  Real XA (two-phase commit, recovery) is out of scope for this
+  phase. See `docs/adr/0018-transactions-non-xa-one-phase.md` (#47).
 
 ## [0.6.0] - 2026-10-10
 

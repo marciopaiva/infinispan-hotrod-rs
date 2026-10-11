@@ -36,8 +36,9 @@ statistics and tracing
 (`docs/adr/0010-client-statistics-and-tracing.md`, #54) are done too.
 Every theme below is now done as well: typed serialization and
 remote query, remote administration, distributed counters, multimap
-cache and multi-cluster failover. The PHP bridge is still open; it
-is its own, separate layer (`php-ext/`), not tracked by the themes
+cache, multi-cluster failover and transactions. The PHP bridge is
+still open; it is its own, separate layer (`php-ext/`), not tracked
+by the themes
 below.
 
 ## The structural change that gated the rest (done, #77)
@@ -194,12 +195,21 @@ individual surfaces.
   mechanism (`EXEC_REQUEST`/`EXEC_RESPONSE`) the Java client itself
   uses for this. See `docs/adr/0014-remote-administration.md`.
 
+### Transactions
+
+Every item in this theme is done.
+
+* ~~Transaction support (#47)~~ (done). `RemoteCache::begin_transaction`
+  returns a `Transaction` (`get`/`put`/`remove`/`commit`/`rollback`):
+  local, optimistic, one-phase commit against `NON_XA`-configured
+  caches. Real XA (two-phase commit, recovery, an external
+  coordinator) is deliberately out of scope for this phase; see
+  `docs/adr/0018-transactions-non-xa-one-phase.md` for why one-phase
+  commit loses nothing for the single-resource case this client can
+  actually construct.
+
 ### Deferred
 
-* **Transaction support (#47).** Two-phase commit across a changing
-  cluster topology is its own hard problem; needs the pool and
-  topology work settled first, which it now is, but still wants its
-  own Analyze/Propose pass rather than piggybacking on another phase.
 * **GSSAPI authentication (#9).** Already deferred: needs a system
   Kerberos library, which conflicts with this project's preference for
   no new system dependencies (the same reasoning ADR 0002 used to
