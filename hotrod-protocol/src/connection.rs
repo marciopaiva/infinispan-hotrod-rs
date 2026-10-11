@@ -914,7 +914,10 @@ impl HotRodConnection {
             self.write_and_read_header(&cache_name, OpCode::CounterGetNames, &[])
                 .await?;
             let count = read_vint(&mut self.stream).await?;
-            let mut names = Vec::with_capacity(count as usize);
+            // Not sized from `count` directly: see
+            // `read_array_collection`'s own comment, the same
+            // unchecked-server-count hazard applies here.
+            let mut names = Vec::new();
             for _ in 0..count {
                 names.push(read_string(&mut self.stream).await?);
             }
@@ -1901,7 +1904,17 @@ async fn read_array_collection<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
 ) -> Result<Vec<Vec<u8>>> {
     let count = read_vint(stream).await?;
-    let mut values = Vec::with_capacity(count as usize);
+    // Not `Vec::with_capacity(count as usize)`: `count` is an
+    // unchecked, server-controlled vInt, and sizing a single
+    // allocation from it directly would let a corrupted or hostile
+    // response abort the process instead of failing with a typed
+    // error, the same hazard `wire.rs::read_array`'s own
+    // `MAX_ARRAY_LEN` check exists to avoid. Growing the `Vec`
+    // organically costs reallocations, not a single huge one; an
+    // inflated count with no data behind it just times out on the
+    // next `read_array`, the same as `wire.rs::read_string_map`
+    // already does for its own count-prefixed collection.
+    let mut values = Vec::new();
     for _ in 0..count {
         values.push(read_array(stream).await?);
     }
