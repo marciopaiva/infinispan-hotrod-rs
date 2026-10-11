@@ -114,7 +114,7 @@ pub(crate) enum OpCode {
     // streaming group below. `COMMIT_REQUEST`/`ROLLBACK_REQUEST`
     // (0x3D/0x3F), `FORGET_TX_REQUEST` (0x79) and
     // `FETCH_TX_RECOVERY_REQUEST` (0x7B) are confirmed real but
-    // deliberately out of scope: see that ADR's own "fora de escopo"
+    // deliberately out of scope: see that ADR's own "Consequences"
     // section.
     PrepareTx = 0x7D,
     // Streaming (protocol 4.1, Infinispan 15.1+): not the discontinued

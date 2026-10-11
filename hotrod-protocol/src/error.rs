@@ -121,7 +121,7 @@ pub enum Error {
     /// then failed to persist it, or returned an XA result code this
     /// crate does not recognize. Left in a state this phase cannot
     /// resolve: no two-phase recovery is implemented (see that ADR's
-    /// own "fora de escopo" section).
+    /// own "Consequences" section).
     #[error("transaction commit failed after a successful prepare")]
     TransactionCommitFailed,
 

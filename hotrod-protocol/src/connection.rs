@@ -1393,7 +1393,7 @@ impl HotRodConnection {
             let (_message_id, header) = self
                 .write_and_read_header(&cache_name, OpCode::PrepareTx, &body)
                 .await?;
-            if header.status.is_not_executed() {
+            if header.status.is_not_put_removed_replaced() {
                 return Err(Error::TransactionRolledBack);
             }
             let xa_result = tokio::io::AsyncReadExt::read_i32(&mut self.stream).await?;
@@ -3155,6 +3155,110 @@ mod tests {
                 max_idle: Expiration::Immortal,
             },
         }];
+        conn.prepare_transaction_one_phase(&xid, &modifications)
+            .await
+            .expect("prepare_transaction_one_phase");
+
+        server.await.unwrap();
+    }
+
+    /// Exercises every other `control_byte`/version/value combination
+    /// `prepare_transaction_sends_xid_flags_and_modifications` leaves
+    /// untested, across three modifications in one request: a key
+    /// read and found to exist (control byte `0x0`, its version
+    /// written, a `Put`), a key read and found absent (`NON_EXISTING`,
+    /// `0x2`, no version, a `Put`), and a key read and found to exist
+    /// then removed (version written even though the write is a
+    /// `Remove`, `REMOVE_OP`, `0x4`, no expiration or value).
+    #[tokio::test]
+    async fn prepare_transaction_sends_version_non_existing_and_remove_control_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request(&mut stream).await;
+            assert_eq!(opcode, 0x7D, "expected a PrepareTx request");
+
+            let _format_id = crate::varint::read_vint(&mut stream).await.unwrap();
+            let _global_transaction_id = read_array(&mut stream).await.unwrap();
+            let _branch_qualifier = read_array(&mut stream).await.unwrap();
+            let _one_phase_commit = stream.read_u8().await.unwrap();
+            let _recoverable = stream.read_u8().await.unwrap();
+            let mut timeout_bytes = [0u8; 8];
+            stream.read_exact(&mut timeout_bytes).await.unwrap();
+
+            let count = crate::varint::read_vint(&mut stream).await.unwrap();
+            assert_eq!(count, 3);
+
+            let key1 = read_array(&mut stream).await.unwrap();
+            assert_eq!(key1, b"key1");
+            let control1 = stream.read_u8().await.unwrap();
+            assert_eq!(
+                control1, 0x0,
+                "read and existed: neither NOT_READ nor NON_EXISTING"
+            );
+            let mut version1 = [0u8; 8];
+            stream.read_exact(&mut version1).await.unwrap();
+            assert_eq!(u64::from_be_bytes(version1), 7);
+            let time_units1 = stream.read_u8().await.unwrap();
+            assert_eq!(time_units1, 0x88);
+            let value1 = read_array(&mut stream).await.unwrap();
+            assert_eq!(value1, b"v1");
+
+            let key2 = read_array(&mut stream).await.unwrap();
+            assert_eq!(key2, b"key2");
+            let control2 = stream.read_u8().await.unwrap();
+            assert_eq!(control2, 0x2, "NON_EXISTING: read and did not exist");
+            let time_units2 = stream.read_u8().await.unwrap();
+            assert_eq!(time_units2, 0x88);
+            let value2 = read_array(&mut stream).await.unwrap();
+            assert_eq!(value2, b"v2");
+
+            let key3 = read_array(&mut stream).await.unwrap();
+            assert_eq!(key3, b"key3");
+            let control3 = stream.read_u8().await.unwrap();
+            assert_eq!(control3, 0x4, "REMOVE_OP: read and existed, then removed");
+            let mut version3 = [0u8; 8];
+            stream.read_exact(&mut version3).await.unwrap();
+            assert_eq!(u64::from_be_bytes(version3), 9);
+
+            let mut resp = response_header(id, 0x7E, 0x00);
+            resp.extend_from_slice(&0i32.to_be_bytes()); // XA_OK
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let mut conn = HotRodConnection::connect(addr, "transactional-test")
+            .await
+            .expect("connect");
+        let xid = crate::transaction::generate_xid();
+        let modifications = vec![
+            crate::transaction::Modification {
+                key: b"key1".to_vec(),
+                version: Some(7),
+                not_read: false,
+                write: crate::transaction::ModificationWrite::Put {
+                    value: b"v1".to_vec(),
+                    lifespan: Expiration::Immortal,
+                    max_idle: Expiration::Immortal,
+                },
+            },
+            crate::transaction::Modification {
+                key: b"key2".to_vec(),
+                version: None,
+                not_read: false,
+                write: crate::transaction::ModificationWrite::Put {
+                    value: b"v2".to_vec(),
+                    lifespan: Expiration::Immortal,
+                    max_idle: Expiration::Immortal,
+                },
+            },
+            crate::transaction::Modification {
+                key: b"key3".to_vec(),
+                version: Some(9),
+                not_read: false,
+                write: crate::transaction::ModificationWrite::Remove,
+            },
+        ];
         conn.prepare_transaction_one_phase(&xid, &modifications)
             .await
             .expect("prepare_transaction_one_phase");
