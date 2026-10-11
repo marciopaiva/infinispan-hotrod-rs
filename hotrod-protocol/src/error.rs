@@ -106,6 +106,25 @@ pub enum Error {
     #[error("invalid cluster configuration: {0}")]
     InvalidClusterConfig(String),
 
+    /// `Transaction::commit` was rolled back: either a key was
+    /// modified since this transaction read it (write-skew), or the
+    /// server could not even start preparing because another
+    /// in-flight prepare for the same transaction id conflicted with
+    /// this one. The wire does not distinguish the two; none of the
+    /// transaction's writes were applied either way. Retrying the
+    /// whole transaction from scratch is the usual response. See
+    /// `docs/adr/0018-transactions-non-xa-one-phase.md`.
+    #[error("transaction was rolled back")]
+    TransactionRolledBack,
+
+    /// `Transaction::commit`'s prepare succeeded, but the server
+    /// then failed to persist it, or returned an XA result code this
+    /// crate does not recognize. Left in a state this phase cannot
+    /// resolve: no two-phase recovery is implemented (see that ADR's
+    /// own "fora de escopo" section).
+    #[error("transaction commit failed after a successful prepare")]
+    TransactionCommitFailed,
+
     /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
     /// knows this cursor, most likely because it sat idle past the
     /// server's five-minute reaper. No retry is attempted; see
