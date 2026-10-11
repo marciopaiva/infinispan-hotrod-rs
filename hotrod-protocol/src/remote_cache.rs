@@ -65,6 +65,15 @@ enum Operation {
     CounterGetAndSet(String, i64),
     CounterReset(String),
     CounterRemove(String),
+    MultimapGet(Vec<u8>, bool),
+    MultimapGetWithMetadata(Vec<u8>, bool),
+    MultimapPut(Vec<u8>, Vec<u8>, Expiration, Expiration, bool),
+    MultimapRemoveKey(Vec<u8>, bool),
+    MultimapRemoveEntry(Vec<u8>, Vec<u8>, bool),
+    MultimapSize(bool),
+    MultimapContainsEntry(Vec<u8>, Vec<u8>, bool),
+    MultimapContainsKey(Vec<u8>, bool),
+    MultimapContainsValue(Vec<u8>, bool),
 }
 
 impl Operation {
@@ -102,6 +111,15 @@ impl Operation {
             Operation::CounterGetAndSet(..) => "counter_get_and_set",
             Operation::CounterReset(_) => "counter_reset",
             Operation::CounterRemove(_) => "counter_remove",
+            Operation::MultimapGet(..) => "multimap_get",
+            Operation::MultimapGetWithMetadata(..) => "multimap_get_with_metadata",
+            Operation::MultimapPut(..) => "multimap_put",
+            Operation::MultimapRemoveKey(..) => "multimap_remove_key",
+            Operation::MultimapRemoveEntry(..) => "multimap_remove_entry",
+            Operation::MultimapSize(_) => "multimap_size",
+            Operation::MultimapContainsEntry(..) => "multimap_contains_entry",
+            Operation::MultimapContainsKey(..) => "multimap_contains_key",
+            Operation::MultimapContainsValue(..) => "multimap_contains_value",
         }
     }
 }
@@ -126,6 +144,10 @@ enum OperationResult {
     CounterNames(Vec<String>),
     CounterValue(i64),
     CounterUnit,
+    MultimapValues(Vec<Vec<u8>>),
+    MultimapEntry(Option<crate::multimap::MultimapEntry>),
+    MultimapPut,
+    MultimapSize(u64),
 }
 
 async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<OperationResult> {
@@ -218,6 +240,46 @@ async fn run_operation(conn: &mut HotRodConnection, op: &Operation) -> Result<Op
             conn.counter_remove(name).await?;
             Ok(OperationResult::CounterUnit)
         }
+        Operation::MultimapGet(key, supports_duplicates) => Ok(OperationResult::MultimapValues(
+            conn.multimap_get(key, *supports_duplicates).await?,
+        )),
+        Operation::MultimapGetWithMetadata(key, supports_duplicates) => {
+            Ok(OperationResult::MultimapEntry(
+                conn.multimap_get_with_metadata(key, *supports_duplicates)
+                    .await?,
+            ))
+        }
+        Operation::MultimapPut(key, value, lifespan, max_idle, supports_duplicates) => {
+            conn.multimap_put(key, value, *lifespan, *max_idle, *supports_duplicates)
+                .await?;
+            Ok(OperationResult::MultimapPut)
+        }
+        Operation::MultimapRemoveKey(key, supports_duplicates) => Ok(OperationResult::Bool(
+            conn.multimap_remove_key(key, *supports_duplicates).await?,
+        )),
+        Operation::MultimapRemoveEntry(key, value, supports_duplicates) => {
+            Ok(OperationResult::Bool(
+                conn.multimap_remove_entry(key, value, *supports_duplicates)
+                    .await?,
+            ))
+        }
+        Operation::MultimapSize(supports_duplicates) => Ok(OperationResult::MultimapSize(
+            conn.multimap_size(*supports_duplicates).await?,
+        )),
+        Operation::MultimapContainsEntry(key, value, supports_duplicates) => {
+            Ok(OperationResult::Bool(
+                conn.multimap_contains_entry(key, value, *supports_duplicates)
+                    .await?,
+            ))
+        }
+        Operation::MultimapContainsKey(key, supports_duplicates) => Ok(OperationResult::Bool(
+            conn.multimap_contains_key(key, *supports_duplicates)
+                .await?,
+        )),
+        Operation::MultimapContainsValue(value, supports_duplicates) => Ok(OperationResult::Bool(
+            conn.multimap_contains_value(value, *supports_duplicates)
+                .await?,
+        )),
     }
 }
 
@@ -630,6 +692,154 @@ impl RemoteCache {
             OperationResult::CounterUnit => Ok(()),
             _ => {
                 unreachable!("Operation::CounterRemove always yields OperationResult::CounterUnit")
+            }
+        }
+    }
+
+    // Multimap cache (`docs/adr/0016-multimap-cache.md`). Every
+    // operation here targets this `RemoteCache`'s own cache name
+    // (an ordinary cache, set by `HotRodClient::multimap_cache`), not
+    // a fixed reserved one like counters. `get`/`put`/`remove_key`/
+    // `remove_entry`/`contains_key`/`contains_entry` have a key to
+    // route by, so they go through `call`, the same routing/retry
+    // chain `RemoteCache`'s own keyed methods already use;
+    // `size`/`contains_value` have none, so they go to the seed.
+
+    pub(crate) async fn multimap_get(
+        &self,
+        key: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        match self
+            .call(
+                key,
+                Operation::MultimapGet(key.to_vec(), supports_duplicates),
+            )
+            .await?
+        {
+            OperationResult::MultimapValues(values) => Ok(values),
+            _ => {
+                unreachable!("Operation::MultimapGet always yields OperationResult::MultimapValues")
+            }
+        }
+    }
+
+    pub(crate) async fn multimap_get_with_metadata(
+        &self,
+        key: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<Option<crate::multimap::MultimapEntry>> {
+        let op = Operation::MultimapGetWithMetadata(key.to_vec(), supports_duplicates);
+        match self.call(key, op).await? {
+            OperationResult::MultimapEntry(entry) => Ok(entry),
+            _ => unreachable!(
+                "Operation::MultimapGetWithMetadata always yields OperationResult::MultimapEntry"
+            ),
+        }
+    }
+
+    pub(crate) async fn multimap_put(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        lifespan: Expiration,
+        max_idle: Expiration,
+        supports_duplicates: bool,
+    ) -> Result<()> {
+        let op = Operation::MultimapPut(
+            key.to_vec(),
+            value.to_vec(),
+            lifespan,
+            max_idle,
+            supports_duplicates,
+        );
+        match self.call(key, op).await? {
+            OperationResult::MultimapPut => Ok(()),
+            _ => unreachable!("Operation::MultimapPut always yields OperationResult::MultimapPut"),
+        }
+    }
+
+    pub(crate) async fn multimap_remove_key(
+        &self,
+        key: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<bool> {
+        let op = Operation::MultimapRemoveKey(key.to_vec(), supports_duplicates);
+        match self.call(key, op).await? {
+            OperationResult::Bool(value) => Ok(value),
+            _ => unreachable!("Operation::MultimapRemoveKey always yields OperationResult::Bool"),
+        }
+    }
+
+    pub(crate) async fn multimap_remove_entry(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<bool> {
+        let op = Operation::MultimapRemoveEntry(key.to_vec(), value.to_vec(), supports_duplicates);
+        match self.call(key, op).await? {
+            OperationResult::Bool(value) => Ok(value),
+            _ => {
+                unreachable!("Operation::MultimapRemoveEntry always yields OperationResult::Bool")
+            }
+        }
+    }
+
+    /// No key to route by: goes to the seed, same as `RemoteCache::size`.
+    pub(crate) async fn multimap_size(&self, supports_duplicates: bool) -> Result<u64> {
+        match self
+            .call_seed(Operation::MultimapSize(supports_duplicates))
+            .await?
+        {
+            OperationResult::MultimapSize(size) => Ok(size),
+            _ => {
+                unreachable!("Operation::MultimapSize always yields OperationResult::MultimapSize")
+            }
+        }
+    }
+
+    pub(crate) async fn multimap_contains_entry(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<bool> {
+        let op =
+            Operation::MultimapContainsEntry(key.to_vec(), value.to_vec(), supports_duplicates);
+        match self.call(key, op).await? {
+            OperationResult::Bool(value) => Ok(value),
+            _ => {
+                unreachable!("Operation::MultimapContainsEntry always yields OperationResult::Bool")
+            }
+        }
+    }
+
+    pub(crate) async fn multimap_contains_key(
+        &self,
+        key: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<bool> {
+        let op = Operation::MultimapContainsKey(key.to_vec(), supports_duplicates);
+        match self.call(key, op).await? {
+            OperationResult::Bool(value) => Ok(value),
+            _ => {
+                unreachable!("Operation::MultimapContainsKey always yields OperationResult::Bool")
+            }
+        }
+    }
+
+    /// No key to route by: goes to the seed, same as `multimap_size`.
+    pub(crate) async fn multimap_contains_value(
+        &self,
+        value: &[u8],
+        supports_duplicates: bool,
+    ) -> Result<bool> {
+        let op = Operation::MultimapContainsValue(value.to_vec(), supports_duplicates);
+        match self.call_seed(op).await? {
+            OperationResult::Bool(value) => Ok(value),
+            _ => {
+                unreachable!("Operation::MultimapContainsValue always yields OperationResult::Bool")
             }
         }
     }

@@ -74,13 +74,12 @@ multi-node CI fixture (#78), client listeners (#4), near caching
 statistics and tracing (#54). All seven are done, and so is every
 other item each theme below marks `(done)`: fuzzing, retry policy and
 node health tracking (#97), the serialization abstraction (#99),
-remote query (#50), remote administration (#55) and distributed
-counters (#49). Three of the five themes below are now fully done
-(Large data access, Reliability and observability, Typed data); what
-is left of the other two, High availability and Specialized data
-structures and administration (now just multimap cache, #48), is
-independent of everything above, so either can go next in whatever
-order is actually needed.
+remote query (#50), remote administration (#55), distributed
+counters (#49) and multimap cache (#48). Four of the five themes
+below are now fully done (Large data access, Reliability and
+observability, Typed data, Specialized data structures and
+administration); what is left, High availability, is independent of
+everything above.
 
 ### Large data access
 
@@ -163,10 +162,15 @@ Both items in this theme are done.
 
 ### Specialized data structures and administration
 
-Each of these has its own dedicated Hot Rod operations, independent of
-`RemoteCache` and of each other; small individual surfaces.
+Every item in this theme is done. Each had its own dedicated Hot Rod
+operations, independent of `RemoteCache` and of each other; small
+individual surfaces.
 
-* **Multimap cache (#48)**
+* ~~Multimap cache (#48)~~ (done). `HotRodClient::multimap_cache(name,
+  supports_duplicates)` returns a `MultimapCache` where each key maps
+  to a collection of values instead of one. Not a special cache type
+  server-side: an ordinary cache, reached through its own nine
+  opcodes. See `docs/adr/0016-multimap-cache.md`.
 * ~~Distributed counters (#49)~~ (done). `HotRodClient::counters()`
   defines, inspects and lists strong (atomic, optionally bounded) and
   weak (cheaper, non-atomic) counters. Every operation goes to the

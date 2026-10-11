@@ -39,6 +39,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   cross its configured bound returns `Error::CounterOutOfBounds`
   instead of a value. See
   `docs/adr/0015-distributed-counters.md` (#49).
+- Multimap cache: `HotRodClient::multimap_cache(name, supports_duplicates)`
+  returns a `MultimapCache` where each key maps to a collection of
+  values instead of one
+  (`get`/`get_with_metadata`/`put`/`remove_key`/`remove_entry`/
+  `size`/`contains_entry`/`contains_key`/`contains_value`). Not a
+  special cache type server-side: an ordinary cache, reached through
+  its own nine opcodes. See `docs/adr/0016-multimap-cache.md` (#48).
 
 ## [0.6.0] - 2026-10-10
 
