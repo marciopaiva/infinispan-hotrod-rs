@@ -80,21 +80,32 @@ would.
 
 ### `ClientInner` (`client.rs`)
 
-`seed_addrs` changes from a plain `Vec<SocketAddr>` to
-`RwLock<Vec<SocketAddr>>`: it now reflects whichever cluster is
-currently active, and `switch_to_cluster`/the automatic failover
-below replace it wholesale on a switch. Two new fields:
+What used to be four independent fields
+(`seed_addrs`/`active_seed_addr`/`topology`, plus a new
+`active_cluster_name`) are instead one struct behind one lock:
 
 ```rust
-pub(crate) clusters: RwLock<Vec<(String, Vec<SocketAddr>)>>,
-pub(crate) active_cluster_name: RwLock<String>,
+pub(crate) struct ActiveCluster {
+    pub(crate) name: String,
+    pub(crate) seed_addrs: Vec<SocketAddr>,
+    pub(crate) active_seed_addr: SocketAddr,
+    pub(crate) topology: Option<Arc<ClusterTopology>>,
+}
+
+pub(crate) struct ClientInner {
+    pub(crate) active: RwLock<ActiveCluster>,
+    pub(crate) clusters: RwLock<Vec<(String, Vec<SocketAddr>)>>,
+    // ...
+}
 ```
 
 `clusters` holds every cluster this client knows about, including
 the one it was constructed with, under
 `HotRodClient::DEFAULT_CLUSTER_NAME`, added automatically by
 `connect`/`connect_with_timeout`/`connect_tls`/
-`connect_tls_with_timeout`.
+`connect_tls_with_timeout`. See "Corrected mid-flight" below for why
+`active` is one combined lock, not the four separate ones an earlier
+version of this phase shipped with before review.
 
 ### Public API (`HotRodClient`)
 
@@ -117,22 +128,30 @@ configuration already works.
 `add_cluster` rejects an empty `seed_addrs` and a `name` already in
 use (including `DEFAULT_CLUSTER_NAME` itself) with
 `Error::InvalidClusterConfig`. `switch_to_cluster` rejects an
-unconfigured `name` with `Error::UnknownCluster`; on success it
-replaces `seed_addrs`/`active_seed_addr` (the new cluster's first
-seed) /`active_cluster_name`, and resets `topology` to `None`, the
-same "nothing carries over" rule the Java client's sentinel topology
-id encodes.
+unconfigured `name` with `Error::UnknownCluster`, and a configured
+one with no seed addresses (only reachable by constructing
+`ClientInner` directly, which `add_cluster` itself never allows)
+with `Error::InvalidClusterConfig` rather than indexing into an
+empty list; on success it replaces the whole `ActiveCluster` in one
+write (name, seed list, the new cluster's first seed as
+`active_seed_addr`, `topology` reset to `None`, the same "nothing
+carries over" rule the Java client's sentinel topology id encodes),
+and clears every node's quarantine (`node_health.clear_all()`): a
+different cluster's nodes failing recently has nothing to do with
+this one's own health.
 
 ### Automatic failover
 
 `failover_seed` and the new `try_failover_to_live_cluster` share one
 helper, `try_promote_seed`, generalizing what `failover_seed` already
 did (dial, authenticate, seed the pool, promote `active_seed_addr`)
-to optionally also switch clusters when it succeeds:
-`failover_seed` passes `switch: None` (same cluster, just another of
-its own seeds); `try_failover_to_live_cluster` passes
-`Some((name, seeds))` for whichever alternate cluster it is
-currently trying.
+to optionally also switch clusters when it succeeds: `failover_seed`
+passes `None` (same cluster, just another of its own seeds);
+`try_failover_to_live_cluster` passes `Some(name)` for whichever
+alternate cluster it is currently trying, with `candidates` already
+being that cluster's own full seed list, so `try_promote_seed` builds
+the replacement `ActiveCluster` from what it already has, no second
+copy of the seed list needed.
 
 `try_failover_to_live_cluster` iterates every entry in `clusters`
 except the currently active one, in the order `add_cluster` was
@@ -149,10 +168,49 @@ if `try_failover_to_live_cluster` finds a live alternate, its address
 becomes the next candidate and the same retry loop continues,
 without consuming an extra attempt for the switch itself (only the
 real connection attempt that follows does, same as any other
-candidate). Since this lives in `dispatch`, it covers every operation
+candidate). Unlike the `failover_seed` fallback just above it, this
+one never checks the current chain's own `tried` set against the
+result: `try_promote_seed` has already committed the switch as a
+side effect by the time it returns `Ok`, so discarding that result
+over an address coincidentally already tried in the cluster just
+abandoned would report failure to the caller despite the client now
+genuinely being connected elsewhere (see "Corrected mid-flight"
+below). Since this lives in `dispatch`, it covers every operation
 that goes through it uniformly, `call` and `call_seed` alike,
 including query/administration/counters/multimap, with no change
 needed in any of those modules.
+
+### Corrected mid-flight: one lock, not four
+
+The first version of this phase kept `seed_addrs`, `active_seed_addr`,
+`topology` and `active_cluster_name` as four independent `RwLock`s,
+each updated with its own separate write during a switch. Review
+before merge found this could tear: a concurrent reader (another
+in-flight operation, since `HotRodClient` is `Clone`d and shared
+across tasks specifically so independent operations run concurrently)
+could observe a half-applied switch, most seriously the new
+cluster's `active_seed_addr` paired with the old cluster's
+still-live `topology`, routing a request by a segment owner that has
+nothing to do with the cluster the client believes it just switched
+to. The same four-separate-reads shape in `failover_seed`
+(`active_seed_addr` then `seed_addrs`) and in
+`active_seed_and_topology` (a pre-existing helper whose own doc
+comment already claimed these were "read together", which turned
+out to mean only "in the same function", not atomically) had the
+analogous problem for the already-shipped single-cluster case,
+never tripped over before because nothing used to update
+`active_seed_addr` and `topology` in quick succession the way a
+cluster switch now does.
+
+Fixed by replacing all four with the single `ActiveCluster` struct
+above: every read of "the active cluster's state" (whichever subset
+a caller needs) is now one lock acquisition, and every write that
+changes more than one field (a switch) replaces the whole struct in
+one write. `record_topology_update` was adjusted the same way, reading
+the previous topology id and writing the new topology under the one
+lock instead of two. This was a correctness fix with no API
+change: every symptom was internal to `ClientInner`, never visible
+through `HotRodClient`'s own public methods.
 
 ### Test fixture
 
@@ -174,8 +232,10 @@ job, the same pattern `cluster-test`/`tls-test` already use;
 * New public API: `HotRodClient::add_cluster`/`switch_to_cluster`/
   `active_cluster_name`/`DEFAULT_CLUSTER_NAME`,
   `Error::UnknownCluster`, `Error::InvalidClusterConfig`. Additive:
-  nothing existing changes shape, though `ClientInner::seed_addrs`'s
-  internal type changed (pub(crate) only, no public surface affected).
+  nothing existing changes shape, though `ClientInner` itself does
+  internally (`pub(crate)` only, no public surface affected): see
+  "Corrected mid-flight" for the `ActiveCluster` consolidation this
+  phase's own review drove.
 * Confirmed against two real, independent live servers
   (`ci/infinispan-multicluster`): `add_cluster`/`switch_to_cluster`
   move traffic to the second server and back, each cluster's own
