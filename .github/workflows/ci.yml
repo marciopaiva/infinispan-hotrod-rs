@@ -40,7 +40,7 @@ jobs:
         run: ci/infinispan/setup.sh
 
       - name: Live-server tests
-        run: cargo test --test live_server -- --ignored --skip cluster_ --skip tls_
+        run: cargo test --test live_server -- --ignored --skip cluster_ --skip tls_ --skip multicluster_
         env:
           INFINISPAN_ADDR: 127.0.0.1:11222
           INFINISPAN_USER: testuser
@@ -64,7 +64,11 @@ jobs:
         run: ci/infinispan-cluster/setup.sh
 
       - name: Cluster tests
-        run: cargo test --test live_server cluster_ -- --ignored
+        # `cluster_` as a cargo test-name filter also matches
+        # `multicluster_`, a separate fixture (ci/infinispan-multicluster/,
+        # multicluster-test below): excluded explicitly so that job's
+        # own tests do not run here against the wrong servers.
+        run: cargo test --test live_server -- --ignored cluster_ --skip multicluster_
 
       - name: Stop Infinispan cluster
         if: always()
@@ -89,3 +93,23 @@ jobs:
       - name: Stop TLS-enabled Infinispan
         if: always()
         run: ci/infinispan-tls/teardown.sh
+
+  multicluster-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start independent Infinispan clusters
+        run: ci/infinispan-multicluster/setup.sh
+
+      - name: Multi-cluster failover tests
+        run: cargo test --test live_server multicluster_ -- --ignored
+
+      - name: Stop independent Infinispan clusters
+        if: always()
+        run: ci/infinispan-multicluster/teardown.sh
