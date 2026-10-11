@@ -46,6 +46,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `size`/`contains_entry`/`contains_key`/`contains_value`). Not a
   special cache type server-side: an ordinary cache, reached through
   its own nine opcodes. See `docs/adr/0016-multimap-cache.md` (#48).
+- Multi-cluster failover: `HotRodClient::add_cluster(name, seed_addrs)`
+  configures an alternate cluster for disaster recovery;
+  `switch_to_cluster(name)` moves to it (or back to the original,
+  `HotRodClient::DEFAULT_CLUSTER_NAME`) immediately, without checking
+  liveness; `active_cluster_name()` reports which one is active. Every
+  operation also fails over to a live alternate cluster automatically
+  once every seed of the active one becomes unreachable, reusing the
+  retry chain from `docs/adr/0011-retry-policy-and-node-health.md`.
+  Entirely client-side, no new opcodes. See
+  `docs/adr/0017-multi-cluster-failover.md` (#56).
 
 ## [0.6.0] - 2026-10-10
 

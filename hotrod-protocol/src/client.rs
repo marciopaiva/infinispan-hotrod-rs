@@ -160,11 +160,15 @@ pub(crate) struct ClusterTopology {
 }
 
 pub(crate) struct ClientInner {
-    /// Every seed address this instance was constructed with, in the
-    /// order given to `connect`/`connect_with_timeout`.
-    /// `active_seed_addr` is always one of these; `failover_seed` tries
-    /// the rest when it stops responding.
-    pub(crate) seed_addrs: Vec<SocketAddr>,
+    /// The currently active cluster's own seed addresses, in the order
+    /// given to `connect`/`connect_with_timeout`, or to `add_cluster` for
+    /// whichever cluster is active now. `active_seed_addr` is always one
+    /// of these; `failover_seed` tries the rest when it stops responding.
+    /// An `RwLock`, not a plain `Vec`, since `switch_to_cluster`/the
+    /// automatic failover in `try_failover_to_live_cluster`
+    /// (`docs/adr/0017-multi-cluster-failover.md`) replace it wholesale
+    /// when the active cluster changes.
+    pub(crate) seed_addrs: RwLock<Vec<SocketAddr>>,
     /// The seed this instance is currently connected to; also the
     /// fallback used before a topology has arrived and the retry target
     /// when a computed owner's connection fails. Never evicted by a
@@ -210,6 +214,16 @@ pub(crate) struct ClientInner {
     /// operation, beyond its first attempt, before surfacing the last
     /// attempt's error.
     pub(crate) max_retries: RwLock<usize>,
+    /// Every cluster this client knows about, by name, including the
+    /// one it was originally constructed with (under
+    /// `HotRodClient::DEFAULT_CLUSTER_NAME`). `add_cluster` appends to
+    /// this; `switch_to_cluster`/`try_failover_to_live_cluster` read it
+    /// to find the seeds of whichever cluster becomes active next. See
+    /// `docs/adr/0017-multi-cluster-failover.md`.
+    pub(crate) clusters: RwLock<Vec<(String, Vec<SocketAddr>)>>,
+    /// The name of whichever entry in `clusters` `seed_addrs`/
+    /// `active_seed_addr`/`topology` currently reflect.
+    pub(crate) active_cluster_name: RwLock<String>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation
@@ -262,6 +276,16 @@ impl Drop for PendingSlot {
 }
 
 impl HotRodClient {
+    /// Sentinel name for the cluster this client was originally
+    /// constructed with (`connect`/`connect_with_timeout`/`connect_tls`/
+    /// `connect_tls_with_timeout`), so `switch_to_cluster` can return to
+    /// it the same way it switches to any `add_cluster`-added one.
+    /// Matches the Java client's own `DEFAULT_CLUSTER_NAME` in spirit
+    /// (an unlikely name for a real cluster to collide with), not its
+    /// exact string: `add_cluster` rejects this name outright, so there
+    /// is no ambiguity either way.
+    pub const DEFAULT_CLUSTER_NAME: &'static str = "__default__";
+
     /// Builds a client directly from its shared state. `pub(crate)` only:
     /// real callers always go through `connect`/`connect_with_timeout`/
     /// `connect_tls`/`connect_tls_with_timeout`. Used by `remote_cache.rs`
@@ -362,7 +386,7 @@ impl HotRodClient {
             match joined {
                 Ok((_index, addr, Ok(_conn))) => {
                     return Ok(Self(Arc::new(ClientInner {
-                        seed_addrs: seed_addrs.to_vec(),
+                        seed_addrs: RwLock::new(seed_addrs.to_vec()),
                         active_seed_addr: RwLock::new(addr),
                         topology: RwLock::new(None),
                         node_origin: RwLock::new(HashMap::new()),
@@ -374,6 +398,11 @@ impl HotRodClient {
                         node_health: NodeHealth::default(),
                         server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
                         max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+                        clusters: RwLock::new(vec![(
+                            Self::DEFAULT_CLUSTER_NAME.to_string(),
+                            seed_addrs.to_vec(),
+                        )]),
+                        active_cluster_name: RwLock::new(Self::DEFAULT_CLUSTER_NAME.to_string()),
                     })));
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -492,6 +521,224 @@ impl HotRodClient {
     /// `pub(crate)` accessor for `remote_cache.rs`'s dispatch loop.
     pub(crate) fn node_health(&self) -> &NodeHealth {
         &self.0.node_health
+    }
+
+    /// Configures an alternate cluster for failover/disaster recovery
+    /// (`docs/adr/0017-multi-cluster-failover.md`), reachable later by
+    /// `name` through `switch_to_cluster`, or tried automatically once
+    /// every seed of the currently active cluster stops responding.
+    /// `name` must not already be configured, and must not be
+    /// `DEFAULT_CLUSTER_NAME` (the sentinel reserved for the cluster
+    /// this client was originally constructed with); `seed_addrs` must
+    /// not be empty. Neither is validated by actually dialing anything:
+    /// a cluster that turns out to be unreachable is simply skipped the
+    /// next time something tries to fail over to it.
+    pub fn add_cluster(&self, name: impl Into<String>, seed_addrs: Vec<SocketAddr>) -> Result<()> {
+        let name = name.into();
+        if seed_addrs.is_empty() {
+            return Err(Error::InvalidClusterConfig(
+                "seed_addrs must not be empty".to_string(),
+            ));
+        }
+        let mut clusters = self.0.clusters.write().unwrap_or_else(|p| p.into_inner());
+        if clusters.iter().any(|(existing, _)| *existing == name) {
+            return Err(Error::InvalidClusterConfig(format!(
+                "cluster {name:?} is already configured"
+            )));
+        }
+        clusters.push((name, seed_addrs));
+        Ok(())
+    }
+
+    /// Switches to the cluster named `name` (`DEFAULT_CLUSTER_NAME`, or
+    /// one `add_cluster` added) immediately, without checking that it
+    /// is actually reachable: this matches the Java client's own
+    /// `manualSwitchToCluster`, not its liveness-checked
+    /// `switchToCluster`. If `name` turns out to be unreachable, the
+    /// next operation's own retry chain (which also tries every other
+    /// configured cluster, see `try_failover_to_live_cluster`) is what
+    /// surfaces that, the same as it would for any other connection
+    /// failure.
+    ///
+    /// Resets the known topology: a different cluster's segment
+    /// ownership has nothing to do with the one just left behind, the
+    /// same reason `try_failover_to_live_cluster` resets it on an
+    /// automatic switch.
+    pub fn switch_to_cluster(&self, name: &str) -> Result<()> {
+        let clusters = self.0.clusters.read().unwrap_or_else(|p| p.into_inner());
+        let (name, seed_addrs) = clusters
+            .iter()
+            .find(|(existing, _)| existing == name)
+            .ok_or_else(|| Error::UnknownCluster(name.to_string()))?
+            .clone();
+        drop(clusters);
+        *self.0.seed_addrs.write().unwrap_or_else(|p| p.into_inner()) = seed_addrs.clone();
+        *self
+            .0
+            .active_seed_addr
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = seed_addrs[0];
+        *self
+            .0
+            .active_cluster_name
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = name;
+        *self.0.topology.write().unwrap_or_else(|p| p.into_inner()) = None;
+        Ok(())
+    }
+
+    /// The name of the cluster this client currently routes against:
+    /// `DEFAULT_CLUSTER_NAME` until the first switch, manual or
+    /// automatic.
+    pub fn active_cluster_name(&self) -> String {
+        self.0
+            .active_cluster_name
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Shared by `failover_seed` (tries the rest of the active
+    /// cluster's own seeds) and `try_failover_to_live_cluster` (tries
+    /// another cluster's seeds): dials each of `candidates` in order,
+    /// skipping `skip`, until one accepts a connection and, if
+    /// credentials were set, authenticates. The winner is pushed into
+    /// its `(addr, cache_name)` pool as an idle connection and promoted
+    /// to `active_seed_addr`. When `switch` names a cluster, this also
+    /// replaces `seed_addrs`/`active_cluster_name` with it and resets
+    /// `topology` to `None`; `failover_seed` passes `None` since it
+    /// never leaves the active cluster.
+    async fn try_promote_seed(
+        &self,
+        cache_name: &str,
+        candidates: &[SocketAddr],
+        skip: Option<SocketAddr>,
+        switch: Option<(String, Vec<SocketAddr>)>,
+    ) -> Result<SocketAddr> {
+        let topology_id = self.current_topology_id();
+        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
+        let auth = self
+            .0
+            .auth
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut last_err: Option<Error> = None;
+        for &addr in candidates {
+            if Some(addr) == skip {
+                continue;
+            }
+            let mut conn = match HotRodConnection::connect_hash_aware(
+                addr,
+                cache_name,
+                topology_id,
+                timeout,
+                self.0.tls.as_ref(),
+                true, // dialing a seed: verify by hostname
+            )
+            .await
+            {
+                Ok(conn) => conn,
+                Err(err) => {
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+            if let Some(auth) = &auth {
+                if let Err(err) = auth.authenticate(&mut conn).await {
+                    last_err = Some(err);
+                    continue;
+                }
+            }
+            self.0
+                .node_origin
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(addr, None);
+            let pool = self.pool_for(addr, cache_name);
+            if tokio::time::timeout(timeout, pool.seed_idle(conn))
+                .await
+                .is_err()
+            {
+                last_err = Some(Error::Timeout(timeout));
+                continue;
+            }
+            *self
+                .0
+                .active_seed_addr
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) = addr;
+            if let Some((name, seeds)) = &switch {
+                *self.0.seed_addrs.write().unwrap_or_else(|p| p.into_inner()) = seeds.clone();
+                *self
+                    .0
+                    .active_cluster_name
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = name.clone();
+                *self.0.topology.write().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+            return Ok(addr);
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no address available to fail over to",
+            ))
+        }))
+    }
+
+    /// Tried by `remote_cache.rs`'s dispatch loop right before it would
+    /// otherwise give up (`docs/adr/0017-multi-cluster-failover.md`):
+    /// every candidate of the active cluster, including every other
+    /// seed via `failover_seed`, has already failed by this point, so
+    /// this tries every other configured cluster in turn, in the order
+    /// `add_cluster` was called, until one responds. On success, the
+    /// cluster switch this performs is visible both through
+    /// `active_cluster_name` and as a `tracing` `WARN` event, since
+    /// nothing about the call that triggered it otherwise indicates a
+    /// whole cluster was just abandoned.
+    pub(crate) async fn try_failover_to_live_cluster(
+        &self,
+        cache_name: &str,
+    ) -> Result<SocketAddr> {
+        let active_name = self.active_cluster_name();
+        let clusters = self
+            .0
+            .clusters
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut last_err: Option<Error> = None;
+        for (name, seeds) in clusters {
+            if name == active_name {
+                continue;
+            }
+            match self
+                .try_promote_seed(
+                    cache_name,
+                    &seeds,
+                    None,
+                    Some((name.clone(), seeds.clone())),
+                )
+                .await
+            {
+                Ok(addr) => {
+                    tracing::warn!(
+                        from_cluster = %active_name,
+                        to_cluster = %name,
+                        "switched to a failover cluster after the active one became unreachable"
+                    );
+                    return Ok(addr);
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no other cluster configured or reachable",
+            ))
+        }))
     }
 
     /// Authenticates using SASL PLAIN. See
@@ -883,67 +1130,14 @@ impl HotRodClient {
             .active_seed_addr
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        let topology_id = self.current_topology_id();
-        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
-        let auth = self
+        let seed_addrs = self
             .0
-            .auth
+            .seed_addrs
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let mut last_err: Option<Error> = None;
-        for &addr in &self.0.seed_addrs {
-            if addr == previous {
-                continue;
-            }
-            let mut conn = match HotRodConnection::connect_hash_aware(
-                addr,
-                cache_name,
-                topology_id,
-                timeout,
-                self.0.tls.as_ref(),
-                true, // dialing a seed: verify by hostname
-            )
+        self.try_promote_seed(cache_name, &seed_addrs, Some(previous), None)
             .await
-            {
-                Ok(conn) => conn,
-                Err(err) => {
-                    last_err = Some(err);
-                    continue;
-                }
-            };
-            if let Some(auth) = &auth {
-                if let Err(err) = auth.authenticate(&mut conn).await {
-                    last_err = Some(err);
-                    continue;
-                }
-            }
-            self.0
-                .node_origin
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(addr, None);
-            let pool = self.pool_for(addr, cache_name);
-            if tokio::time::timeout(timeout, pool.seed_idle(conn))
-                .await
-                .is_err()
-            {
-                last_err = Some(Error::Timeout(timeout));
-                continue;
-            }
-            *self
-                .0
-                .active_seed_addr
-                .write()
-                .unwrap_or_else(|p| p.into_inner()) = addr;
-            return Ok(addr);
-        }
-        Err(last_err.unwrap_or_else(|| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "no other seed address available to fail over to",
-            ))
-        }))
     }
 
     /// Applies whatever topology update `conn` parsed from its last
@@ -1102,7 +1296,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn max_retries_and_server_failure_timeout_default_and_can_be_overridden() {
         let client = HotRodClient::from_inner(ClientInner {
-            seed_addrs: vec![],
+            seed_addrs: RwLock::new(vec![]),
             active_seed_addr: RwLock::new("127.0.0.1:1".parse().unwrap()),
             topology: RwLock::new(None),
             node_origin: RwLock::new(HashMap::new()),
@@ -1114,6 +1308,11 @@ pub(crate) mod tests {
             node_health: NodeHealth::default(),
             server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
             max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec![],
+            )]),
+            active_cluster_name: RwLock::new(HotRodClient::DEFAULT_CLUSTER_NAME.to_string()),
         });
 
         assert_eq!(client.max_retries(), DEFAULT_MAX_RETRIES);
@@ -1127,6 +1326,114 @@ pub(crate) mod tests {
 
         assert_eq!(client.max_retries(), 7);
         assert_eq!(client.server_failure_timeout(), None);
+    }
+
+    fn client_for_cluster_tests(seed_addr: SocketAddr) -> HotRodClient {
+        HotRodClient::from_inner(ClientInner {
+            seed_addrs: RwLock::new(vec![seed_addr]),
+            active_seed_addr: RwLock::new(seed_addr),
+            topology: RwLock::new(Some(Arc::new(ClusterTopology {
+                topology_id: 1,
+                servers: vec![],
+                hash_function_version: 0,
+                segment_owners: vec![],
+                resolved_addrs: RwLock::new(HashMap::new()),
+            }))),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(None),
+            tls: None,
+            timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec![seed_addr],
+            )]),
+            active_cluster_name: RwLock::new(HotRodClient::DEFAULT_CLUSTER_NAME.to_string()),
+        })
+    }
+
+    #[test]
+    fn add_cluster_rejects_an_empty_seed_list() {
+        let client = client_for_cluster_tests("127.0.0.1:1".parse().unwrap());
+        let err = client
+            .add_cluster("dr", vec![])
+            .expect_err("expected InvalidClusterConfig");
+        assert!(matches!(err, Error::InvalidClusterConfig(_)));
+    }
+
+    #[test]
+    fn add_cluster_rejects_a_name_already_in_use() {
+        let client = client_for_cluster_tests("127.0.0.1:1".parse().unwrap());
+        client
+            .add_cluster("dr", vec!["127.0.0.1:2".parse().unwrap()])
+            .expect("first add_cluster should succeed");
+
+        let err = client
+            .add_cluster("dr", vec!["127.0.0.1:3".parse().unwrap()])
+            .expect_err("expected InvalidClusterConfig for a duplicate name");
+        assert!(matches!(err, Error::InvalidClusterConfig(_)));
+
+        let err = client
+            .add_cluster(
+                HotRodClient::DEFAULT_CLUSTER_NAME,
+                vec!["127.0.0.1:3".parse().unwrap()],
+            )
+            .expect_err("expected InvalidClusterConfig for the sentinel name");
+        assert!(matches!(err, Error::InvalidClusterConfig(_)));
+    }
+
+    #[test]
+    fn switch_to_cluster_errors_for_an_unknown_name() {
+        let client = client_for_cluster_tests("127.0.0.1:1".parse().unwrap());
+        let err = client
+            .switch_to_cluster("does-not-exist")
+            .expect_err("expected UnknownCluster");
+        assert!(matches!(err, Error::UnknownCluster(name) if name == "does-not-exist"));
+    }
+
+    #[test]
+    fn switch_to_cluster_updates_seed_addrs_active_seed_and_resets_topology() {
+        let original_seed: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let dr_seed: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let client = client_for_cluster_tests(original_seed);
+        client
+            .add_cluster("dr", vec![dr_seed])
+            .expect("add_cluster should succeed");
+        assert!(
+            client.inner().topology.read().unwrap().is_some(),
+            "test setup should start with a known topology"
+        );
+
+        client
+            .switch_to_cluster("dr")
+            .expect("switch_to_cluster should succeed");
+
+        assert_eq!(client.active_cluster_name(), "dr");
+        assert_eq!(*client.inner().active_seed_addr.read().unwrap(), dr_seed);
+        assert_eq!(*client.inner().seed_addrs.read().unwrap(), vec![dr_seed]);
+        assert!(
+            client.inner().topology.read().unwrap().is_none(),
+            "switching clusters should discard the old cluster's topology"
+        );
+
+        // Switching back to the original cluster works the same way,
+        // since it is just another entry in `clusters` under the
+        // sentinel name.
+        client
+            .switch_to_cluster(HotRodClient::DEFAULT_CLUSTER_NAME)
+            .expect("switch_to_cluster back to the default should succeed");
+        assert_eq!(
+            client.active_cluster_name(),
+            HotRodClient::DEFAULT_CLUSTER_NAME
+        );
+        assert_eq!(
+            *client.inner().active_seed_addr.read().unwrap(),
+            original_seed
+        );
     }
 
     /// Binds a listener and immediately drops it, so the returned address
@@ -1431,7 +1738,7 @@ pub(crate) mod tests {
         // throwaway reachability probe (see its docs), which would consume
         // `seed_task`'s first `accept` before any real auth exchange ran.
         let client = HotRodClient::from_inner(ClientInner {
-            seed_addrs: vec![seed_addr],
+            seed_addrs: RwLock::new(vec![seed_addr]),
             active_seed_addr: RwLock::new(seed_addr),
             topology: RwLock::new(None),
             node_origin: RwLock::new(HashMap::new()),
@@ -1443,6 +1750,11 @@ pub(crate) mod tests {
             node_health: NodeHealth::default(),
             server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
             max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec![seed_addr],
+            )]),
+            active_cluster_name: RwLock::new(HotRodClient::DEFAULT_CLUSTER_NAME.to_string()),
         });
 
         client
@@ -1511,7 +1823,7 @@ pub(crate) mod tests {
         });
 
         let client = HotRodClient::from_inner(ClientInner {
-            seed_addrs: vec![seed_addr],
+            seed_addrs: RwLock::new(vec![seed_addr]),
             active_seed_addr: RwLock::new(seed_addr),
             topology: RwLock::new(None),
             node_origin: RwLock::new(HashMap::new()),
@@ -1523,6 +1835,11 @@ pub(crate) mod tests {
             node_health: NodeHealth::default(),
             server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
             max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec![seed_addr],
+            )]),
+            active_cluster_name: RwLock::new(HotRodClient::DEFAULT_CLUSTER_NAME.to_string()),
         });
 
         client
@@ -1561,7 +1878,7 @@ pub(crate) mod tests {
     async fn checkout_does_not_leak_pool_capacity_when_open_fails() {
         let dead_addr = unreachable_addr().await;
         let client = HotRodClient::from_inner(ClientInner {
-            seed_addrs: vec![dead_addr],
+            seed_addrs: RwLock::new(vec![dead_addr]),
             active_seed_addr: RwLock::new(dead_addr),
             topology: RwLock::new(None),
             node_origin: RwLock::new(HashMap::new()),
@@ -1573,6 +1890,11 @@ pub(crate) mod tests {
             node_health: NodeHealth::default(),
             server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
             max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec![dead_addr],
+            )]),
+            active_cluster_name: RwLock::new(HotRodClient::DEFAULT_CLUSTER_NAME.to_string()),
         });
 
         // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed

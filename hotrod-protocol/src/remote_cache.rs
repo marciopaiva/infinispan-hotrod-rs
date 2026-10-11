@@ -1101,6 +1101,23 @@ impl RemoteCache {
                     _ => None,
                 };
             }
+            // Every seed of the active cluster, including every one
+            // `failover_seed` just tried, is now exhausted: before
+            // giving up, see whether another configured cluster
+            // responds (`docs/adr/0017-multi-cluster-failover.md`).
+            // On success this has already switched the active
+            // cluster, so `addr` belongs to it, not to whatever
+            // `self.cache_name`'s pool was keyed against a moment ago.
+            if next.is_none() {
+                next = match self
+                    .client
+                    .try_failover_to_live_cluster(&self.cache_name)
+                    .await
+                {
+                    Ok(new_seed) if !tried.contains(&new_seed) => Some((new_seed, None)),
+                    _ => None,
+                };
+            }
             let Some((addr, origin)) = next else {
                 return Err(last_err.unwrap_or_else(exhausted_candidates_error));
             };
@@ -1306,7 +1323,12 @@ pub(crate) mod tests {
         timeout: Duration,
     ) -> HotRodClient {
         HotRodClient::from_inner(ClientInner {
-            seed_addrs,
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                seed_addrs.clone(),
+            )]),
+            active_cluster_name: RwLock::new(HotRodClient::DEFAULT_CLUSTER_NAME.to_string()),
+            seed_addrs: RwLock::new(seed_addrs),
             active_seed_addr: RwLock::new(active_seed_addr),
             topology: RwLock::new(None),
             node_origin: RwLock::new(StdHashMap::new()),
@@ -1445,6 +1467,45 @@ pub(crate) mod tests {
         assert_eq!(*client.inner().active_seed_addr.read().unwrap(), other_addr);
 
         other_task.await.unwrap();
+    }
+
+    /// Every seed of the active cluster refuses the connection outright,
+    /// but a configured alternate cluster has one live seed. The
+    /// automatic failover in `HotRodClient::try_failover_to_live_cluster`
+    /// (`docs/adr/0017-multi-cluster-failover.md`) must find it and let
+    /// this `get` complete, without the caller doing anything beyond
+    /// the call itself.
+    #[tokio::test]
+    async fn automatic_cluster_failover_completes_the_operation_on_a_live_alternate() {
+        let dead_seed_addr = unreachable_addr().await;
+
+        let dr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dr_addr = dr_listener.local_addr().unwrap();
+        let dr_task = tokio::spawn(async move {
+            let (mut stream, _) = dr_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![dead_seed_addr], dead_seed_addr);
+        client
+            .add_cluster("dr", vec![dr_addr])
+            .expect("add_cluster should succeed");
+
+        let result = client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should fail over to the alternate cluster");
+
+        assert_eq!(result, None);
+        assert_eq!(client.active_cluster_name(), "dr");
+        assert_eq!(*client.inner().active_seed_addr.read().unwrap(), dr_addr);
+
+        dr_task.await.unwrap();
     }
 
     #[tokio::test]
