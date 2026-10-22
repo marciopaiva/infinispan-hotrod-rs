@@ -61,6 +61,7 @@ mod status;
 mod streaming;
 mod tls;
 mod topology;
+mod transaction;
 mod typed_cache;
 mod varint;
 mod wire;
@@ -82,6 +83,7 @@ pub use remote_cache::RemoteCache;
 pub use stats::{ClientStatistics, NearCacheStatistics, PoolStatistics};
 pub use streaming::{GetStream, PutStream};
 pub use tls::TlsConfig;
+pub use transaction::Transaction;
 pub use typed_cache::{TypedCache, TypedVersionedValue};
 pub use wire::Expiration;
 
