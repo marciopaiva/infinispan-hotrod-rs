@@ -200,8 +200,12 @@ for row in result.rows {
 
 `administration` creates, removes and lists caches, no shell or REST
 access to the server needed. `CacheConfig::Template` names an
-existing template, `CacheConfig::Definition` passes a full
-configuration document (XML, JSON or YAML, auto-detected server-side):
+existing template; `CacheConfig::Definition` passes a full
+configuration document (XML, a bare fragment, JSON or YAML,
+auto-detected server-side) instead, which does not depend on the
+server having a given template predefined (confirmed against a real
+server to not always be the case: see
+`docs/adr/0014-remote-administration.md`'s "Corrected mid-flight"):
 
 ```rust
 use hotrod_protocol::{AdminFlag, CacheConfig};
@@ -209,7 +213,12 @@ use hotrod_protocol::{AdminFlag, CacheConfig};
 client
     .administration()
     .with_flags([AdminFlag::Volatile])
-    .create_cache("sessions", CacheConfig::Template("org.infinispan.DIST_SYNC".to_string()))
+    .create_cache(
+        "sessions",
+        CacheConfig::Definition(
+            "<distributed-cache><encoding media-type=\"application/octet-stream\"/></distributed-cache>".to_string(),
+        ),
+    )
     .await?;
 
 let names = client.administration().cache_names().await?;
