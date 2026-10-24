@@ -270,6 +270,33 @@ wire type on a tag.
   per-write "store this as protostream" capability in this crate is
   left for a future proposal if that turns out to matter in practice.
 * Not implemented, left for later if it turns out to matter:
-  `executeStatement` (DELETE/UPDATE Ickle), streaming/iterating very
-  large result sets instead of buffering the whole response, the
-  protocol's JSON media-type variant, and `TypedCache::query`.
+  streaming/iterating very large result sets instead of buffering the
+  whole response, the protocol's JSON media-type variant, and
+  `TypedCache::query`.
+
+### Addendum: `executeStatement` (#108)
+
+The question this ADR originally left open ("needs its own Analyze
+pass to confirm the request/response shape differs from a plain
+SELECT's `QueryRequest`/`QueryResponse`") is answered: it does not.
+Checked directly against the Java client's own source
+(`infinispan/infinispan`): `RemoteQuery.executeStatement()` builds the
+exact same `QueryOperation`, over the exact same `QUERY_REQUEST`/
+`QUERY_RESPONSE` opcodes, as a plain `execute()`. The only field
+`QueryOperation.writeOperationRequest` sets differently is
+`hitCountAccuracy`, forced to `1`; the affected-row count comes back
+in the ordinary `QueryResponse.hitCount`, with `results` left empty
+by the server rather than carrying any rows.
+
+`query.rs::encode_query_request` gained a `hit_count_accuracy:
+Option<i32>` parameter (tag 7, omitted when `None`, exactly as before
+this parameter existed) and `Query` a new method:
+
+```rust
+pub async fn execute_statement(self) -> Result<u32>;
+```
+
+It calls the same `run_query`/`decode_query_response` path `execute`
+already uses, with `hit_count_accuracy = Some(1)`, and returns
+`QueryResult::hit_count` as the affected-entry count. No new opcode,
+no new message, no change to `connection.rs` or `header.rs`.

@@ -2468,6 +2468,62 @@ pub(crate) mod tests {
         seed_task.await.unwrap();
     }
 
+    /// `execute_statement` (issue #108) runs the exact same
+    /// `OpCode::Query` round trip as `execute`
+    /// (`docs/adr/0013-remote-query.md`), with `hitCountAccuracy`
+    /// forced to 1 and the affected-row count read back from
+    /// `hit_count` rather than `rows`.
+    #[tokio::test]
+    async fn execute_statement_sets_hit_count_accuracy_and_returns_the_affected_count() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let request_body = read_array(&mut stream).await.unwrap();
+            assert!(String::from_utf8_lossy(&request_body).contains("DELETE FROM org.example.User"));
+
+            let mut pos = 0;
+            let mut hit_count_accuracy = None;
+            while let Some((field, wire_type)) = read_tag(&request_body, &mut pos).unwrap() {
+                if field == 7 {
+                    hit_count_accuracy =
+                        Some(crate::protobuf_wire::read_int32(&request_body, &mut pos).unwrap());
+                } else if wire_type == WIRE_TYPE_VARINT {
+                    crate::protobuf_wire::read_varint(&request_body, &mut pos).unwrap();
+                } else {
+                    read_length_delimited(&request_body, &mut pos).unwrap();
+                }
+            }
+            assert_eq!(
+                hit_count_accuracy,
+                Some(1),
+                "expected hitCountAccuracy = 1 in the request"
+            );
+
+            // The server leaves `results` empty for a statement, not a
+            // SELECT; only `hit_count` (the affected-row count) matters.
+            let response = query_response_bytes(0, &[], 3);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let affected = client
+            .cache("my-cache")
+            .query("DELETE FROM org.example.User WHERE age < :maxAge")
+            .param("maxAge", QueryValue::Int32(18))
+            .execute_statement()
+            .await
+            .expect("execute_statement should succeed");
+
+        assert_eq!(affected, 3);
+
+        seed_task.await.unwrap();
+    }
+
     /// `get_all` and `put_all` have no single key to route by either, per
     /// the Propose step in issue #41: same setup as
     /// `size_clear_ping_and_stats_always_target_the_seed`, an owner

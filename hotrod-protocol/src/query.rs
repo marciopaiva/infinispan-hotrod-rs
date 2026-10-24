@@ -270,18 +270,24 @@ const QUERY_REQUEST_QUERY_STRING: u32 = 1;
 const QUERY_REQUEST_START_OFFSET: u32 = 3;
 const QUERY_REQUEST_MAX_RESULTS: u32 = 4;
 const QUERY_REQUEST_NAMED_PARAMETERS: u32 = 5;
+const QUERY_REQUEST_HIT_COUNT_ACCURACY: u32 = 7;
 
 /// Encodes a `QueryRequest` (`docs/adr/0013-remote-query.md`): the
 /// Protobuf body `OpCode::Query`'s request carries, after the normal
-/// Hot Rod header. `local` and `hitCountAccuracy` are left
-/// unset/omitted, not exposed in this phase's `Query` builder: a
-/// field protostream's own generated schema declares optional, so
-/// omitting it is exactly as valid on the wire as sending its default
-/// (`local = false`), not a shortcut around the format.
+/// Hot Rod header. `local` is left unset/omitted, not exposed in this
+/// phase's `Query` builder: a field protostream's own generated
+/// schema declares optional, so omitting it is exactly as valid on
+/// the wire as sending its default (`local = false`), not a shortcut
+/// around the format. `hit_count_accuracy` is `None` for a plain
+/// `execute()` (field omitted, same as before this parameter
+/// existed) and `Some(1)` for `execute_statement()`, matching the
+/// Java client's own `QueryOperation.writeOperationRequest`
+/// (`withHitCount = false` unconditionally sets `hitCountAccuracy(1)`).
 pub(crate) fn encode_query_request(
     query: &str,
     start_offset: i64,
     max_results: Option<i32>,
+    hit_count_accuracy: Option<i32>,
     named_parameters: &[(String, QueryValue)],
 ) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -298,6 +304,11 @@ pub(crate) fn encode_query_request(
     if let Some(max_results) = max_results {
         write_tag(&mut buf, QUERY_REQUEST_MAX_RESULTS, WIRE_TYPE_VARINT);
         write_int32(&mut buf, max_results);
+    }
+
+    if let Some(hit_count_accuracy) = hit_count_accuracy {
+        write_tag(&mut buf, QUERY_REQUEST_HIT_COUNT_ACCURACY, WIRE_TYPE_VARINT);
+        write_int32(&mut buf, hit_count_accuracy);
     }
 
     for (name, value) in named_parameters {
@@ -463,9 +474,32 @@ impl<'a> Query<'a> {
                 &self.query,
                 self.start_offset,
                 self.max_results,
+                None,
                 &self.named_parameters,
             ))
             .await
+    }
+
+    /// Runs a DELETE or UPDATE Ickle statement, returning the number
+    /// of affected entries. The wire round trip is identical to
+    /// `execute` (the same `QueryRequest`/`QueryResponse`, see
+    /// `docs/adr/0013-remote-query.md`): this always sets
+    /// `hitCountAccuracy` to 1, matching the Java client's own
+    /// `executeStatement`, and reads the affected-row count back from
+    /// `QueryResponse.hit_count` instead of `rows`, which the server
+    /// leaves empty for a statement rather than a SELECT.
+    pub async fn execute_statement(self) -> Result<u32> {
+        let result = self
+            .cache
+            .run_query(encode_query_request(
+                &self.query,
+                self.start_offset,
+                self.max_results,
+                Some(1),
+                &self.named_parameters,
+            ))
+            .await?;
+        Ok(result.hit_count)
     }
 }
 
@@ -612,6 +646,7 @@ mod tests {
             "FROM Foo WHERE bar = :baz",
             10,
             Some(5),
+            None,
             &[("baz".to_string(), QueryValue::Int32(3))],
         );
 
@@ -652,6 +687,38 @@ mod tests {
             WrappedValue::Scalar(QueryValue::Int32(3))
         );
 
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn query_request_omits_hit_count_accuracy_unless_requested() {
+        let bytes = encode_query_request("FROM Foo", 0, None, None, &[]);
+        let mut pos = 0;
+        while let Some((field, wire_type)) = read_tag(&bytes, &mut pos).unwrap() {
+            assert_ne!(field, QUERY_REQUEST_HIT_COUNT_ACCURACY);
+            skip_field(&bytes, &mut pos, wire_type).unwrap();
+        }
+    }
+
+    #[test]
+    fn query_request_sets_hit_count_accuracy_for_execute_statement() {
+        let bytes = encode_query_request("DELETE FROM Foo WHERE bar = :baz", 0, None, Some(1), &[]);
+
+        let mut pos = 0;
+        let (field, _) = read_tag(&bytes, &mut pos).unwrap().unwrap(); // query string
+        read_length_delimited(&bytes, &mut pos).unwrap();
+        assert_eq!(field, QUERY_REQUEST_QUERY_STRING);
+
+        let (field, _) = read_tag(&bytes, &mut pos).unwrap().unwrap(); // start offset
+        read_int64(&bytes, &mut pos).unwrap();
+        assert_eq!(field, QUERY_REQUEST_START_OFFSET);
+
+        let (field, wire_type) = read_tag(&bytes, &mut pos).unwrap().unwrap();
+        assert_eq!(
+            (field, wire_type),
+            (QUERY_REQUEST_HIT_COUNT_ACCURACY, WIRE_TYPE_VARINT)
+        );
+        assert_eq!(read_int32(&bytes, &mut pos).unwrap(), 1);
         assert_eq!(pos, bytes.len());
     }
 
