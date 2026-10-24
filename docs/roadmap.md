@@ -176,6 +176,13 @@ Every item in this theme is done.
   cluster this client now routes against; the old cluster's own
   connection pools are drained the same way. See
   `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+* ~~Multi-cluster failover: proactive switch-back (#117)~~ (done). A
+  background monitor, started only after a real automatic failover
+  (never after a manual `switch_to_cluster`), keeps retrying the
+  abandoned cluster at `switch_back_check_interval` (60s by default,
+  configurable, `None` disables it) until it responds again, then
+  switches back on its own. See
+  `docs/adr/0020-multicluster-proactive-switch-back.md`.
 
 ### Specialized data structures and administration
 
@@ -223,11 +230,6 @@ Every item in this theme is done.
   no new system dependencies (the same reasoning ADR 0002 used to
   defer it originally).
 * **Remote task execution (#51).** No current use case pulling on it.
-* **Multi-cluster failover: proactive switch-back (#117).** Split out
-  of #115: needs a background polling task and its own configuration,
-  a bigger and more independent decision than the two gaps #115
-  already closed. The Java client does not do this either (see
-  `docs/adr/0017-multi-cluster-failover.md`).
 
 This intentionally does not try to move on everything at once. Each
 theme, and each item within one, lands after what it depends on, not

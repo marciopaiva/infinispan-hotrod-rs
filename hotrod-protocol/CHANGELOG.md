@@ -65,6 +65,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
   rolls the whole transaction back (`Error::TransactionRolledBack`).
   Real XA (two-phase commit, recovery) is out of scope for this
   phase. See `docs/adr/0018-transactions-non-xa-one-phase.md` (#47).
+- Multi-cluster failover: a background monitor now switches back to
+  a cluster an automatic failover abandoned once it responds again,
+  with no further action from the caller. Starts only after a real
+  automatic failover, never after a manual `switch_to_cluster`.
+  Enabled by default, every 60 seconds;
+  `HotRodClient::switch_back_check_interval`/
+  `set_switch_back_check_interval` reads or overrides the interval,
+  `None` disabling it. See
+  `docs/adr/0020-multicluster-proactive-switch-back.md` (#117).
 
 ### Fixed
 
