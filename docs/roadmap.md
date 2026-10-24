@@ -168,6 +168,14 @@ Every item in this theme is done.
   `docs/adr/0011-retry-policy-and-node-health.md`. Entirely
   client-side, no new opcodes. See
   `docs/adr/0017-multi-cluster-failover.md`.
+* ~~Multi-cluster failover: listener/near cache termination and pool
+  draining (#115)~~ (done). A switch now bumps a generation counter
+  any registered `CacheListener` (raw, or inside a `NearCachedCache`)
+  watches, terminating it instead of leaving it to silently trust an
+  invalidation feed that no longer has anything to do with the
+  cluster this client now routes against; the old cluster's own
+  connection pools are drained the same way. See
+  `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
 
 ### Specialized data structures and administration
 
@@ -215,6 +223,11 @@ Every item in this theme is done.
   no new system dependencies (the same reasoning ADR 0002 used to
   defer it originally).
 * **Remote task execution (#51).** No current use case pulling on it.
+* **Multi-cluster failover: proactive switch-back (#117).** Split out
+  of #115: needs a background polling task and its own configuration,
+  a bigger and more independent decision than the two gaps #115
+  already closed. The Java client does not do this either (see
+  `docs/adr/0017-multi-cluster-failover.md`).
 
 This intentionally does not try to move on everything at once. Each
 theme, and each item within one, lands after what it depends on, not

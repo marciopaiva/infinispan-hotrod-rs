@@ -77,7 +77,11 @@ let value = cache.get(b"key").await?;
 ```
 
 A `RemoteCache` can also register a client listener, delivered on its
-own dedicated connection as `CacheEvent`s pulled one at a time:
+own dedicated connection as `CacheEvent`s pulled one at a time. A
+later `HotRodClient::switch_to_cluster` call (or automatic failover)
+terminates it with `Error::ListenerClusterSwitched`, the same as a
+dropped connection: register a new one against the now-active
+cluster instead of expecting this one to follow:
 
 ```rust
 let mut listener = cache.listen().await?;
