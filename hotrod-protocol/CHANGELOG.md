@@ -94,6 +94,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   server-side filtering exists in this protocol, unlike cache
   listeners. See
   `docs/adr/0022-distributed-counter-listeners.md` (#113).
+- `TypedCache::query` unmarshals a whole-entity query row through the
+  cache's own value marshaller; a projected column passes through
+  unchanged as `TypedQueryRow::Columns`, since it is already
+  scalar-typed by the wire format. `MultimapCache::typed` wraps a
+  multimap cache the same way `RemoteCache::typed` does, returning a
+  `TypedMultimapCache`. See
+  `docs/adr/0023-typed-remote-query-and-multimap.md` (#111).
 
 ### Fixed
 

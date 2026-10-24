@@ -29,7 +29,7 @@ for release notes.
 | Transactions | Yes | Yes (`NON_XA`, one-phase commit only; real XA and recovery not yet implemented) |
 | Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed; value-change listeners supported) |
-| Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
+| Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise; also covers remote query and multimap cache) |
 | Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE) |
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
@@ -208,6 +208,15 @@ let removed = cache
     .await?;
 ```
 
+`typed`'s own `query` unmarshals a whole-entity row through the
+value marshaller instead of returning raw bytes; a projected column
+still comes back as `QueryValue`, since it is already scalar-typed:
+
+```rust
+let typed = cache.typed(BytesMarshaller, Utf8Marshaller);
+let result = typed.query("FROM demo.Book WHERE title = :title").execute().await?;
+```
+
 `administration` creates, removes and lists caches, no shell or REST
 access to the server needed. `CacheConfig::Template` names an
 existing template; `CacheConfig::Definition` passes a full
@@ -274,6 +283,15 @@ let tags = client.multimap_cache("tags-by-user", true);
 tags.put(b"user:42", b"admin", Expiration::Default, Expiration::Default).await?;
 tags.put(b"user:42", b"beta-tester", Expiration::Default, Expiration::Default).await?;
 let values = tags.get(b"user:42").await?; // every value stored under this key
+```
+
+`typed` wraps a `MultimapCache` the same way it wraps a
+`RemoteCache`, returning `Vec<V>` instead of `Vec<Vec<u8>>`:
+
+```rust
+let typed_tags = tags.typed(Utf8Marshaller, Utf8Marshaller);
+typed_tags.put(&"user:42".to_string(), &"admin".to_string(), Expiration::Default, Expiration::Default).await?;
+let values = typed_tags.get(&"user:42".to_string()).await?;
 ```
 
 `begin_transaction` starts a local, optimistic transaction against a

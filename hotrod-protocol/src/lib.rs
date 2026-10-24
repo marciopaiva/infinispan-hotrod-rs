@@ -64,6 +64,7 @@ mod tls;
 mod topology;
 mod transaction;
 mod typed_cache;
+mod typed_multimap;
 mod varint;
 mod wire;
 
@@ -86,7 +87,10 @@ pub use stats::{ClientStatistics, NearCacheStatistics, PoolStatistics};
 pub use streaming::{GetStream, PutStream};
 pub use tls::TlsConfig;
 pub use transaction::Transaction;
-pub use typed_cache::{TypedCache, TypedVersionedValue};
+pub use typed_cache::{
+    TypedCache, TypedQuery, TypedQueryResult, TypedQueryRow, TypedVersionedValue,
+};
+pub use typed_multimap::{TypedMultimapCache, TypedMultimapEntry};
 pub use wire::Expiration;
 
 /// Thin `pub` wrappers around a handful of otherwise `pub(crate)` wire

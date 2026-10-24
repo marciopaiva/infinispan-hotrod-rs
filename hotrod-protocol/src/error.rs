@@ -237,12 +237,13 @@ pub enum Error {
 
     /// A `Marshaller::marshall`/`unmarshall` call failed on `side`,
     /// wrapped from whatever error type that marshaller uses
-    /// (`docs/adr/0012-serialization-abstraction.md`). `TypedCache` is
-    /// the only thing that produces this; nothing byte-oriented ever
-    /// does. No `#[from]`: `TypedCache::wrap` is the only place this is
-    /// ever constructed, deliberately, so an unrelated future
-    /// `Box<dyn Error + Send + Sync>` elsewhere in the crate can never
-    /// silently convert into this variant through a bare `?`.
+    /// (`docs/adr/0012-serialization-abstraction.md`). `TypedCache`,
+    /// `TypedQuery` and `TypedMultimapCache` are the only things that
+    /// produce this; nothing byte-oriented ever does. No `#[from]`:
+    /// `wrap_marshalling_error` is the only place this is ever
+    /// constructed, deliberately, so an unrelated future `Box<dyn
+    /// Error + Send + Sync>` elsewhere in the crate can never silently
+    /// convert into this variant through a bare `?`.
     #[error("failed to marshall or unmarshall a {side}: {source}")]
     Marshalling {
         side: MarshallingSide,
@@ -266,6 +267,22 @@ impl std::fmt::Display for MarshallingSide {
             MarshallingSide::Key => "key",
             MarshallingSide::Value => "value",
         })
+    }
+}
+
+/// Wraps any marshaller error into `Error::Marshalling`, tagged with
+/// which side (`key` or `value`) it happened on. Shared by every
+/// typed wrapper (`TypedCache`, `TypedQuery`, `TypedMultimapCache`),
+/// moved here from `typed_cache.rs` once more than one needed it: see
+/// `Error::Marshalling`'s own doc comment for why nothing else is
+/// allowed to construct that variant.
+pub(crate) fn wrap_marshalling_error<E: std::error::Error + Send + Sync + 'static>(
+    side: MarshallingSide,
+    err: E,
+) -> Error {
+    Error::Marshalling {
+        side,
+        source: Box::new(err),
     }
 }
 

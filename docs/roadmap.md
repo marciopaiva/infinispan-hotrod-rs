@@ -159,6 +159,10 @@ Both items in this theme are done.
   statements, confirmed against the Java client's own source to be
   the same wire round trip as `execute`, with `hitCountAccuracy`
   forced to 1 and the affected-row count read back from `hit_count`.
+  `TypedCache::query` (#111) unmarshals whole-entity rows through the
+  cache's own value marshaller; a projected column passes through
+  unchanged, since it is already scalar-typed by the wire format. See
+  `docs/adr/0023-typed-remote-query-and-multimap.md`.
 
 ### High availability
 
@@ -208,6 +212,9 @@ individual surfaces.
   to a collection of values instead of one. Not a special cache type
   server-side: an ordinary cache, reached through its own nine
   opcodes. See `docs/adr/0016-multimap-cache.md`.
+  `MultimapCache::typed` (#111) wraps it the same way
+  `RemoteCache::typed` does, mirroring `TypedCache`'s own shape. See
+  `docs/adr/0023-typed-remote-query-and-multimap.md`.
 * ~~Distributed counters (#49)~~ (done). `HotRodClient::counters()`
   defines, inspects and lists strong (atomic, optionally bounded) and
   weak (cheaper, non-atomic) counters. Every operation goes to the

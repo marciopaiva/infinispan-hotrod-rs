@@ -12,7 +12,9 @@ use std::time::SystemTime;
 
 use crate::client::HotRodClient;
 use crate::error::Result;
+use crate::marshall::Marshaller;
 use crate::remote_cache::RemoteCache;
+use crate::typed_multimap::TypedMultimapCache;
 use crate::wire::Expiration;
 
 /// One key's values plus its entry metadata, returned by
@@ -31,7 +33,8 @@ pub struct MultimapEntry {
 
 /// A handle to one multimap cache, obtained from
 /// `HotRodClient::multimap_cache`. Byte-oriented like `RemoteCache`;
-/// no `TypedCache` integration in this phase.
+/// see `typed` for a typed wrapper
+/// (`docs/adr/0023-typed-remote-query-and-multimap.md`).
 #[derive(Clone)]
 pub struct MultimapCache {
     cache: RemoteCache,
@@ -134,5 +137,18 @@ impl MultimapCache {
         self.cache
             .multimap_contains_value(value, self.supports_duplicates)
             .await
+    }
+
+    /// Wraps this handle with a `Marshaller` pair, the multimap
+    /// counterpart of `RemoteCache::typed`
+    /// (`docs/adr/0023-typed-remote-query-and-multimap.md`). Cheap
+    /// and synchronous, like `RemoteCache::typed`: nothing here needs
+    /// a round trip to set up.
+    pub fn typed<MK: Marshaller, MV: Marshaller>(
+        &self,
+        key_marshaller: MK,
+        value_marshaller: MV,
+    ) -> TypedMultimapCache<MK, MV> {
+        TypedMultimapCache::new(self.clone(), key_marshaller, value_marshaller)
     }
 }

@@ -23,17 +23,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::connection::VersionedResult;
-use crate::error::{Error, MarshallingSide, Result};
+use crate::error::{wrap_marshalling_error as wrap, MarshallingSide, Result};
 use crate::marshall::Marshaller;
+use crate::query::{Query, QueryRow, QueryValue};
 use crate::remote_cache::RemoteCache;
 use crate::wire::Expiration;
-
-fn wrap<E: std::error::Error + Send + Sync + 'static>(side: MarshallingSide, err: E) -> Error {
-    Error::Marshalling {
-        side,
-        source: Box::new(err),
-    }
-}
 
 /// `VersionedValue`'s typed equivalent: `get_with_version`'s metadata,
 /// with `value: V` instead of `Vec<u8>`. A separate type rather than
@@ -268,11 +262,106 @@ impl<MK: Marshaller, MV: Marshaller> TypedCache<MK, MV> {
             .put_all(entry_bytes_list, lifespan, max_idle)
             .await
     }
+
+    /// `RemoteCache::query`'s typed counterpart
+    /// (`docs/adr/0023-typed-remote-query-and-multimap.md`): named
+    /// parameters stay `QueryValue` (a query's own Ickle types have
+    /// no relationship to this cache's key type, so there is nothing
+    /// for `MK` to marshal here), but a whole-entity row
+    /// (`QueryRow::Entity`) is unmarshalled through this cache's own
+    /// value marshaller. A projected row (`QueryRow::Columns`) is
+    /// already scalar-typed by the wire format and passes through
+    /// unchanged.
+    pub fn query(&self, query: impl Into<String>) -> TypedQuery<'_, MV> {
+        TypedQuery {
+            query: self.cache.query(query),
+            value_marshaller: self.value_marshaller.clone(),
+        }
+    }
+}
+
+/// `QueryRow`'s typed counterpart: `Entity`'s bytes already decoded
+/// through a `TypedQuery`'s own value marshaller; `Columns` carries
+/// the exact same `QueryValue`s `QueryRow::Columns` would, since a
+/// projection is already scalar-typed by the wire format, with
+/// nothing for a `Marshaller` to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedQueryRow<V> {
+    Entity(V),
+    Columns(Vec<QueryValue>),
+}
+
+/// `QueryResult`'s typed counterpart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedQueryResult<V> {
+    pub rows: Vec<TypedQueryRow<V>>,
+    pub hit_count: u32,
+    pub hit_count_exact: bool,
+}
+
+/// A query against one `TypedCache`'s entries, built with
+/// `TypedCache::query`. Only generic over `MV`: see `query`'s own doc
+/// comment for why a query's named parameters have nothing to do
+/// with this cache's key marshaller.
+pub struct TypedQuery<'a, MV: Marshaller> {
+    query: Query<'a>,
+    value_marshaller: Arc<MV>,
+}
+
+impl<'a, MV: Marshaller> TypedQuery<'a, MV> {
+    /// Same as `Query::param`: named parameters are not marshalled,
+    /// they are already `QueryValue`.
+    pub fn param(mut self, name: impl Into<String>, value: QueryValue) -> Self {
+        self.query = self.query.param(name, value);
+        self
+    }
+
+    /// Same as `Query::start_offset`.
+    pub fn start_offset(mut self, start_offset: i64) -> Self {
+        self.query = self.query.start_offset(start_offset);
+        self
+    }
+
+    /// Same as `Query::max_results`.
+    pub fn max_results(mut self, max_results: i32) -> Self {
+        self.query = self.query.max_results(max_results);
+        self
+    }
+
+    /// Runs the query, unmarshalling every `QueryRow::Entity` through
+    /// this query's own value marshaller; a `QueryRow::Columns`
+    /// passes through as `TypedQueryRow::Columns` unchanged.
+    pub async fn execute(self) -> Result<TypedQueryResult<MV::Value>> {
+        let result = self.query.execute().await?;
+        let mut rows = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            rows.push(match row {
+                QueryRow::Entity(bytes) => TypedQueryRow::Entity(
+                    self.value_marshaller
+                        .unmarshall(&bytes)
+                        .map_err(|err| wrap(MarshallingSide::Value, err))?,
+                ),
+                QueryRow::Columns(columns) => TypedQueryRow::Columns(columns),
+            });
+        }
+        Ok(TypedQueryResult {
+            rows,
+            hit_count: result.hit_count,
+            hit_count_exact: result.hit_count_exact,
+        })
+    }
+
+    /// Same as `Query::execute_statement`: no value involved, so this
+    /// passes through unchanged rather than needing a typed result.
+    pub async fn execute_statement(self) -> Result<u32> {
+        self.query.execute_statement().await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use std::collections::HashMap as StdHashMap;
     use std::sync::RwLock;
     use std::time::Duration;
@@ -591,5 +680,179 @@ mod tests {
         assert_eq!(result, None);
 
         owner_task.await.unwrap();
+    }
+
+    /// `TypedCache::query` (`docs/adr/0023-typed-remote-query-and-multimap.md`):
+    /// a whole-entity row (`QueryRow::Entity`) is unmarshalled through
+    /// this cache's own value marshaller.
+    #[tokio::test]
+    async fn typed_query_execute_unmarshalls_whole_entities() {
+        use crate::query::test_support::{query_response_bytes, wrapped_entity_bytes};
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+
+            let response = query_response_bytes(
+                0,
+                &[wrapped_entity_bytes("org.example.Greeting", b"hello")],
+                1,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let typed = client
+            .cache("my-cache")
+            .typed(BytesMarshaller, Utf8Marshaller);
+
+        let result = typed
+            .query("FROM org.example.Greeting")
+            .execute()
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(
+            result.rows,
+            vec![TypedQueryRow::Entity("hello".to_string())]
+        );
+        assert_eq!(result.hit_count, 1);
+
+        seed_task.await.unwrap();
+    }
+
+    /// A projected column (`QueryRow::Columns`) is already
+    /// scalar-typed by the wire format: it passes through as
+    /// `TypedQueryRow::Columns` unchanged, with no marshaller
+    /// involved.
+    #[tokio::test]
+    async fn typed_query_execute_passes_projected_columns_through_unchanged() {
+        use crate::query::test_support::{query_response_bytes, wrapped_scalar_bytes};
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+
+            let response = query_response_bytes(
+                1,
+                &[wrapped_scalar_bytes(&QueryValue::String(
+                    "Alice".to_string(),
+                ))],
+                1,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let typed = client
+            .cache("my-cache")
+            .typed(BytesMarshaller, Utf8Marshaller);
+
+        let result = typed
+            .query("SELECT name FROM org.example.Greeting")
+            .execute()
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(
+            result.rows,
+            vec![TypedQueryRow::Columns(vec![QueryValue::String(
+                "Alice".to_string()
+            )])]
+        );
+
+        seed_task.await.unwrap();
+    }
+
+    /// `TypedQuery::execute_statement` has no value to unmarshal, so
+    /// it passes `Query::execute_statement`'s own `u32` through
+    /// unchanged.
+    #[tokio::test]
+    async fn typed_query_execute_statement_passes_through_the_affected_count() {
+        use crate::query::test_support::query_response_bytes;
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+
+            let response = query_response_bytes(0, &[], 3);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let typed = client
+            .cache("my-cache")
+            .typed(BytesMarshaller, Utf8Marshaller);
+
+        let affected = typed
+            .query("DELETE FROM org.example.Greeting")
+            .execute_statement()
+            .await
+            .expect("execute_statement should succeed");
+
+        assert_eq!(affected, 3);
+
+        seed_task.await.unwrap();
+    }
+
+    /// A failing value marshaller on a whole-entity row surfaces as
+    /// `Error::Marshalling`, the same guarantee `TypedCache`'s own
+    /// `get`/`put` already have.
+    #[tokio::test]
+    async fn typed_query_execute_surfaces_a_failing_value_marshaller() {
+        use crate::query::test_support::{query_response_bytes, wrapped_entity_bytes};
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+
+            let response = query_response_bytes(
+                0,
+                &[wrapped_entity_bytes("org.example.Greeting", b"hello")],
+                1,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let typed = client
+            .cache("my-cache")
+            .typed(BytesMarshaller, FailingMarshaller);
+
+        let result = typed.query("FROM org.example.Greeting").execute().await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Marshalling {
+                side: MarshallingSide::Value,
+                ..
+            })
+        ));
+
+        seed_task.await.unwrap();
     }
 }
