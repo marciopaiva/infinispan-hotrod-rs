@@ -1425,6 +1425,56 @@ async fn multicluster_switch_to_cluster_moves_traffic_to_an_independent_server()
     );
 }
 
+/// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`: a real
+/// listener, registered against the primary cluster, must stop with a
+/// terminal `Error::ListenerClusterSwitched` once `switch_to_cluster`
+/// moves this client to the DR server, confirming the fake-server unit
+/// test (`listener::tests::next_returns_a_terminal_error_once_the_cluster_generation_changes`)
+/// against a real connection to a real, otherwise perfectly healthy
+/// server: nothing about the connection itself fails here, only this
+/// client's own choice to stop trusting it.
+#[tokio::test]
+#[ignore]
+async fn multicluster_switch_to_cluster_terminates_a_listener_on_the_old_cluster() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+    client
+        .add_cluster("dr", vec![multicluster_dr_addr()])
+        .expect("add_cluster should succeed");
+
+    let mut listener = client
+        .cache("")
+        .listen()
+        .await
+        .expect("listen against the primary cluster");
+
+    client
+        .switch_to_cluster("dr")
+        .expect("switch_to_cluster should succeed");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await
+        .expect("the switch must terminate the listener promptly, not hang");
+    assert!(
+        matches!(event, Some(Err(Error::ListenerClusterSwitched))),
+        "expected a terminal ListenerClusterSwitched error, got {event:?}"
+    );
+
+    client
+        .switch_to_cluster(HotRodClient::DEFAULT_CLUSTER_NAME)
+        .expect("switch_to_cluster back to the primary should succeed");
+}
+
 #[tokio::test]
 #[ignore]
 async fn cluster_contains_key_reflects_presence() {

@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, BufStream};
+use tokio::sync::watch;
 
 use crate::connection::{with_timeout, HotRodConnection, DEFAULT_TOPOLOGY_ID};
 use crate::error::{Error, Result};
@@ -183,6 +184,12 @@ pub struct CacheListener {
     /// kind of desynced state if the next call just started reading a
     /// fresh frame from the middle of the abandoned one.
     poisoned: bool,
+    /// The cluster-switch generation watched for, so `next` can tell a
+    /// switch away from this listener's own cluster
+    /// (`HotRodClient::switch_to_cluster`, or automatic failover)
+    /// apart from one that never happened. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    generation_rx: watch::Receiver<u64>,
 }
 
 /// Writes a factory's parameter count (a single wire byte, the
@@ -228,6 +235,7 @@ impl CacheListener {
         cache_name: &[u8],
         timeout: Duration,
         options: &ListenOptions,
+        generation_rx: watch::Receiver<u64>,
     ) -> Result<Self> {
         let mut listener_id = vec![0u8; 16];
         rand::thread_rng().fill_bytes(&mut listener_id);
@@ -248,6 +256,7 @@ impl CacheListener {
             cache_name: cache_name.to_vec(),
             timeout,
             poisoned: false,
+            generation_rx,
         })
     }
 
@@ -260,6 +269,21 @@ impl CacheListener {
     /// listener's timeout: waiting for the next event is the normal
     /// state of a listener, not a hung request the way every other wait
     /// in this crate is.
+    ///
+    /// Also races the read against `generation_rx` changing: if
+    /// `HotRodClient::switch_to_cluster` (or automatic failover)
+    /// switches this client away from the cluster this listener was
+    /// registered against, this returns a terminal
+    /// `Error::ListenerClusterSwitched` instead of waiting on a
+    /// connection that may still be healthy but no longer has anything
+    /// to do with the cluster this client now routes against. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`. If
+    /// the client (and with it, the generation channel's sender) has
+    /// since been dropped entirely, `changed()` resolves to an `Err`
+    /// tokio's own `select!` does not match against: that branch is
+    /// simply disabled for this call, falling back to waiting on the
+    /// read alone, rather than busy-looping on an `Err` that would
+    /// otherwise resolve again immediately on every repoll.
     pub async fn next(&mut self) -> Option<Result<CacheEvent>> {
         if self.poisoned {
             return Some(Err(Error::PoisonedConnection));
@@ -269,10 +293,17 @@ impl CacheListener {
         // client is committed to that frame, and `poisoned` stays set
         // until it is parsed in full, so neither a later clean close nor
         // this call being dropped mid-frame is ever mistaken for one.
-        let magic = match self.stream.read_u8().await {
-            Ok(byte) => byte,
-            Err(io_err) if io_err.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(io_err) => return Some(Err(Error::Io(io_err))),
+        let magic = tokio::select! {
+            biased;
+            Ok(()) = self.generation_rx.changed() => {
+                self.poisoned = true;
+                return Some(Err(Error::ListenerClusterSwitched));
+            }
+            byte = self.stream.read_u8() => match byte {
+                Ok(byte) => byte,
+                Err(io_err) if io_err.kind() == io::ErrorKind::UnexpectedEof => return None,
+                Err(io_err) => return Some(Err(Error::Io(io_err))),
+            },
         };
         self.poisoned = true;
         let result = read_event_after_magic(&mut self.stream, magic, &self.listener_id).await;
@@ -493,6 +524,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -551,9 +583,15 @@ pub(crate) mod tests {
             raw_data: true,
             ..Default::default()
         };
-        CacheListener::register(conn, b"my-cache", Duration::from_secs(5), &options)
-            .await
-            .expect("register");
+        CacheListener::register(
+            conn,
+            b"my-cache",
+            Duration::from_secs(5),
+            &options,
+            watch::channel(0).1,
+        )
+        .await
+        .expect("register");
 
         server.await.unwrap();
     }
@@ -584,6 +622,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -644,6 +683,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -677,6 +717,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -684,6 +725,54 @@ pub(crate) mod tests {
         assert!(listener.next().await.is_none());
 
         server.await.unwrap();
+    }
+
+    /// `HotRodClient::switch_to_cluster` (or automatic failover) bumps
+    /// the generation this listener watches; `next` must notice that
+    /// promptly and stop, even though the connection itself is left
+    /// completely untouched (the fake server here never closes it or
+    /// sends anything), rather than waiting forever on a connection
+    /// that still works but no longer has anything to do with the
+    /// cluster this client now routes against. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    #[tokio::test]
+    async fn next_returns_a_terminal_error_once_the_cluster_generation_changes() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let (id, _listener_id) = read_listener_id(&mut stream).await;
+            let resp = response_header(id, 0x26, 0x00);
+            stream.write_all(&resp).await.unwrap();
+            // Never closes or writes anything else: the connection
+            // stays open and healthy for as long as the test runs.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let conn = HotRodConnection::connect(addr, "my-cache").await.unwrap();
+        let (generation_tx, generation_rx) = watch::channel(0u64);
+        let mut listener = CacheListener::register(
+            conn,
+            b"my-cache",
+            Duration::from_secs(5),
+            &ListenOptions::default(),
+            generation_rx,
+        )
+        .await
+        .expect("register");
+
+        generation_tx.send_modify(|generation| *generation += 1);
+
+        assert!(matches!(
+            listener.next().await,
+            Some(Err(Error::ListenerClusterSwitched))
+        ));
+        // No reconnection, the same as every other terminal cause: a
+        // second call is a poisoned connection, not another read.
+        assert!(matches!(
+            listener.next().await,
+            Some(Err(Error::PoisonedConnection))
+        ));
     }
 
     #[tokio::test]
@@ -711,6 +800,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -756,6 +846,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -803,6 +894,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");
@@ -842,8 +934,14 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let result =
-            CacheListener::register(conn, b"my-cache", Duration::from_secs(5), &options).await;
+        let result = CacheListener::register(
+            conn,
+            b"my-cache",
+            Duration::from_secs(5),
+            &options,
+            watch::channel(0).1,
+        )
+        .await;
         match result {
             Err(
                 err @ Error::BatchTooLarge {
@@ -881,6 +979,7 @@ pub(crate) mod tests {
             b"my-cache",
             Duration::from_secs(5),
             &ListenOptions::default(),
+            watch::channel(0).1,
         )
         .await
         .expect("register");

@@ -66,6 +66,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Real XA (two-phase commit, recovery) is out of scope for this
   phase. See `docs/adr/0018-transactions-non-xa-one-phase.md` (#47).
 
+### Fixed
+
+- Multi-cluster failover: a `switch_to_cluster` call (or automatic
+  failover) now terminates every `CacheListener` (raw, or inside a
+  `NearCachedCache`) registered against the cluster being left
+  behind, instead of leaving it to silently keep receiving events
+  from (or, for a near cache, trusting an invalidation feed from) a
+  cluster that no longer has anything to do with the one this client
+  now routes against. New error: `Error::ListenerClusterSwitched`.
+  Also drains the old cluster's own connection pools, including its
+  former active seed, which previously leaked for the rest of the
+  client's lifetime. See
+  `docs/adr/0019-multicluster-listener-and-pool-cleanup.md` (#115).
+
 ## [0.6.0] - 2026-10-10
 
 ### Added

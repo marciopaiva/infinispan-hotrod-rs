@@ -876,6 +876,58 @@ mod tests {
             server.await.unwrap();
         }
 
+        /// The correctness risk this fixes
+        /// (`docs/adr/0019-multicluster-listener-and-pool-cleanup.md`):
+        /// without it, a near cache would keep serving values read
+        /// from the cluster it just switched *to*, invalidated only by
+        /// events from the cluster it switched *away from*, which have
+        /// nothing to do with each other. `switch_to_cluster` must kill
+        /// the feed itself, not rely on the old connection dying on its
+        /// own (it never does here: `server_a` hands its listener
+        /// socket back still open, and the test only drops it after
+        /// the switch has already taken effect).
+        #[tokio::test]
+        async fn switching_clusters_stops_the_local_cache_from_being_used() {
+            let tcp_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr_a = tcp_a.local_addr().unwrap();
+            let tcp_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr_b = tcp_b.local_addr().unwrap();
+
+            let server_a = tokio::spawn(async move {
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp_a).await;
+                let (mut op_sock, _) = tcp_a.accept().await.unwrap();
+                serve_get(&mut op_sock, b"value").await;
+                listen_sock
+            });
+            let server_b = tokio::spawn(async move {
+                let (mut op_sock, _) = tcp_b.accept().await.unwrap();
+                serve_get(&mut op_sock, b"value-after-switch").await;
+            });
+
+            let client = client_with_seed(addr_a);
+            client.add_cluster("dr", vec![addr_b]).expect("add_cluster");
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            client
+                .switch_to_cluster("dr")
+                .expect("switch_to_cluster should succeed");
+
+            // Every `get` from here on routes to the new cluster
+            // (`addr_b`) and must not be served from the stale local
+            // entry the old cluster's `value` populated.
+            let after_switch = poll_until(&near, b"key", b"value-after-switch").await;
+            assert_eq!(after_switch, b"value-after-switch");
+
+            drop(server_a.await.unwrap());
+            server_b.await.unwrap();
+        }
+
         /// `put`'s write times out (the server never responds), yet the
         /// local entry is still invalidated: the timed-out connection is
         /// not returned to the pool, so the next `get` opens a new one.

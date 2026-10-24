@@ -45,6 +45,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::net::lookup_host;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::connection::{HotRodConnection, DEFAULT_TIMEOUT, DEFAULT_TOPOLOGY_ID};
@@ -240,6 +241,17 @@ pub(crate) struct ClientInner {
     /// to find the seeds of whichever cluster becomes active next. See
     /// `docs/adr/0017-multi-cluster-failover.md`.
     pub(crate) clusters: RwLock<Vec<(String, Vec<SocketAddr>)>>,
+    /// Bumped by one on every cluster switch, manual
+    /// (`switch_to_cluster`) or automatic (`try_promote_seed`'s switch
+    /// branch). `CacheListener::register` subscribes to this and
+    /// captures the value current at registration time, so its `next`
+    /// can tell a later switch apart from the cluster it was
+    /// registered against and stop reading from an abandoned cluster's
+    /// connection instead of silently continuing to trust it. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`. Only
+    /// `subscribe()`'s `Receiver` is ever read; the `Sender`'s own
+    /// current value is never inspected directly.
+    pub(crate) cluster_generation: watch::Sender<u64>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation
@@ -421,6 +433,7 @@ impl HotRodClient {
                             Self::DEFAULT_CLUSTER_NAME.to_string(),
                             seed_addrs.to_vec(),
                         )]),
+                        cluster_generation: watch::channel(0).0,
                     })));
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -582,6 +595,21 @@ impl HotRodClient {
     /// ownership has nothing to do with the one just left behind, the
     /// same reason `try_failover_to_live_cluster` resets it on an
     /// automatic switch.
+    ///
+    /// Also drains every pool the old cluster owned
+    /// (`evict_abandoned_cluster`) and bumps `cluster_generation`, so
+    /// any `CacheListener` (raw, or wrapped in a `NearCachedCache`)
+    /// registered against the cluster just left behind stops reading
+    /// from it instead of silently continuing to trust a feed that no
+    /// longer has anything to do with the cluster this client now
+    /// routes against. The bump happens while `active`'s write lock is
+    /// still held, not after releasing it: `active_seed_and_generation`
+    /// reads the seed and subscribes to the generation together under
+    /// one read-lock acquisition, so pairing the write side the same
+    /// way is what actually makes that combined read atomic relative to
+    /// a switch, rather than just moving the race from one pair of
+    /// reads to another. Found by review before merge: see
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
     pub fn switch_to_cluster(&self, name: &str) -> Result<()> {
         let clusters = self.0.clusters.read().unwrap_or_else(|p| p.into_inner());
         let (name, seed_addrs) = clusters
@@ -593,12 +621,23 @@ impl HotRodClient {
         let &active_seed_addr = seed_addrs.first().ok_or_else(|| {
             Error::InvalidClusterConfig(format!("cluster {name:?} has no seed addresses"))
         })?;
-        *self.0.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveCluster {
-            name,
-            seed_addrs,
-            active_seed_addr,
-            topology: None,
+        let old = {
+            let mut active = self.0.active.write().unwrap_or_else(|p| p.into_inner());
+            let old = std::mem::replace(
+                &mut *active,
+                ActiveCluster {
+                    name,
+                    seed_addrs,
+                    active_seed_addr,
+                    topology: None,
+                },
+            );
+            self.0
+                .cluster_generation
+                .send_modify(|generation| *generation += 1);
+            old
         };
+        self.evict_abandoned_cluster(&old);
         // A different cluster's nodes failing recently has nothing to
         // do with this one's own health.
         self.0.node_health.clear_all();
@@ -617,6 +656,34 @@ impl HotRodClient {
             .clone()
     }
 
+    /// The active seed address and a fresh subscription to this
+    /// client's cluster-switch generation counter, read together under
+    /// one acquisition of `active`'s read lock. `pub(crate)`:
+    /// `RemoteCache::listen_with` dials the returned seed and hands the
+    /// receiver to `CacheListener::register`, which captures its
+    /// current value and watches for it changing later, so a listener
+    /// can tell a switch away from the cluster it was registered
+    /// against apart from one that never happened.
+    ///
+    /// Reading these two as separate calls (seed first, subscribe
+    /// later, with the dial itself in between) would reopen exactly
+    /// the race this exists to close: `switch_to_cluster`/
+    /// `try_promote_seed`'s switch branch bump the generation while
+    /// still holding `active`'s write lock, so a read lock acquired
+    /// here either observes the old seed with a pre-bump generation
+    /// (the later bump then correctly arrives as a change) or the new
+    /// seed with the matching post-bump generation (no spurious change
+    /// for the switch this listener is already correctly aligned
+    /// with), never a mix of the two. Found by review before merge:
+    /// see `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    pub(crate) fn active_seed_addr_and_generation(&self) -> (SocketAddr, watch::Receiver<u64>) {
+        let active = self.0.active.read().unwrap_or_else(|p| p.into_inner());
+        (
+            active.active_seed_addr,
+            self.0.cluster_generation.subscribe(),
+        )
+    }
+
     /// Shared by `failover_seed` (tries the rest of the active
     /// cluster's own seeds) and `try_failover_to_live_cluster` (tries
     /// another cluster's seeds): dials each of `candidates` in order,
@@ -629,7 +696,11 @@ impl HotRodClient {
     /// list, active seed, topology reset to `None`) is replaced in
     /// one write, not as separate field updates (`ActiveCluster`'s
     /// own docs); `failover_seed` passes `None` since it never leaves
-    /// the active cluster, so only `active_seed_addr` changes.
+    /// the active cluster, so only `active_seed_addr` changes. A real
+    /// switch also drains the old cluster's pools and bumps
+    /// `cluster_generation`, the same cleanup `switch_to_cluster`
+    /// itself performs: see its own docs and
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
     async fn try_promote_seed(
         &self,
         cache_name: &str,
@@ -685,21 +756,35 @@ impl HotRodClient {
                 last_err = Some(Error::Timeout(timeout));
                 continue;
             }
-            {
+            let switched_from = {
                 let mut active = self.0.active.write().unwrap_or_else(|p| p.into_inner());
                 match switch_to_cluster_name {
                     Some(name) => {
-                        *active = ActiveCluster {
-                            name: name.to_string(),
-                            seed_addrs: candidates.to_vec(),
-                            active_seed_addr: addr,
-                            topology: None,
-                        };
+                        let old = std::mem::replace(
+                            &mut *active,
+                            ActiveCluster {
+                                name: name.to_string(),
+                                seed_addrs: candidates.to_vec(),
+                                active_seed_addr: addr,
+                                topology: None,
+                            },
+                        );
+                        // Bumped while `active`'s write lock is still
+                        // held: see `switch_to_cluster`'s own docs for
+                        // why.
+                        self.0
+                            .cluster_generation
+                            .send_modify(|generation| *generation += 1);
+                        Some(old)
                     }
-                    None => active.active_seed_addr = addr,
+                    None => {
+                        active.active_seed_addr = addr;
+                        None
+                    }
                 }
-            }
-            if switch_to_cluster_name.is_some() {
+            };
+            if let Some(old) = &switched_from {
+                self.evict_abandoned_cluster(old);
                 // A different cluster's nodes failing recently has
                 // nothing to do with this one's own health.
                 self.0.node_health.clear_all();
@@ -1194,11 +1279,7 @@ impl HotRodClient {
             active.topology = Some(new_topology.clone());
             active.active_seed_addr
         };
-        let mut node_origin = self
-            .0
-            .node_origin
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
+        let node_origin = self.0.node_origin.read().unwrap_or_else(|p| p.into_inner());
         let stale_addrs: Vec<SocketAddr> = node_origin
             .iter()
             .filter(|(&addr, origin)| {
@@ -1209,23 +1290,68 @@ impl HotRodClient {
             })
             .map(|(&addr, _)| addr)
             .collect();
-        if stale_addrs.is_empty() {
+        drop(node_origin);
+        self.evict_pools_for(&stale_addrs);
+    }
+
+    /// Closes and removes every pool for an address in `addrs`, across
+    /// every cache name, and drops the matching `node_origin` entries.
+    /// Shared by `record_topology_update` (an address whose origin
+    /// server left the topology) and `evict_abandoned_cluster` (every
+    /// address a cluster just switched away from owned): neither case
+    /// has any further use for a pool to one of these addresses, since
+    /// in the first case the node left the cluster, and in the second
+    /// the cluster itself is no longer the active one. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    fn evict_pools_for(&self, addrs: &[SocketAddr]) {
+        if addrs.is_empty() {
             return;
         }
-        for addr in &stale_addrs {
-            node_origin.remove(addr);
-        }
-        drop(node_origin);
+        self.0
+            .node_origin
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|addr, _| !addrs.contains(addr));
+        self.0
+            .pools
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(pool_addr, _cache_name), pool| {
+                if addrs.contains(pool_addr) {
+                    pool.close();
+                    false
+                } else {
+                    true
+                }
+            });
+    }
 
-        let mut pools = self.0.pools.write().unwrap_or_else(|p| p.into_inner());
-        pools.retain(|(pool_addr, _cache_name), pool| {
-            if stale_addrs.contains(pool_addr) {
-                pool.close();
-                false
-            } else {
-                true
-            }
-        });
+    /// Drains every pool `old` owned: its own seed list, plus whatever
+    /// topology addresses had already been resolved against it.
+    /// Called right after a cluster switch (manual or automatic)
+    /// replaces `old` as the active cluster, since none of its
+    /// addresses belong to the cluster now active. Unlike
+    /// `record_topology_update`'s own node-left-the-cluster cleanup,
+    /// nothing here is protected as "the active seed": by the time
+    /// this runs, `old`'s own seed is no longer active at all. If two
+    /// clusters happen to share an address (an unusual configuration),
+    /// that address's pool is closed anyway; the Java client's own
+    /// "discard and rediscover" switch behavior does not special-case
+    /// this either. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    fn evict_abandoned_cluster(&self, old: &ActiveCluster) {
+        let mut addrs = old.seed_addrs.clone();
+        if let Some(topology) = &old.topology {
+            addrs.extend(
+                topology
+                    .resolved_addrs
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .values()
+                    .copied(),
+            );
+        }
+        self.evict_pools_for(&addrs);
     }
 }
 
@@ -1333,6 +1459,7 @@ pub(crate) mod tests {
                 HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 vec![],
             )]),
+            cluster_generation: watch::channel(0).0,
         });
 
         assert_eq!(client.max_retries(), DEFAULT_MAX_RETRIES);
@@ -1375,6 +1502,7 @@ pub(crate) mod tests {
                 HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 vec![seed_addr],
             )]),
+            cluster_generation: watch::channel(0).0,
         })
     }
 
@@ -1458,6 +1586,63 @@ pub(crate) mod tests {
         assert_eq!(
             client.inner().active.read().unwrap().active_seed_addr,
             original_seed
+        );
+    }
+
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`: a
+    /// switch must bump `cluster_generation` (so a registered
+    /// `CacheListener` notices) and drain every pool the old cluster
+    /// owned, including its own seed, which `record_topology_update`'s
+    /// own cleanup deliberately never touches (there, it is still the
+    /// active seed; here, by the time this runs, it no longer is).
+    #[tokio::test]
+    async fn switch_to_cluster_bumps_generation_and_drains_the_old_cluster_s_pools() {
+        let original_seed: SocketAddr = unreachable_addr().await;
+        let dr_seed: SocketAddr = unreachable_addr().await;
+        let client = client_for_cluster_tests(original_seed);
+        client
+            .add_cluster("dr", vec![dr_seed])
+            .expect("add_cluster should succeed");
+
+        // Populate a pool for the original seed, the same way a real
+        // operation would have, so there is something for the switch
+        // to drain.
+        client.inner().pools.write().unwrap().insert(
+            (original_seed, "my-cache".to_string()),
+            Arc::new(ConnectionPool::new(1)),
+        );
+
+        let (_, generation_rx) = client.active_seed_addr_and_generation();
+        assert!(
+            !generation_rx.has_changed().unwrap_or(false),
+            "no switch has happened yet"
+        );
+
+        client
+            .switch_to_cluster("dr")
+            .expect("switch_to_cluster should succeed");
+
+        assert!(
+            generation_rx.has_changed().unwrap(),
+            "switch_to_cluster must bump cluster_generation"
+        );
+        assert!(
+            client.pool_statistics().is_empty(),
+            "the old cluster's pool must be drained on switch"
+        );
+
+        // A combined read taken after the switch has fully completed
+        // must see the new seed paired with the already-bumped
+        // generation, never the new seed with a stale baseline (which
+        // would make a listener registering right now miss this
+        // switch): review before merge found `listen_with` doing these
+        // two reads separately, with the dial in between, reopening
+        // exactly this race.
+        let (seed_after, generation_rx_after) = client.active_seed_addr_and_generation();
+        assert_eq!(seed_after, dr_seed);
+        assert!(
+            !generation_rx_after.has_changed().unwrap_or(false),
+            "a subscription taken after the switch already completed must not see it as a pending change"
         );
     }
 
@@ -1782,6 +1967,7 @@ pub(crate) mod tests {
                 HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 vec![seed_addr],
             )]),
+            cluster_generation: watch::channel(0).0,
         });
 
         client
@@ -1869,6 +2055,7 @@ pub(crate) mod tests {
                 HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 vec![seed_addr],
             )]),
+            cluster_generation: watch::channel(0).0,
         });
 
         client
@@ -1926,6 +2113,7 @@ pub(crate) mod tests {
                 HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 vec![dead_addr],
             )]),
+            cluster_generation: watch::channel(0).0,
         });
 
         // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed

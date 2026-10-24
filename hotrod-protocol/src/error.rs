@@ -132,6 +132,21 @@ pub enum Error {
     #[error("server-side iteration cursor is no longer known to the server")]
     InvalidIteration,
 
+    /// `CacheListener::next` stopped reading from its connection
+    /// because `HotRodClient::switch_to_cluster` (or automatic
+    /// failover) switched this client away from the cluster this
+    /// listener was registered against. The connection itself was
+    /// never touched and may still be perfectly healthy; a listener
+    /// never migrates across a cluster switch, the same "no
+    /// reconnection" decision already made for a dropped connection
+    /// (`docs/adr/0006-client-listeners.md`). Register a new listener
+    /// against the now-active cluster instead. See
+    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    #[error(
+        "listener's cluster was switched away from; register a new listener against the current cluster instead"
+    )]
+    ListenerClusterSwitched,
+
     #[error("SCRAM server verification failed: the server's final signature did not match")]
     ScramServerVerificationFailed,
 
