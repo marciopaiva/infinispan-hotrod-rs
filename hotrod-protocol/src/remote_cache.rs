@@ -527,6 +527,7 @@ impl RemoteCache {
             self.cache_name.as_bytes(),
             self.client.timeout(),
             options,
+            self.client.subscribe_cluster_generation(),
         )
         .await
     }
@@ -1339,6 +1340,7 @@ pub(crate) mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::watch;
 
     use crate::client::tests::{
         read_request_opcode, response_header, response_header_with_topology, serve_plain_auth,
@@ -1375,6 +1377,7 @@ pub(crate) mod tests {
                 HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 seed_addrs.clone(),
             )]),
+            cluster_generation: watch::channel(0).0,
             active: RwLock::new(ActiveCluster {
                 name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 seed_addrs,
