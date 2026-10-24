@@ -162,6 +162,120 @@ impl<'a> Administration<'a> {
             .await?;
         parse_json_string_array(&response)
     }
+
+    /// `name`-only task, shared by `reindex_cache`/`update_index_schema`:
+    /// confirmed against the Java client's own `reindexCache`/
+    /// `updateIndexSchema` (`RemoteCacheManagerAdminImpl.java`) to send
+    /// just `name`, never `flags` (`Collections.singletonMap`, not the
+    /// `flags`-aware map every other task in this file uses). The
+    /// response body is a JSON string, same as every other task here,
+    /// discarded unread: the Java client's own callers discard it too.
+    async fn exec_name_only(&self, task_name: &str, name: &str) -> Result<()> {
+        self.exec_cache()
+            .run_exec(
+                task_name.to_string(),
+                vec![("name".to_string(), name.as_bytes().to_vec())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Triggers a full reindex of `name`'s indexed data. Long-running
+    /// server-side; this crate has no per-call timeout override
+    /// anywhere (`HotRodClient::set_timeout` is client-wide), so
+    /// neither this nor `update_index_schema` gets one either, unlike
+    /// the Java client's own timeout-overloaded variants, which never
+    /// send anything extra to the server for it either way.
+    pub async fn reindex_cache(&self, name: &str) -> Result<()> {
+        self.exec_name_only("@@cache@reindex", name).await
+    }
+
+    /// Updates `name`'s index schema to match its current indexed
+    /// entity definitions, without a full reindex.
+    pub async fn update_index_schema(&self, name: &str) -> Result<()> {
+        self.exec_name_only("@@cache@updateindexschema", name).await
+    }
+
+    /// Updates a single configuration attribute of the already-running
+    /// cache `name` (e.g. `"clustering.remote-timeout"`), without
+    /// restarting it. Confirmed against the Java client's own
+    /// `updateConfigurationAttribute`.
+    pub async fn update_configuration_attribute(
+        &self,
+        name: &str,
+        attribute: &str,
+        value: &str,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("name".to_string(), name.as_bytes().to_vec()),
+            ("attribute".to_string(), attribute.as_bytes().to_vec()),
+            ("value".to_string(), value.as_bytes().to_vec()),
+        ];
+        if let Some(flags) = self.flags_param() {
+            params.push(flags);
+        }
+        self.exec_cache()
+            .run_exec("@@cache@updateConfigurationAttribute".to_string(), params)
+            .await?;
+        Ok(())
+    }
+
+    /// Makes `cache_name` also reachable as `alias_name`. Matches the
+    /// Java client's own `assignAlias(aliasName, cacheName)` argument
+    /// order; the wire parameter names are `name`
+    /// (confirmed against `RemoteCacheManagerAdminImpl.ALIAS_NAME`/
+    /// `CACHE_NAME`: the cache being aliased) and `alias` (the alias
+    /// itself).
+    pub async fn assign_alias(&self, alias_name: &str, cache_name: &str) -> Result<()> {
+        let mut params = vec![
+            ("name".to_string(), cache_name.as_bytes().to_vec()),
+            ("alias".to_string(), alias_name.as_bytes().to_vec()),
+        ];
+        if let Some(flags) = self.flags_param() {
+            params.push(flags);
+        }
+        self.exec_cache()
+            .run_exec("@@cache@assignAlias".to_string(), params)
+            .await?;
+        Ok(())
+    }
+
+    /// Defines a cache template named `name`, from `configuration` (a
+    /// full configuration document, a bare fragment, JSON or YAML;
+    /// same auto-detection as `CacheConfig::Definition`) if given, or
+    /// the server's own default otherwise: confirmed against the Java
+    /// client's own `createTemplate`, which accepts a nullable
+    /// configuration. Unlike `create_cache`, there is no way to base a
+    /// template on another already-defined template through this
+    /// task.
+    pub async fn create_template(&self, name: &str, configuration: Option<&str>) -> Result<()> {
+        let mut params = vec![("name".to_string(), name.as_bytes().to_vec())];
+        if let Some(configuration) = configuration {
+            params.push((
+                "configuration".to_string(),
+                configuration.as_bytes().to_vec(),
+            ));
+        }
+        if let Some(flags) = self.flags_param() {
+            params.push(flags);
+        }
+        self.exec_cache()
+            .run_exec("@@template@create".to_string(), params)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes the template named `name`.
+    pub async fn remove_template(&self, name: &str) -> Result<()> {
+        let mut params = vec![("name".to_string(), name.as_bytes().to_vec())];
+        if let Some(flags) = self.flags_param() {
+            params.push(flags);
+        }
+        self.exec_cache()
+            .run_exec("@@template@remove".to_string(), params)
+            .await?;
+        Ok(())
+    }
 }
 
 impl HotRodClient {
@@ -474,6 +588,280 @@ mod tests {
             names,
             vec!["cache-one".to_string(), "cache-two".to_string()]
         );
+
+        server.await.unwrap();
+    }
+
+    /// `reindex_cache` sends only `name`, never `flags`: confirmed
+    /// against the Java client's own `reindexCache`
+    /// (`Collections.singletonMap`, not the `flags`-aware map every
+    /// other task uses), even with flags set on the handle.
+    #[tokio::test]
+    async fn reindex_cache_sends_only_the_name_even_with_flags_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@cache@reindex");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 1);
+            let name = read_array(&mut stream).await.unwrap();
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(name, b"name");
+            assert_eq!(value, b"my-cache");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .with_flags([AdminFlag::Volatile])
+            .reindex_cache("my-cache")
+            .await
+            .expect("reindex_cache should succeed");
+
+        server.await.unwrap();
+    }
+
+    /// Same shape as `reindex_cache`, confirming `update_index_schema`
+    /// uses its own task name, still with no `flags`.
+    #[tokio::test]
+    async fn update_index_schema_sends_only_the_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@cache@updateindexschema");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 1);
+            let name = read_array(&mut stream).await.unwrap();
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(name, b"name");
+            assert_eq!(value, b"my-cache");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .update_index_schema("my-cache")
+            .await
+            .expect("update_index_schema should succeed");
+
+        server.await.unwrap();
+    }
+
+    /// `update_configuration_attribute` sends `name`, `attribute`,
+    /// `value`, then `flags` when set.
+    #[tokio::test]
+    async fn update_configuration_attribute_sends_name_attribute_value_and_flags() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@cache@updateConfigurationAttribute");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 4);
+
+            let name0 = read_array(&mut stream).await.unwrap();
+            let value0 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name0, b"name");
+            assert_eq!(value0, b"my-cache");
+
+            let name1 = read_array(&mut stream).await.unwrap();
+            let value1 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name1, b"attribute");
+            assert_eq!(value1, b"clustering.remote-timeout");
+
+            let name2 = read_array(&mut stream).await.unwrap();
+            let value2 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name2, b"value");
+            assert_eq!(value2, b"30000");
+
+            let name3 = read_array(&mut stream).await.unwrap();
+            let value3 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name3, b"flags");
+            assert_eq!(value3, b"UPDATE");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .with_flags([AdminFlag::Update])
+            .update_configuration_attribute("my-cache", "clustering.remote-timeout", "30000")
+            .await
+            .expect("update_configuration_attribute should succeed");
+
+        server.await.unwrap();
+    }
+
+    /// `assign_alias(alias_name, cache_name)` sends the wire
+    /// parameters as `name` (the cache being aliased) then `alias`
+    /// (the alias itself), matching the argument order the Java
+    /// client's own `assignAlias` method takes, not the order its two
+    /// wire parameter names happen to spell.
+    #[tokio::test]
+    async fn assign_alias_sends_cache_name_then_alias_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@cache@assignAlias");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 2);
+
+            let name0 = read_array(&mut stream).await.unwrap();
+            let value0 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name0, b"name");
+            assert_eq!(value0, b"my-cache");
+
+            let name1 = read_array(&mut stream).await.unwrap();
+            let value1 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name1, b"alias");
+            assert_eq!(value1, b"my-alias");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .assign_alias("my-alias", "my-cache")
+            .await
+            .expect("assign_alias should succeed");
+
+        server.await.unwrap();
+    }
+
+    /// `create_template` with a configuration sends `name` and
+    /// `configuration`.
+    #[tokio::test]
+    async fn create_template_sends_name_and_configuration() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@template@create");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 2);
+
+            let name0 = read_array(&mut stream).await.unwrap();
+            let value0 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name0, b"name");
+            assert_eq!(value0, b"my-template");
+
+            let name1 = read_array(&mut stream).await.unwrap();
+            let value1 = read_array(&mut stream).await.unwrap();
+            assert_eq!(name1, b"configuration");
+            assert_eq!(value1, b"<distributed-cache/>");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .create_template("my-template", Some("<distributed-cache/>"))
+            .await
+            .expect("create_template should succeed");
+
+        server.await.unwrap();
+    }
+
+    /// `create_template` with no configuration omits the
+    /// `configuration` parameter entirely, the same "omitted, not
+    /// empty" convention `remove_cache`'s own `flags` test already
+    /// confirms.
+    #[tokio::test]
+    async fn create_template_omits_configuration_when_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@template@create");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 1);
+            let name = read_array(&mut stream).await.unwrap();
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(name, b"name");
+            assert_eq!(value, b"my-template");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .create_template("my-template", None)
+            .await
+            .expect("create_template should succeed");
+
+        server.await.unwrap();
+    }
+
+    /// `remove_template` sends only `name` when no flags are set.
+    #[tokio::test]
+    async fn remove_template_sends_only_the_name_when_no_flags_are_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x2B, "expected an Exec request");
+            let task_name = read_array(&mut stream).await.unwrap();
+            assert_eq!(task_name, b"@@template@remove");
+            let param_count = read_vint(&mut stream).await.unwrap();
+            assert_eq!(param_count, 1);
+            let name = read_array(&mut stream).await.unwrap();
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(name, b"name");
+            assert_eq!(value, b"my-template");
+
+            let mut resp = response_header(id, 0x2C, 0x00);
+            write_array(&mut resp, b"\"ok\"");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![addr], addr);
+        client
+            .administration()
+            .remove_template("my-template")
+            .await
+            .expect("remove_template should succeed");
 
         server.await.unwrap();
     }
