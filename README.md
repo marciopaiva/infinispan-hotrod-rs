@@ -28,7 +28,7 @@ its own issue. See `docs/adr/` for how each phase was scoped and
 | Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
-| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; no DELETE/UPDATE statements yet) |
+| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE) |
 | Remote task execution | Yes | No ([#51](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/51)) |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |

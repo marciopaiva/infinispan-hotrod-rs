@@ -155,6 +155,10 @@ Both items in this theme are done.
   gap the initial research missed: making a caller's own writes
   queryable needs their cache configured for protostream encoding
   server-side, not something this phase negotiates per request.
+  `Query::execute_statement` (#108) runs DELETE/UPDATE Ickle
+  statements, confirmed against the Java client's own source to be
+  the same wire round trip as `execute`, with `hitCountAccuracy`
+  forced to 1 and the affected-row count read back from `hit_count`.
 
 ### High availability
 

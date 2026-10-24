@@ -74,6 +74,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `set_switch_back_check_interval` reads or overrides the interval,
   `None` disabling it. See
   `docs/adr/0020-multicluster-proactive-switch-back.md` (#117).
+- Remote query: `Query::execute_statement()` runs a DELETE or UPDATE
+  Ickle statement, returning the number of affected entries. The same
+  `QueryRequest`/`QueryResponse` wire round trip as `execute`, with
+  `hitCountAccuracy` forced to 1 and the count read back from
+  `hit_count`; confirmed against the Java client's own source to need
+  no new opcode or message. See `docs/adr/0013-remote-query.md` (#108).
 
 ### Fixed
 

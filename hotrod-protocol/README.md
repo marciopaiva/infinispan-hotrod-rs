@@ -30,7 +30,7 @@ for release notes.
 | Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
-| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; no DELETE/UPDATE statements yet) |
+| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE) |
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
@@ -200,6 +200,12 @@ for row in result.rows {
         // decode `bytes` with whatever Marshaller matches the Book schema
     }
 }
+
+let removed = cache
+    .query("DELETE FROM demo.Book WHERE title = :title")
+    .param("title", QueryValue::String("Dune".to_string()))
+    .execute_statement()
+    .await?;
 ```
 
 `administration` creates, removes and lists caches, no shell or REST
