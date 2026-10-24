@@ -80,6 +80,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `hitCountAccuracy` forced to 1 and the count read back from
   `hit_count`; confirmed against the Java client's own source to need
   no new opcode or message. See `docs/adr/0013-remote-query.md` (#108).
+- Multi-cluster failover: `HotRodClient::authenticate_plain_for_cluster`/
+  `authenticate_scram_for_cluster`/`authenticate_digest_for_cluster`/
+  `authenticate_oauthbearer_for_cluster` and `set_cluster_tls` override
+  a configured cluster's own credentials or TLS independently of this
+  client's global defaults, which a cluster with no override still
+  falls back to. Scoped to authentication and TLS only, not
+  `ClientIntelligence`. See
+  `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md` (#114).
 
 ### Fixed
 
