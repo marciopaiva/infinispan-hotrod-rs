@@ -746,12 +746,34 @@ impl HotRodClient {
     /// `cluster_generation`, the same cleanup `switch_to_cluster`
     /// itself performs: see its own docs and
     /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    ///
+    /// `expected_generation`, when given, guards the commit itself,
+    /// not just the decision to attempt it: right before replacing
+    /// `active` (under the same write lock the replace itself uses),
+    /// this aborts with an error instead of committing if
+    /// `cluster_generation` no longer matches. Every existing caller
+    /// (`failover_seed`, `try_failover_to_live_cluster`) passes `None`
+    /// and keeps committing unconditionally, the same as before this
+    /// parameter existed; only `run_switch_back_monitor` passes
+    /// `Some(_)`. Without this, a manual `switch_to_cluster` landing
+    /// while the monitor's own dial above is still in flight (bounded
+    /// only by the connection timeout, not this short) would be
+    /// silently overwritten the moment that dial succeeds, since
+    /// nothing checked `cluster_generation` again that close to the
+    /// commit. Checking only once, before the dial even starts (what
+    /// the monitor itself also does, to avoid dialing at all when
+    /// already superseded), is not enough on its own: the window
+    /// this closes is the one between that early check and the
+    /// commit, which the dial's own latency can make arbitrarily
+    /// wide. Found by review before merge: see
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`.
     async fn try_promote_seed(
         &self,
         cache_name: &str,
         candidates: &[SocketAddr],
         skip: Option<SocketAddr>,
         switch_to_cluster_name: Option<&str>,
+        expected_generation: Option<u64>,
     ) -> Result<SocketAddr> {
         let topology_id = self.current_topology_id();
         let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
@@ -803,6 +825,18 @@ impl HotRodClient {
             }
             let switched_from = {
                 let mut active = self.0.active.write().unwrap_or_else(|p| p.into_inner());
+                if let Some(expected) = expected_generation {
+                    if *self.0.cluster_generation.subscribe().borrow() != expected {
+                        // Superseded by a newer switch while the dial
+                        // above was in flight: abort without ever
+                        // touching `active`, rather than silently
+                        // overwriting whatever that newer switch just
+                        // decided.
+                        return Err(Error::Io(io::Error::other(
+                            "cluster switch superseded by a newer one before this one could commit",
+                        )));
+                    }
+                }
                 match switch_to_cluster_name {
                     Some(name) => {
                         let old = std::mem::replace(
@@ -884,7 +918,7 @@ impl HotRodClient {
                 continue;
             }
             match self
-                .try_promote_seed(cache_name, seeds, None, Some(name))
+                .try_promote_seed(cache_name, seeds, None, Some(name), None)
                 .await
             {
                 Ok(addr) => {
@@ -1303,7 +1337,7 @@ impl HotRodClient {
             let active = self.0.active.read().unwrap_or_else(|p| p.into_inner());
             (active.active_seed_addr, active.seed_addrs.clone())
         };
-        self.try_promote_seed(cache_name, &seed_addrs, Some(previous), None)
+        self.try_promote_seed(cache_name, &seed_addrs, Some(previous), None, None)
             .await
     }
 
@@ -1483,7 +1517,13 @@ async fn run_switch_back_monitor(
 
         let client = HotRodClient(inner);
         match client
-            .try_promote_seed("", &target_seeds, None, Some(&target_name))
+            .try_promote_seed(
+                "",
+                &target_seeds,
+                None,
+                Some(&target_name),
+                Some(started_generation),
+            )
             .await
         {
             Ok(_) => {
@@ -1789,6 +1829,130 @@ pub(crate) mod tests {
             !generation_rx_after.has_changed().unwrap_or(false),
             "a subscription taken after the switch already completed must not see it as a pending change"
         );
+    }
+
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`: found by
+    /// review before merge. `try_promote_seed`'s `expected_generation`
+    /// guard must abort without committing if `cluster_generation` no
+    /// longer matches by the time the dial succeeds, closing the
+    /// window between `run_switch_back_monitor`'s own pre-dial check
+    /// and the commit, which the dial's own latency can make
+    /// arbitrarily wide. Exercised directly and deterministically
+    /// here, rather than by racing a real concurrent switch against a
+    /// real dial's latency, which a slow CI runner could make flake
+    /// in either direction.
+    #[tokio::test]
+    async fn try_promote_seed_aborts_without_committing_when_superseded_before_the_commit() {
+        let original_seed: SocketAddr = unreachable_addr().await;
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = target_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = client_for_cluster_tests(original_seed);
+        client
+            .add_cluster("target", vec![target_addr])
+            .expect("add_cluster should succeed");
+
+        let stale_generation = *client.inner().cluster_generation.subscribe().borrow();
+        // Simulate a switch landing after this generation was
+        // captured, before the dial below even starts.
+        client
+            .inner()
+            .cluster_generation
+            .send_modify(|generation| *generation += 1);
+
+        let result = client
+            .try_promote_seed(
+                "",
+                &[target_addr],
+                None,
+                Some("target"),
+                Some(stale_generation),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a superseded attempt must not report success"
+        );
+        assert_eq!(
+            client.active_cluster_name(),
+            HotRodClient::DEFAULT_CLUSTER_NAME,
+            "a superseded attempt must never commit the switch it was attempting"
+        );
+    }
+
+    /// `run_switch_back_monitor` itself (not just `try_promote_seed`'s
+    /// own guard) must give up once superseded, without ever having to
+    /// successfully dial its target: exercised directly here, with a
+    /// target address that is never bound to anything for the whole
+    /// test, rather than through a real automatic failover and a real
+    /// recovered listener. `docs/adr/0020-multicluster-proactive-switch-back.md`
+    /// explains why: a real "down, then back up on the same port"
+    /// integration test is kept to a single, necessary case elsewhere
+    /// (`remote_cache::tests::automatic_failover_proactively_switches_back_once_the_original_cluster_recovers`);
+    /// this property does not need one, since it never requires the
+    /// dial to succeed at all.
+    #[tokio::test]
+    async fn run_switch_back_monitor_gives_up_once_superseded_while_asleep() {
+        let client = client_for_cluster_tests(unreachable_addr().await);
+        client.set_switch_back_check_interval(Some(Duration::from_millis(20)));
+        let started_generation = *client.inner().cluster_generation.subscribe().borrow();
+        let weak = Arc::downgrade(&client.0);
+        let never_bound_target = unreachable_addr().await;
+
+        let monitor = tokio::spawn(run_switch_back_monitor(
+            weak,
+            "ghost-cluster".to_string(),
+            vec![never_bound_target],
+            started_generation,
+        ));
+        // Give the monitor time to start its first sleep before
+        // superseding it, so this exercises the post-sleep check
+        // (`run_switch_back_monitor`'s own docs), not just the
+        // pre-sleep one.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        client
+            .inner()
+            .cluster_generation
+            .send_modify(|generation| *generation += 1);
+
+        tokio::time::timeout(Duration::from_millis(500), monitor)
+            .await
+            .expect("the monitor should give up once superseded, not hang")
+            .expect("the monitor task should not panic");
+    }
+
+    /// `set_switch_back_check_interval(None)` must stop a monitor
+    /// already asleep, not just prevent a future one from starting:
+    /// see `run_switch_back_monitor`'s own docs for the gap this
+    /// closes (checking again right after waking, not only before
+    /// sleeping). Exercised directly, the same reason and with the
+    /// same safety as the test just above.
+    #[tokio::test]
+    async fn run_switch_back_monitor_stops_once_disabled_while_asleep() {
+        let client = client_for_cluster_tests(unreachable_addr().await);
+        client.set_switch_back_check_interval(Some(Duration::from_millis(20)));
+        let started_generation = *client.inner().cluster_generation.subscribe().borrow();
+        let weak = Arc::downgrade(&client.0);
+        let never_bound_target = unreachable_addr().await;
+
+        let monitor = tokio::spawn(run_switch_back_monitor(
+            weak,
+            "ghost-cluster".to_string(),
+            vec![never_bound_target],
+            started_generation,
+        ));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        client.set_switch_back_check_interval(None);
+
+        tokio::time::timeout(Duration::from_millis(500), monitor)
+            .await
+            .expect("a disabled monitor should stop at its next wake, not hang")
+            .expect("the monitor task should not panic");
     }
 
     /// Binds a listener and immediately drops it, so the returned address

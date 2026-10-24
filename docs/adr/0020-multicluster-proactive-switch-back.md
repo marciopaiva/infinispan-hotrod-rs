@@ -109,6 +109,30 @@ check caught it. Checking again immediately after the sleep closes
 that gap: `set_switch_back_check_interval(None)` stops a monitor
 already in flight before its next attempt, not after one more.
 
+### The commit itself must re-check, not just the decision to attempt it
+
+**Corrected before merge.** The first version only checked
+`cluster_generation` once, right before starting the dial inside
+`try_promote_seed`, matching what `run_switch_back_monitor` itself
+already does before calling it. That is not enough on its own: the
+dial's own latency (bounded by the connection timeout, not by
+anything short) opens a window between that check and the commit.
+Review before merge found that a manual `switch_to_cluster` landing
+inside that window would be silently overwritten the moment the
+monitor's dial happened to succeed, directly contradicting this
+phase's own "never second-guessed" decision.
+
+`try_promote_seed` now takes an `expected_generation: Option<u64>`
+parameter, checked again immediately before replacing `active`,
+under the same write lock the replace itself uses (the same
+lock-ordering discipline ADR 0019's own review already established
+for `cluster_generation`'s write side). If the generation no longer
+matches, the attempt aborts without ever touching `active`, instead
+of committing a switch nothing asked for anymore. Every existing
+caller (`failover_seed`, `try_failover_to_live_cluster`) passes
+`None` and keeps committing unconditionally, exactly as before this
+parameter existed; only `run_switch_back_monitor` passes `Some(_)`.
+
 ### Lifecycle: `Weak`, not `Arc`
 
 The monitor holds `Weak<ClientInner>`, upgraded fresh on every wake.
@@ -134,7 +158,62 @@ builder, no new `connect*` parameter. `DEFAULT_SWITCH_BACK_CHECK_INTERVAL`
 is 60 seconds, the same order of magnitude as
 `DEFAULT_SERVER_FAILURE_TIMEOUT`.
 
-### Test coverage: why no live-server test
+### Test coverage: one real integration test, not three
+
+**Corrected before merge.** The first version had three fake-server
+tests that each bound a real `TcpListener`, dropped it to simulate
+"down", triggered a real automatic failover against it, then rebound
+a fresh `TcpListener` on that exact same address to simulate
+"recovered". Stress-running the full suite many times in a tight
+loop before merge surfaced occasional cross-test corruption: the gap
+between dropping and rebinding frees a real OS ephemeral port, which
+`cargo test`'s own parallelism means an unrelated, concurrently
+running test can legitimately claim in the meantime (via its own
+`TcpListener::bind("127.0.0.1:0")`), especially once a 20ms retry
+interval let the monitor itself dial that address repeatedly during
+the gap. One reliability test even caused failures in entirely
+unrelated tests elsewhere in the suite.
+
+A deeper investigation (comparing the same stress-run methodology
+against `main`, with no switch-back code at all) found that rapid,
+repeated back-to-back full-suite runs on one machine are themselves
+a source of flakiness independent of this change (confirmed:
+`main` degrades too, at a comparable or higher rate, under the exact
+same tight-loop methodology; a single run, or a few runs with brief
+gaps between them, shows none of it). That rules out treating every
+observed failure as proof of a bug in this phase specifically, but
+the underlying risk the first version introduced (reusing a freed
+ephemeral port while a background task keeps dialing it) was real
+regardless, and worth designing out rather than only mitigating with
+timing margins.
+
+The test suite now keeps exactly one real "down, then back up on the
+same address" integration test
+(`remote_cache::tests::automatic_failover_proactively_switches_back_once_the_original_cluster_recovers`),
+the one property that genuinely needs real sockets end to end, with
+two mitigations: the freed listener is dropped as late as possible
+(right before the one dial that needs it to fail, not at the top of
+the test), and `switch_back_check_interval` is set to 300ms rather
+than 20ms, so the monitor's own first retry lands comfortably after
+this test has already rebound the address, not while it is still
+free.
+
+The other two properties (a manual switch superseding a pending
+monitor; disabling stopping one already asleep) do not need the
+dial to ever succeed at all, so they call `run_switch_back_monitor`
+directly with a target address that is never bound to anything for
+the whole test
+(`client::tests::run_switch_back_monitor_gives_up_once_superseded_while_asleep`,
+`client::tests::run_switch_back_monitor_stops_once_disabled_while_asleep`),
+bumping the generation or clearing the interval while the monitor is
+asleep and confirming it stops promptly. These are both more precise
+(they exercise exactly the property each one claims) and carry none
+of the port-reuse risk the original versions did. A third
+deterministic test,
+`client::tests::try_promote_seed_aborts_without_committing_when_superseded_before_the_commit`,
+covers the commit-time guard itself (see above) the same way, calling
+`try_promote_seed` directly against a dial that is allowed to
+succeed, with a generation already stale by the time it does.
 
 `ci/infinispan-multicluster/`'s own existing live test
 (`multicluster_switch_to_cluster_moves_traffic_to_an_independent_server`)
@@ -144,7 +223,7 @@ nothing in that test harness can stop a running container. The same
 constraint applies here, more so: exercising this phase for real
 would also need the "dead" node to start responding again partway
 through, with no tool available to make that happen against real
-infrastructure in this environment. Fake-server coverage (below)
+infrastructure in this environment. Fake-server coverage above
 exercises the exact same code path (`try_promote_seed`) the live
 servers would run, with the one part that differs (dialing a real
 socket) already covered, unchanged, by the existing live
@@ -159,11 +238,14 @@ multi-cluster test.
   failover now recovers on its own once the abandoned cluster
   responds again, without the caller polling or remembering to call
   `switch_to_cluster` back.
-* A manual `switch_to_cluster` is never second-guessed: confirmed by
-  `remote_cache::tests::a_manual_switch_supersedes_a_pending_switch_back_monitor`.
+* A manual `switch_to_cluster` is never second-guessed, including
+  while a monitor's own dial is already in flight: confirmed by
+  `client::tests::try_promote_seed_aborts_without_committing_when_superseded_before_the_commit`
+  and
+  `client::tests::run_switch_back_monitor_gives_up_once_superseded_while_asleep`.
 * `set_switch_back_check_interval(None)` stops a monitor already
   running, not just future ones: confirmed by
-  `remote_cache::tests::disabling_the_switch_back_interval_stops_a_pending_monitor`.
+  `client::tests::run_switch_back_monitor_stops_once_disabled_while_asleep`.
 * Confirmed against a fake server end to end
   (`remote_cache::tests::automatic_failover_proactively_switches_back_once_the_original_cluster_recovers`):
   a real automatic failover, the original address accepting
