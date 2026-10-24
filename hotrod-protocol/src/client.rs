@@ -79,6 +79,15 @@ pub(crate) const DEFAULT_MAX_RETRIES: usize = 3;
 /// `-1` sentinel.
 pub(crate) const DEFAULT_SERVER_FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default interval `run_switch_back_monitor` waits between attempts
+/// to switch back to a cluster an automatic failover just abandoned
+/// (`docs/adr/0020-multicluster-proactive-switch-back.md`). No Java
+/// client equivalent to match: chosen on the same order of magnitude
+/// as `DEFAULT_SERVER_FAILURE_TIMEOUT`, since both bound how long this
+/// client tolerates not noticing a cluster's state changed. `None`
+/// disables the monitor entirely.
+pub(crate) const DEFAULT_SWITCH_BACK_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The cache name the server reserves for Protobuf schema storage
 /// (`docs/adr/0013-remote-query.md`), confirmed against the Java
 /// client's `InternalCacheNames.PROTOBUF_METADATA_CACHE_NAME`. An
@@ -252,6 +261,15 @@ pub(crate) struct ClientInner {
     /// `subscribe()`'s `Receiver` is ever read; the `Sender`'s own
     /// current value is never inspected directly.
     pub(crate) cluster_generation: watch::Sender<u64>,
+    /// How long `run_switch_back_monitor` waits between attempts to
+    /// switch back to a cluster an automatic failover just abandoned;
+    /// `None` disables the monitor. Read fresh on every tick (not
+    /// captured once when the monitor starts), so toggling this
+    /// applies to an already-running monitor the next time it wakes,
+    /// the same eventual-consistency rule `set_timeout` already
+    /// documents for an idle connection's timeout. See
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`.
+    pub(crate) switch_back_check_interval: RwLock<Option<Duration>>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation
@@ -434,6 +452,9 @@ impl HotRodClient {
                             seed_addrs.to_vec(),
                         )]),
                         cluster_generation: watch::channel(0).0,
+                        switch_back_check_interval: RwLock::new(Some(
+                            DEFAULT_SWITCH_BACK_CHECK_INTERVAL,
+                        )),
                     })));
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -547,6 +568,30 @@ impl HotRodClient {
             .server_failure_timeout
             .write()
             .unwrap_or_else(|p| p.into_inner()) = server_failure_timeout;
+    }
+
+    /// How long `run_switch_back_monitor` waits between attempts to
+    /// switch back to a cluster an automatic failover abandoned, or
+    /// `None` if that monitor is disabled. See
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`.
+    pub fn switch_back_check_interval(&self) -> Option<Duration> {
+        *self
+            .0
+            .switch_back_check_interval
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Overrides `switch_back_check_interval` from this call onward.
+    /// `None` disables the monitor: no new one starts after the next
+    /// automatic failover, and one already running stops at its next
+    /// wake instead of switching back.
+    pub fn set_switch_back_check_interval(&self, interval: Option<Duration>) {
+        *self
+            .0
+            .switch_back_check_interval
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = interval;
     }
 
     /// `pub(crate)` accessor for `remote_cache.rs`'s dispatch loop.
@@ -809,6 +854,19 @@ impl HotRodClient {
     /// `active_cluster_name` and as a `tracing` `WARN` event, since
     /// nothing about the call that triggered it otherwise indicates a
     /// whole cluster was just abandoned.
+    ///
+    /// Also starts a background monitor
+    /// (`docs/adr/0020-multicluster-proactive-switch-back.md`) that
+    /// periodically retries switching back to the cluster just
+    /// abandoned (`active_name`, its seeds already known from
+    /// `clusters`), until it succeeds, is disabled
+    /// (`set_switch_back_check_interval(None)`), is superseded by a
+    /// later switch of any kind (manual or another automatic
+    /// failover; detected via `cluster_generation`, so this never
+    /// needs to know about the monitor to cancel it), or every clone
+    /// of this client is dropped. A manual `switch_to_cluster` never
+    /// starts one: only an automatic failover implies "this was not
+    /// the caller's choice, get back if possible".
     pub(crate) async fn try_failover_to_live_cluster(
         &self,
         cache_name: &str,
@@ -835,6 +893,17 @@ impl HotRodClient {
                         to_cluster = %name,
                         "switched to a failover cluster after the active one became unreachable"
                     );
+                    if let Some((_, abandoned_seeds)) =
+                        clusters.iter().find(|(n, _)| *n == active_name)
+                    {
+                        let started_generation = *self.0.cluster_generation.subscribe().borrow();
+                        tokio::spawn(run_switch_back_monitor(
+                            Arc::downgrade(&self.0),
+                            active_name.clone(),
+                            abandoned_seeds.clone(),
+                            started_generation,
+                        ));
+                    }
                     return Ok(addr);
                 }
                 Err(err) => last_err = Some(err),
@@ -1355,6 +1424,80 @@ impl HotRodClient {
     }
 }
 
+/// Periodically retries switching back to `target_name` (an
+/// automatic failover's own abandoned cluster, with `target_seeds`
+/// already known at the time it was abandoned), until it succeeds,
+/// is superseded, or every clone of the client is dropped. See
+/// `try_failover_to_live_cluster`'s own docs for when this is
+/// spawned, and `docs/adr/0020-multicluster-proactive-switch-back.md`
+/// for the full design.
+///
+/// Holds only a `Weak<ClientInner>`, never an `Arc`: unlike
+/// `near_cache.rs`'s invalidation task (which deliberately keeps its
+/// state alive via a strong `Arc` for as long as any
+/// `NearCachedCache` clone exists), this task must never be the
+/// reason a `HotRodClient` and everything it owns stays alive after
+/// every clone of it is otherwise dropped. `weak.upgrade()` failing
+/// is this monitor's own signal to stop, checked on every wake
+/// instead of needing an explicit cancellation handle.
+async fn run_switch_back_monitor(
+    weak: std::sync::Weak<ClientInner>,
+    target_name: String,
+    target_seeds: Vec<SocketAddr>,
+    started_generation: u64,
+) {
+    loop {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let current_interval = *inner
+            .switch_back_check_interval
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        drop(inner);
+        let Some(interval) = current_interval else {
+            return;
+        };
+        tokio::time::sleep(interval).await;
+
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let still_enabled = inner
+            .switch_back_check_interval
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some();
+        let generation_unchanged =
+            *inner.cluster_generation.subscribe().borrow() == started_generation;
+        if !still_enabled || !generation_unchanged {
+            // Disabled while this monitor was asleep, or something
+            // else (a manual switch, or another automatic failover)
+            // already changed the active cluster since this monitor
+            // started: nothing left for it to do, checked again here
+            // rather than only before the sleep, so disabling takes
+            // effect as soon as this monitor next wakes, not only
+            // after one more switch-back attempt already in flight.
+            return;
+        }
+
+        let client = HotRodClient(inner);
+        match client
+            .try_promote_seed("", &target_seeds, None, Some(&target_name))
+            .await
+        {
+            Ok(_) => {
+                tracing::warn!(
+                    to_cluster = %target_name,
+                    "switched back to the recovered cluster"
+                );
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
 async fn resolve_server_addr(server: &TopologyServer) -> Result<SocketAddr> {
     lookup_host((server.host.as_str(), server.port))
         .await?
@@ -1460,6 +1603,7 @@ pub(crate) mod tests {
                 vec![],
             )]),
             cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
         });
 
         assert_eq!(client.max_retries(), DEFAULT_MAX_RETRIES);
@@ -1503,6 +1647,7 @@ pub(crate) mod tests {
                 vec![seed_addr],
             )]),
             cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
         })
     }
 
@@ -1968,6 +2113,7 @@ pub(crate) mod tests {
                 vec![seed_addr],
             )]),
             cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
         });
 
         client
@@ -2056,6 +2202,7 @@ pub(crate) mod tests {
                 vec![seed_addr],
             )]),
             cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
         });
 
         client
@@ -2114,6 +2261,7 @@ pub(crate) mod tests {
                 vec![dead_addr],
             )]),
             cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
         });
 
         // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed

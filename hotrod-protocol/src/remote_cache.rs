@@ -1352,7 +1352,7 @@ pub(crate) mod tests {
     };
     use crate::client::{
         ActiveCluster, AuthMethod, ClientInner, ClusterTopology, HotRodClient, DEFAULT_MAX_RETRIES,
-        DEFAULT_SERVER_FAILURE_TIMEOUT,
+        DEFAULT_SERVER_FAILURE_TIMEOUT, DEFAULT_SWITCH_BACK_CHECK_INTERVAL,
     };
     use crate::health::NodeHealth;
     use crate::protobuf_wire::{read_length_delimited, read_tag, WIRE_TYPE_VARINT};
@@ -1382,6 +1382,7 @@ pub(crate) mod tests {
                 seed_addrs.clone(),
             )]),
             cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
             active: RwLock::new(ActiveCluster {
                 name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 seed_addrs,
@@ -1590,6 +1591,187 @@ pub(crate) mod tests {
         );
 
         dr_task.await.unwrap();
+    }
+
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`: once an
+    /// automatic failover abandons a cluster, a background monitor
+    /// keeps retrying it at `switch_back_check_interval` until it
+    /// responds again, then switches back on its own, with no further
+    /// action from the caller.
+    #[tokio::test]
+    async fn automatic_failover_proactively_switches_back_once_the_original_cluster_recovers() {
+        let original_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let original_addr = original_listener.local_addr().unwrap();
+        drop(original_listener); // down for now; rebound further below
+
+        let dr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dr_addr = dr_listener.local_addr().unwrap();
+        let dr_task = tokio::spawn(async move {
+            let (mut stream, _) = dr_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![original_addr], original_addr);
+        client
+            .add_cluster("dr", vec![dr_addr])
+            .expect("add_cluster should succeed");
+        client.set_switch_back_check_interval(Some(Duration::from_millis(20)));
+
+        let result = client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should fail over to the dr cluster");
+        assert_eq!(result, None);
+        assert_eq!(client.active_cluster_name(), "dr");
+        dr_task.await.unwrap();
+
+        // The original address accepts connections again: the monitor
+        // spawned by the failover above should notice on its next
+        // tick and switch back on its own.
+        let recovered_listener = TcpListener::bind(original_addr)
+            .await
+            .expect("rebind the original address now that it is back up");
+        let recovered_task = tokio::spawn(async move {
+            let (_stream, _) = recovered_listener.accept().await.unwrap();
+            // try_promote_seed only needs the connection itself to
+            // succeed (cache_name "", no auth configured): nothing
+            // else to serve.
+        });
+
+        let mut switched_back = false;
+        for _ in 0..200 {
+            if client.active_cluster_name() == HotRodClient::DEFAULT_CLUSTER_NAME {
+                switched_back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            switched_back,
+            "the switch-back monitor should have switched back to the recovered cluster"
+        );
+
+        recovered_task.await.unwrap();
+    }
+
+    /// A manual `switch_to_cluster` is a deliberate choice: a
+    /// switch-back monitor already in flight for an earlier automatic
+    /// failover must not fight it, even once its own original target
+    /// becomes reachable again. See
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`.
+    #[tokio::test]
+    async fn a_manual_switch_supersedes_a_pending_switch_back_monitor() {
+        let original_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let original_addr = original_listener.local_addr().unwrap();
+        drop(original_listener);
+
+        let dr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dr_addr = dr_listener.local_addr().unwrap();
+        let dr_task = tokio::spawn(async move {
+            let (mut stream, _) = dr_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![original_addr], original_addr);
+        client
+            .add_cluster("dr", vec![dr_addr])
+            .expect("add_cluster should succeed");
+        client
+            .add_cluster("third", vec![unreachable_addr().await])
+            .expect("add_cluster should succeed");
+        client.set_switch_back_check_interval(Some(Duration::from_millis(20)));
+
+        client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should fail over to the dr cluster");
+        assert_eq!(client.active_cluster_name(), "dr");
+        dr_task.await.unwrap();
+
+        // The original cluster recovers, but before the monitor's next
+        // tick, the caller deliberately switches to a third cluster.
+        let recovered_listener = TcpListener::bind(original_addr)
+            .await
+            .expect("rebind the original address now that it is back up");
+        client
+            .switch_to_cluster("third")
+            .expect("switch_to_cluster should succeed even though its seed is unreachable");
+
+        // Give the monitor well more than its own interval to have
+        // acted, if it were going to: it must see the generation
+        // bumped by the manual switch above and give up instead.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            client.active_cluster_name(),
+            "third",
+            "a pending switch-back monitor must not override a later manual switch"
+        );
+
+        drop(recovered_listener);
+    }
+
+    /// `set_switch_back_check_interval(None)` must stop a monitor
+    /// already in flight, not just prevent a future one from
+    /// starting. See
+    /// `docs/adr/0020-multicluster-proactive-switch-back.md`.
+    #[tokio::test]
+    async fn disabling_the_switch_back_interval_stops_a_pending_monitor() {
+        let original_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let original_addr = original_listener.local_addr().unwrap();
+        drop(original_listener);
+
+        let dr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dr_addr = dr_listener.local_addr().unwrap();
+        let dr_task = tokio::spawn(async move {
+            let (mut stream, _) = dr_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x03, "expected a Get request");
+            let _key = read_array(&mut stream).await.unwrap();
+            let resp = response_header(id, 0x04, 0x02); // KEY_DOES_NOT_EXIST
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![original_addr], original_addr);
+        client
+            .add_cluster("dr", vec![dr_addr])
+            .expect("add_cluster should succeed");
+        client.set_switch_back_check_interval(Some(Duration::from_millis(20)));
+
+        client
+            .cache("my-cache")
+            .get(b"key")
+            .await
+            .expect("get should fail over to the dr cluster");
+        assert_eq!(client.active_cluster_name(), "dr");
+        dr_task.await.unwrap();
+
+        client.set_switch_back_check_interval(None);
+
+        let recovered_listener = TcpListener::bind(original_addr)
+            .await
+            .expect("rebind the original address now that it is back up");
+
+        // Well more than the interval that was configured before
+        // disabling it, so a regression (the monitor ignoring the
+        // change) would have switched back by now.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            client.active_cluster_name(),
+            "dr",
+            "a disabled monitor must not switch back"
+        );
+
+        drop(recovered_listener);
     }
 
     #[tokio::test]
