@@ -187,6 +187,15 @@ Every item in this theme is done.
   configurable, `None` disables it) until it responds again, then
   switches back on its own. See
   `docs/adr/0020-multicluster-proactive-switch-back.md`.
+* ~~Multi-cluster failover: per-cluster authentication and TLS
+  overrides (#114)~~ (done). `HotRodClient::authenticate_plain_for_cluster`
+  and its `scram`/`digest`/`oauthbearer` siblings, plus
+  `set_cluster_tls`, override a configured cluster's own credentials
+  and TLS independently of this client's global defaults, which a
+  cluster with no override still falls back to unchanged. Deliberately
+  scoped to auth and TLS only, not `ClientIntelligence` (not
+  configurable even globally in this crate, no stated use case). See
+  `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`.
 
 ### Specialized data structures and administration
 
