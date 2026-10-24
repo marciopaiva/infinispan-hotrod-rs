@@ -101,6 +101,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   multimap cache the same way `RemoteCache::typed` does, returning a
   `TypedMultimapCache`. See
   `docs/adr/0023-typed-remote-query-and-multimap.md` (#111).
+- Remote administration: `Administration::reindex_cache`/
+  `update_index_schema`/`update_configuration_attribute`/
+  `assign_alias`/`create_template`/`remove_template` round out every
+  confirmed-real `@@cache@...`/`@@template@...` task on the same
+  `execute_task` primitive `create_cache`/`remove_cache`/`cache_names`
+  already use; no new opcode. See
+  `docs/adr/0014-remote-administration.md` (#112).
 
 ### Fixed
 

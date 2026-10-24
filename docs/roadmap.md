@@ -233,6 +233,10 @@ individual surfaces.
   administration opcodes: built on the same generic named-task
   mechanism (`EXEC_REQUEST`/`EXEC_RESPONSE`) the Java client itself
   uses for this. See `docs/adr/0014-remote-administration.md`.
+  `reindex_cache`/`update_index_schema`/`update_configuration_attribute`/
+  `assign_alias`/`create_template`/`remove_template` (#112) round out
+  every confirmed-real `@@cache@...`/`@@template@...` task on the same
+  primitive, with no new opcode.
 
 ### Transactions
 

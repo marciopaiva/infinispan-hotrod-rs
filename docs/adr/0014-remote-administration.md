@@ -198,7 +198,59 @@ fire; it is never used for anything the server already reports as an
   splitting `Administration` into per-operation handles just to
   enforce this would be a bigger API change than the risk warrants.
 * Not implemented, left for later if it turns out to matter:
-  `@@cache@reindex`, `@@cache@updateindexschema`,
-  `@@cache@updateConfigurationAttribute`, `@@cache@assignAlias`,
-  `@@template@create`/`@@template@remove`, and typed differentiation
-  of server errors.
+  typed differentiation of server errors (still not available on the
+  wire).
+
+### Addendum: the six remaining tasks (#112)
+
+The six tasks this ADR originally deferred are implemented, each a
+thin new case of the same `exec_cache()`/`run_exec` shape
+`create_cache_with_task`/`remove_cache` already established. No new
+opcode, no new `Error` variant, no change to `execute_task`/`run_exec`
+themselves. Confirmed against the Java client's own source
+(`RemoteCacheManagerAdminImpl.java`, fetched directly):
+
+* `Administration::reindex_cache`/`update_index_schema` send only
+  `name`, never `flags`: Java's own `reindexCache`/`updateIndexSchema`
+  use a bare `Collections.singletonMap(CACHE_NAME, ...)`, not the
+  `flags`-aware map every other task (including the four below) uses.
+  Java also has a timeout-overloaded variant of both, but that bound
+  is enforced purely client-side (`TimeoutHotRodOperation`) and sends
+  nothing extra to the server either way; this crate has no per-call
+  timeout override anywhere (one client-wide `HotRodClient::timeout`/
+  `set_timeout`), so neither method gets one here either, for
+  consistency with every other operation in this crate.
+* `Administration::update_configuration_attribute(name, attribute,
+  value)`: `name`, `attribute`, `value`, then `flags` if set.
+* `Administration::assign_alias(alias_name, cache_name)`: wire
+  parameters `name` (the cache being aliased) then `alias` (the alias
+  itself), then `flags` if set. The method's own argument order
+  matches Java's `assignAlias(String aliasName, String cacheName)`
+  even though the wire parameter names spell the opposite order
+  (`CACHE_NAME` before `ALIAS_NAME` in `RemoteCacheManagerAdminImpl`).
+* `Administration::create_template(name, configuration)`: `name`,
+  then `configuration` only when `Some` (omitted entirely for `None`,
+  the same "omitted, not empty" convention `flags` already uses
+  throughout this file), then `flags` if set. Unlike `create_cache`,
+  there is no way to base a template on another already-defined
+  template through this task: Java's own `createTemplate` takes a
+  nullable configuration document, never a template name.
+  `Administration::remove_template(name)`: `name`, then `flags` if
+  set.
+* All six discard their response body on success, the same as every
+  Java caller of `submitOperation` already does: the body is a JSON
+  string on the wire, never inspected either side.
+* **Not revisited: routing.** Reading `RemoteCacheManagerAdminImpl.java`
+  in full while confirming the above surfaced that the Java client
+  actually routes every one of these tasks, including the already
+  shipped `create_cache`/`remove_cache`, to a node associated with the
+  cache name (`operationDispatcher.addressForCache(name)`), not
+  blindly to the active seed the way this crate's own `exec_cache()`
+  always does. This phase does not change that: `create_cache`/
+  `remove_cache`'s own routing is already shipped, public behavior,
+  out of scope for an issue that asked for six new tasks, not a
+  routing change; and the same latency-only trade-off (correctness
+  unaffected, an extra internal hop paid) is the exact one ADR 0015
+  already accepted, deliberately, for distributed counters. The six
+  new tasks here follow the existing, already-decided choice rather
+  than introducing a second, inconsistent one.
