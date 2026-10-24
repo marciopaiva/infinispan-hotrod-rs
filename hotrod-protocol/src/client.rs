@@ -602,7 +602,13 @@ impl HotRodClient {
     /// registered against the cluster just left behind stops reading
     /// from it instead of silently continuing to trust a feed that no
     /// longer has anything to do with the cluster this client now
-    /// routes against. See
+    /// routes against. The bump happens while `active`'s write lock is
+    /// still held, not after releasing it: `active_seed_and_generation`
+    /// reads the seed and subscribes to the generation together under
+    /// one read-lock acquisition, so pairing the write side the same
+    /// way is what actually makes that combined read atomic relative to
+    /// a switch, rather than just moving the race from one pair of
+    /// reads to another. Found by review before merge: see
     /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
     pub fn switch_to_cluster(&self, name: &str) -> Result<()> {
         let clusters = self.0.clusters.read().unwrap_or_else(|p| p.into_inner());
@@ -615,22 +621,26 @@ impl HotRodClient {
         let &active_seed_addr = seed_addrs.first().ok_or_else(|| {
             Error::InvalidClusterConfig(format!("cluster {name:?} has no seed addresses"))
         })?;
-        let old = std::mem::replace(
-            &mut *self.0.active.write().unwrap_or_else(|p| p.into_inner()),
-            ActiveCluster {
-                name,
-                seed_addrs,
-                active_seed_addr,
-                topology: None,
-            },
-        );
+        let old = {
+            let mut active = self.0.active.write().unwrap_or_else(|p| p.into_inner());
+            let old = std::mem::replace(
+                &mut *active,
+                ActiveCluster {
+                    name,
+                    seed_addrs,
+                    active_seed_addr,
+                    topology: None,
+                },
+            );
+            self.0
+                .cluster_generation
+                .send_modify(|generation| *generation += 1);
+            old
+        };
         self.evict_abandoned_cluster(&old);
         // A different cluster's nodes failing recently has nothing to
         // do with this one's own health.
         self.0.node_health.clear_all();
-        self.0
-            .cluster_generation
-            .send_modify(|generation| *generation += 1);
         Ok(())
     }
 
@@ -646,15 +656,32 @@ impl HotRodClient {
             .clone()
     }
 
-    /// A fresh subscription to this client's cluster-switch generation
-    /// counter. `pub(crate)`: `RemoteCache::listen_with` hands this to
-    /// `CacheListener::register`, which captures the current value and
-    /// watches for it changing later, so a listener can tell a switch
-    /// away from the cluster it was registered against apart from one
-    /// that never happened. See
-    /// `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
-    pub(crate) fn subscribe_cluster_generation(&self) -> watch::Receiver<u64> {
-        self.0.cluster_generation.subscribe()
+    /// The active seed address and a fresh subscription to this
+    /// client's cluster-switch generation counter, read together under
+    /// one acquisition of `active`'s read lock. `pub(crate)`:
+    /// `RemoteCache::listen_with` dials the returned seed and hands the
+    /// receiver to `CacheListener::register`, which captures its
+    /// current value and watches for it changing later, so a listener
+    /// can tell a switch away from the cluster it was registered
+    /// against apart from one that never happened.
+    ///
+    /// Reading these two as separate calls (seed first, subscribe
+    /// later, with the dial itself in between) would reopen exactly
+    /// the race this exists to close: `switch_to_cluster`/
+    /// `try_promote_seed`'s switch branch bump the generation while
+    /// still holding `active`'s write lock, so a read lock acquired
+    /// here either observes the old seed with a pre-bump generation
+    /// (the later bump then correctly arrives as a change) or the new
+    /// seed with the matching post-bump generation (no spurious change
+    /// for the switch this listener is already correctly aligned
+    /// with), never a mix of the two. Found by review before merge:
+    /// see `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`.
+    pub(crate) fn active_seed_addr_and_generation(&self) -> (SocketAddr, watch::Receiver<u64>) {
+        let active = self.0.active.read().unwrap_or_else(|p| p.into_inner());
+        (
+            active.active_seed_addr,
+            self.0.cluster_generation.subscribe(),
+        )
     }
 
     /// Shared by `failover_seed` (tries the rest of the active
@@ -732,15 +759,24 @@ impl HotRodClient {
             let switched_from = {
                 let mut active = self.0.active.write().unwrap_or_else(|p| p.into_inner());
                 match switch_to_cluster_name {
-                    Some(name) => Some(std::mem::replace(
-                        &mut *active,
-                        ActiveCluster {
-                            name: name.to_string(),
-                            seed_addrs: candidates.to_vec(),
-                            active_seed_addr: addr,
-                            topology: None,
-                        },
-                    )),
+                    Some(name) => {
+                        let old = std::mem::replace(
+                            &mut *active,
+                            ActiveCluster {
+                                name: name.to_string(),
+                                seed_addrs: candidates.to_vec(),
+                                active_seed_addr: addr,
+                                topology: None,
+                            },
+                        );
+                        // Bumped while `active`'s write lock is still
+                        // held: see `switch_to_cluster`'s own docs for
+                        // why.
+                        self.0
+                            .cluster_generation
+                            .send_modify(|generation| *generation += 1);
+                        Some(old)
+                    }
                     None => {
                         active.active_seed_addr = addr;
                         None
@@ -752,9 +788,6 @@ impl HotRodClient {
                 // A different cluster's nodes failing recently has
                 // nothing to do with this one's own health.
                 self.0.node_health.clear_all();
-                self.0
-                    .cluster_generation
-                    .send_modify(|generation| *generation += 1);
             }
             return Ok(addr);
         }
@@ -1579,7 +1612,7 @@ pub(crate) mod tests {
             Arc::new(ConnectionPool::new(1)),
         );
 
-        let generation_rx = client.subscribe_cluster_generation();
+        let (_, generation_rx) = client.active_seed_addr_and_generation();
         assert!(
             !generation_rx.has_changed().unwrap_or(false),
             "no switch has happened yet"
@@ -1596,6 +1629,20 @@ pub(crate) mod tests {
         assert!(
             client.pool_statistics().is_empty(),
             "the old cluster's pool must be drained on switch"
+        );
+
+        // A combined read taken after the switch has fully completed
+        // must see the new seed paired with the already-bumped
+        // generation, never the new seed with a stale baseline (which
+        // would make a listener registering right now miss this
+        // switch): review before merge found `listen_with` doing these
+        // two reads separately, with the dial in between, reopening
+        // exactly this race.
+        let (seed_after, generation_rx_after) = client.active_seed_addr_and_generation();
+        assert_eq!(seed_after, dr_seed);
+        assert!(
+            !generation_rx_after.has_changed().unwrap_or(false),
+            "a subscription taken after the switch already completed must not see it as a pending change"
         );
     }
 

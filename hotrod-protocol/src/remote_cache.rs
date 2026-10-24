@@ -517,7 +517,11 @@ impl RemoteCache {
     /// which node ends up holding a long-lived registration is worth the
     /// caller seeing directly rather than this silently failing over.
     pub async fn listen_with(&self, options: &ListenOptions) -> Result<CacheListener> {
-        let seed = self.active_seed_addr();
+        // Read together, not as two separate calls around the dial: see
+        // `active_seed_addr_and_generation`'s own docs for the race
+        // that would otherwise reopen between a switch and this
+        // registration.
+        let (seed, generation_rx) = self.client.active_seed_addr_and_generation();
         let conn = self
             .client
             .open_and_authenticate(seed, &self.cache_name, None)
@@ -527,7 +531,7 @@ impl RemoteCache {
             self.cache_name.as_bytes(),
             self.client.timeout(),
             options,
-            self.client.subscribe_cluster_generation(),
+            generation_rx,
         )
         .await
     }
@@ -1554,6 +1558,13 @@ pub(crate) mod tests {
             .add_cluster("dr", vec![dr_addr])
             .expect("add_cluster should succeed");
 
+        // `docs/adr/0019-multicluster-listener-and-pool-cleanup.md`:
+        // the automatic-failover switch branch of `try_promote_seed`
+        // must bump `cluster_generation` and drain the old cluster's
+        // pools the same way the manual `switch_to_cluster` path
+        // already does, not just move the active seed.
+        let (_, generation_rx) = client.active_seed_addr_and_generation();
+
         let result = client
             .cache("my-cache")
             .get(b"key")
@@ -1565,6 +1576,17 @@ pub(crate) mod tests {
         assert_eq!(
             client.inner().active.read().unwrap().active_seed_addr,
             dr_addr
+        );
+        assert!(
+            generation_rx.has_changed().unwrap(),
+            "automatic failover must bump cluster_generation"
+        );
+        assert!(
+            !client
+                .pool_statistics()
+                .iter()
+                .any(|pool| pool.address == dead_seed_addr),
+            "the abandoned cluster's seed pool must be drained on automatic failover"
         );
 
         dr_task.await.unwrap();

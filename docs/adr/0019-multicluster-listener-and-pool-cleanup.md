@@ -80,9 +80,30 @@ has to for a dropped connection.
 dependency). Bumped by one (`send_modify`) in exactly the two places
 that already replace `ActiveCluster` wholesale: `switch_to_cluster`,
 and `try_promote_seed`'s `switch_to_cluster_name: Some(_)` branch
-(automatic failover). `HotRodClient::subscribe_cluster_generation`
-(`pub(crate)`) hands out a `watch::Receiver` to whoever needs to
-watch for a later switch.
+(automatic failover).
+
+**Corrected before merge: the bump must happen while `active`'s write
+lock is still held, and a reader must take the seed and the
+subscription together under one read-lock acquisition.** The first
+version bumped `cluster_generation` after already releasing that
+write lock, and `RemoteCache::listen_with` read the active seed,
+dialed it (an `await` point), and only then subscribed, as three
+separate steps. Review before merge found this reopens the exact
+problem this phase exists to close, in either direction: a switch
+landing between `listen_with`'s seed read and its subscribe call
+could leave a freshly-registered listener connected to the
+already-abandoned cluster but subscribed *after* the bump, so it
+never learns it is already orphaned; the opposite interleaving (the
+switch's `active` swap completing, then `listen_with` correctly
+reading the new seed and subscribing, then the switch's own bump
+finally running) could instead make a brand new, correctly-targeted
+listener see that same switch's bump as a change and terminate
+itself immediately. `HotRodClient::active_seed_addr_and_generation`
+(`pub(crate)`) now reads both under one `active.read()` acquisition,
+and the write side bumps `cluster_generation` before releasing
+`active`'s write lock, not after: a reader's single lock acquisition
+then always lands fully before or fully after a given switch, never
+in the gap between its two halves.
 
 ### `CacheListener` reacts to a switch (`listener.rs`)
 
@@ -164,8 +185,14 @@ behavior does not special-case this either.
   `ci/infinispan-multicluster`).
 * `switch_to_cluster`/automatic failover now drain every pool the
   abandoned cluster owned, including its own former active seed.
-  Confirmed against a fake server
-  (`client::tests::switch_to_cluster_bumps_generation_and_drains_the_old_cluster_s_pools`):
+  Confirmed against a fake server for both the manual switch
+  (`client::tests::switch_to_cluster_bumps_generation_and_drains_the_old_cluster_s_pools`,
+  which also confirms the seed/generation pairing described above
+  stays consistent immediately after a switch completes) and the
+  automatic-failover path
+  (`remote_cache::tests::automatic_cluster_failover_completes_the_operation_on_a_live_alternate`,
+  extended by review to assert on `cluster_generation` and
+  `pool_statistics()` too, not just the active seed): in both cases,
   `pool_statistics()` no longer lists the old cluster's pool after a
   switch.
 * Not implemented, deferred to its own issue (#117): proactively
