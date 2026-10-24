@@ -86,8 +86,16 @@ pub(crate) enum OpCode {
     CounterReset = 0x54,
     CounterGet = 0x56,
     CounterCompareAndSwap = 0x58,
-    // Counter listeners (0x5A/0x5B add, 0x5C/0x5D remove) are
-    // deliberately out of scope for this phase.
+    // Counter listeners (docs/adr/0022-distributed-counter-listeners.md),
+    // confirmed against HotRodConstants.java on both sides. Plain
+    // "response = request + 1" pairs, unlike CounterIsDefined above:
+    // nothing sits between either of these and its own response.
+    // The pushed event opcode itself, COUNTER_EVENT (0x66), has no
+    // request and is deliberately not in this enum, the same
+    // treatment listener.rs already gives the cache event opcodes
+    // (EVENT_CREATED etc.): see counter_listener.rs.
+    CounterAddListener = 0x5A,
+    CounterRemoveListener = 0x5C,
     CounterRemove = 0x5E,
     CounterGetNames = 0x64,
     CounterGetAndSet = 0x7F,

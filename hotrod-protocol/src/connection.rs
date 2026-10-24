@@ -739,6 +739,27 @@ impl HotRodConnection {
         result
     }
 
+    /// Registers a counter listener, `body` already encoded by
+    /// `counter_listener.rs` (counter name, then listener id; no
+    /// factories or interests, unlike `add_client_listener`'s fuller
+    /// body: the counter listener protocol has no server-side
+    /// filtering concept at all). Same handoff as `add_client_listener`:
+    /// the connection is expected to go to `counter_listener.rs` via
+    /// `into_transport` right after, not reused here.
+    pub(crate) async fn counter_add_listener(&mut self, body: &[u8]) -> Result<()> {
+        self.begin_operation()?;
+        let timeout = self.timeout;
+        let result = with_timeout(timeout, async {
+            let cache_name = self.cache_name.clone();
+            self.write_and_read_header(&cache_name, OpCode::CounterAddListener, body)
+                .await?;
+            Ok(())
+        })
+        .await;
+        self.end_operation(result.is_ok());
+        result
+    }
+
     /// Returns `true` if `key` exists in the cache.
     ///
     /// Mirrors `ContainsKeyOperation`: `is_success` and `!is_not_exist`
