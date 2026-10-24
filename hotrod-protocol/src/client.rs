@@ -270,6 +270,24 @@ pub(crate) struct ClientInner {
     /// documents for an idle connection's timeout. See
     /// `docs/adr/0020-multicluster-proactive-switch-back.md`.
     pub(crate) switch_back_check_interval: RwLock<Option<Duration>>,
+    /// Per-cluster auth/TLS overrides, keyed by whatever name
+    /// `clusters` itself uses (`HotRodClient::DEFAULT_CLUSTER_NAME`
+    /// included). A cluster absent here, or present with a field left
+    /// `None`, falls back to this client's global `auth`/`tls`. See
+    /// `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`.
+    pub(crate) cluster_overrides: RwLock<HashMap<String, ClusterOverride>>,
+}
+
+/// One cluster's own auth/TLS, overriding this client's global
+/// default (`ClientInner::auth`/`tls`) for every connection dialed to
+/// that cluster specifically. `None` in either field inherits the
+/// global value; there is no way to override one and not the other
+/// independently of this type's own shape, since both inherit the
+/// same way.
+#[derive(Clone, Default)]
+pub(crate) struct ClusterOverride {
+    pub(crate) auth: Option<AuthMethod>,
+    pub(crate) tls: Option<TlsConfig>,
 }
 
 /// A cache client that tracks cluster topology and routes each operation
@@ -455,6 +473,7 @@ impl HotRodClient {
                         switch_back_check_interval: RwLock::new(Some(
                             DEFAULT_SWITCH_BACK_CHECK_INTERVAL,
                         )),
+                        cluster_overrides: RwLock::new(HashMap::new()),
                     })));
                 }
                 Ok((index, _addr, Err(err))) => errors[index] = Some(err),
@@ -701,6 +720,38 @@ impl HotRodClient {
             .clone()
     }
 
+    /// `cluster_name`'s own auth/TLS, falling back to this client's
+    /// global `auth`/`tls` for whichever field (or both) that
+    /// cluster has no override for
+    /// (`docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`).
+    /// Every connection this client ever dials goes through this:
+    /// `try_promote_seed` (any cluster, switching to it or just
+    /// trying another of its own seeds) and `open_and_authenticate`/
+    /// `authenticate_with` (always the active cluster, see
+    /// `open_and_authenticate`'s own docs for why).
+    fn effective_auth_and_tls(
+        &self,
+        cluster_name: &str,
+    ) -> (Option<AuthMethod>, Option<TlsConfig>) {
+        let overrides = self
+            .0
+            .cluster_overrides
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let over = overrides.get(cluster_name);
+        let auth = over.and_then(|o| o.auth.clone()).or_else(|| {
+            self.0
+                .auth
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        let tls = over
+            .and_then(|o| o.tls.clone())
+            .or_else(|| self.0.tls.clone());
+        (auth, tls)
+    }
+
     /// The active seed address and a fresh subscription to this
     /// client's cluster-switch generation counter, read together under
     /// one acquisition of `active`'s read lock. `pub(crate)`:
@@ -777,12 +828,21 @@ impl HotRodClient {
     ) -> Result<SocketAddr> {
         let topology_id = self.current_topology_id();
         let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
-        let auth = self
-            .0
-            .auth
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        // The cluster whose own auth/TLS override (if any) applies: the
+        // one being switched to, or, for `failover_seed`'s "same
+        // cluster, another seed" case (`switch_to_cluster_name` is
+        // `None`), whichever cluster is currently active.
+        let target_cluster_name = match switch_to_cluster_name {
+            Some(name) => name.to_string(),
+            None => self
+                .0
+                .active
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .name
+                .clone(),
+        };
+        let (auth, tls) = self.effective_auth_and_tls(&target_cluster_name);
         let mut last_err: Option<Error> = None;
         for &addr in candidates {
             if Some(addr) == skip {
@@ -793,7 +853,7 @@ impl HotRodClient {
                 cache_name,
                 topology_id,
                 timeout,
-                self.0.tls.as_ref(),
+                tls.as_ref(),
                 true, // dialing a seed: verify by hostname
             )
             .await
@@ -1026,12 +1086,16 @@ impl HotRodClient {
             .active_seed_addr;
         let topology_id = self.current_topology_id();
         let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
+        // Validates against whichever TLS the active cluster actually
+        // dials with, honoring an override already set for it rather
+        // than always assuming the global `tls`.
+        let (_, tls) = self.effective_auth_and_tls(&self.active_cluster_name());
         let mut conn = HotRodConnection::connect_hash_aware(
             seed,
             "",
             topology_id,
             timeout,
-            self.0.tls.as_ref(),
+            tls.as_ref(),
             true,
         )
         .await?;
@@ -1045,6 +1109,187 @@ impl HotRodClient {
             .values()
         {
             pool.invalidate_idle();
+        }
+        Ok(())
+    }
+
+    /// Same as `authenticate_plain`, but only for connections to the
+    /// cluster named `name` (`DEFAULT_CLUSTER_NAME`, or one
+    /// `add_cluster` added), independently of this client's global
+    /// credentials. See `authenticate_for_cluster_with` and
+    /// `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`.
+    pub async fn authenticate_plain_for_cluster(
+        &self,
+        name: &str,
+        authzid: &str,
+        authcid: &str,
+        password: &str,
+    ) -> Result<()> {
+        self.authenticate_for_cluster_with(
+            name,
+            AuthMethod::Plain {
+                authzid: authzid.to_string(),
+                authcid: authcid.to_string(),
+                password: password.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Same as `authenticate_scram`, but only for connections to the
+    /// cluster named `name`. See `authenticate_plain_for_cluster`.
+    pub async fn authenticate_scram_for_cluster(
+        &self,
+        name: &str,
+        authcid: &str,
+        password: &str,
+    ) -> Result<()> {
+        self.authenticate_for_cluster_with(
+            name,
+            AuthMethod::Scram {
+                authcid: authcid.to_string(),
+                password: password.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Same as `authenticate_digest`, but only for connections to the
+    /// cluster named `name`. See `authenticate_plain_for_cluster`.
+    pub async fn authenticate_digest_for_cluster(
+        &self,
+        name: &str,
+        authcid: &str,
+        password: &str,
+    ) -> Result<()> {
+        self.authenticate_for_cluster_with(
+            name,
+            AuthMethod::Digest {
+                authcid: authcid.to_string(),
+                password: password.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Same as `authenticate_oauthbearer`, but only for connections to
+    /// the cluster named `name`. See `authenticate_plain_for_cluster`.
+    pub async fn authenticate_oauthbearer_for_cluster(
+        &self,
+        name: &str,
+        authzid: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.authenticate_for_cluster_with(
+            name,
+            AuthMethod::OAuthBearer {
+                authzid: authzid.to_string(),
+                token: token.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `authenticate_with`'s per-cluster counterpart: dials `name`'s own
+    /// first seed address (not necessarily the active cluster, matching
+    /// `authenticate_with`'s own single-address, no-fallback dial) to
+    /// validate `method` before storing it as that cluster's own auth
+    /// override, rather than this client's global default. Dials with
+    /// `name`'s own TLS override already in place, if any was set via
+    /// `set_cluster_tls` before this call.
+    ///
+    /// Invalidates every pool's idle connections when `name` is the
+    /// currently active cluster, the same reason `authenticate_with`
+    /// does: an idle pooled connection for one of this cluster's nodes
+    /// may have been opened under the credentials just replaced.
+    /// Harmless, if slightly broader than strictly necessary, when
+    /// `name` is not active: there is normally nothing pooled for an
+    /// inactive cluster's nodes anyway (`ClusterOverride`'s own docs).
+    async fn authenticate_for_cluster_with(&self, name: &str, method: AuthMethod) -> Result<()> {
+        let seed_addrs = {
+            let clusters = self.0.clusters.read().unwrap_or_else(|p| p.into_inner());
+            clusters
+                .iter()
+                .find(|(existing, _)| existing == name)
+                .ok_or_else(|| Error::UnknownCluster(name.to_string()))?
+                .1
+                .clone()
+        };
+        let &addr = seed_addrs.first().ok_or_else(|| {
+            Error::InvalidClusterConfig(format!("cluster {name:?} has no seed addresses"))
+        })?;
+        let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
+        let (_, tls) = self.effective_auth_and_tls(name);
+        let mut conn = HotRodConnection::connect_hash_aware(
+            addr,
+            "",
+            DEFAULT_TOPOLOGY_ID,
+            timeout,
+            tls.as_ref(),
+            true,
+        )
+        .await?;
+        method.authenticate(&mut conn).await?;
+        self.0
+            .cluster_overrides
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(name.to_string())
+            .or_default()
+            .auth = Some(method);
+        if self.active_cluster_name() == name {
+            for pool in self
+                .0
+                .pools
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+            {
+                pool.invalidate_idle();
+            }
+        }
+        Ok(())
+    }
+
+    /// Overrides the TLS configuration used for every connection this
+    /// client dials to the cluster named `name` (`DEFAULT_CLUSTER_NAME`,
+    /// or one `add_cluster` added), independently of this client's
+    /// global `tls`. `None` reverts to the global configuration.
+    ///
+    /// Purely local bookkeeping, no dial: unlike
+    /// `authenticate_plain_for_cluster` and its siblings, `TlsConfig` is
+    /// inert data until a real connection attempt uses it, the same
+    /// reason this client's own global `tls` has no setter at all
+    /// today (fixed at construction). See
+    /// `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`.
+    ///
+    /// Invalidates every pool's idle connections when `name` is the
+    /// currently active cluster, the same reasoning
+    /// `authenticate_for_cluster_with` documents.
+    pub fn set_cluster_tls(&self, name: &str, tls: Option<TlsConfig>) -> Result<()> {
+        {
+            let clusters = self.0.clusters.read().unwrap_or_else(|p| p.into_inner());
+            if !clusters.iter().any(|(existing, _)| existing == name) {
+                return Err(Error::UnknownCluster(name.to_string()));
+            }
+        }
+        self.0
+            .cluster_overrides
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(name.to_string())
+            .or_default()
+            .tls = tls;
+        if self.active_cluster_name() == name {
+            for pool in self
+                .0
+                .pools
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+            {
+                pool.invalidate_idle();
+            }
         }
         Ok(())
     }
@@ -1284,6 +1529,13 @@ impl HotRodClient {
     /// `remote_cache.rs`'s `listen`/`listen_with` also call this directly
     /// to get a connection for `listener.rs` to take ownership of, since
     /// a listener's connection is never pooled (see that module's docs).
+    ///
+    /// Always reached for a node of the currently active cluster: `addr`
+    /// is either that cluster's own seed or one of its topology-discovered
+    /// nodes, never a node of an abandoned cluster (pools are keyed by
+    /// address, not by cluster, but `evict_abandoned_cluster` drains an
+    /// old cluster's pools on every switch, see ADR 0019). So this
+    /// resolves the active cluster's own auth/TLS override, if any.
     pub(crate) async fn open_and_authenticate(
         &self,
         addr: SocketAddr,
@@ -1292,21 +1544,16 @@ impl HotRodClient {
     ) -> Result<HotRodConnection> {
         let topology_id = self.current_topology_id();
         let timeout = *self.0.timeout.read().unwrap_or_else(|p| p.into_inner());
+        let (auth, tls) = self.effective_auth_and_tls(&self.active_cluster_name());
         let mut conn = HotRodConnection::connect_hash_aware(
             addr,
             cache_name,
             topology_id,
             timeout,
-            self.0.tls.as_ref(),
+            tls.as_ref(),
             origin.is_none(),
         )
         .await?;
-        let auth = self
-            .0
-            .auth
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
         if let Some(auth) = auth {
             auth.authenticate(&mut conn).await?;
         }
@@ -1644,6 +1891,7 @@ pub(crate) mod tests {
             )]),
             cluster_generation: watch::channel(0).0,
             switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
         });
 
         assert_eq!(client.max_retries(), DEFAULT_MAX_RETRIES);
@@ -1688,6 +1936,7 @@ pub(crate) mod tests {
             )]),
             cluster_generation: watch::channel(0).0,
             switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
         })
     }
 
@@ -2278,6 +2527,7 @@ pub(crate) mod tests {
             )]),
             cluster_generation: watch::channel(0).0,
             switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
         });
 
         client
@@ -2367,6 +2617,7 @@ pub(crate) mod tests {
             )]),
             cluster_generation: watch::channel(0).0,
             switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
         });
 
         client
@@ -2390,6 +2641,236 @@ pub(crate) mod tests {
             .expect("ping should open a fresh connection, not reuse the invalidated one");
 
         seed_task.await.unwrap();
+    }
+
+    /// `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`: a
+    /// cluster with its own override uses it for the field(s) it set,
+    /// and still falls back to this client's global `auth`/`tls` for
+    /// whichever field (or both) it left unset, including a cluster
+    /// never mentioned in `cluster_overrides` at all.
+    #[test]
+    fn effective_auth_and_tls_falls_back_to_global_unless_a_cluster_has_its_own_override() {
+        let global_auth = AuthMethod::Plain {
+            authzid: String::new(),
+            authcid: "global-user".to_string(),
+            password: "global-pass".to_string(),
+        };
+        let global_tls = TlsConfig {
+            server_name: "global.example".to_string(),
+            ..TlsConfig::default()
+        };
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "auth-only".to_string(),
+            ClusterOverride {
+                auth: Some(AuthMethod::Plain {
+                    authzid: String::new(),
+                    authcid: "dr-user".to_string(),
+                    password: "dr-pass".to_string(),
+                }),
+                tls: None,
+            },
+        );
+        overrides.insert(
+            "tls-only".to_string(),
+            ClusterOverride {
+                auth: None,
+                tls: Some(TlsConfig {
+                    server_name: "dr.example".to_string(),
+                    ..TlsConfig::default()
+                }),
+            },
+        );
+
+        let client = HotRodClient::from_inner(ClientInner {
+            active: RwLock::new(ActiveCluster {
+                name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                seed_addrs: vec!["127.0.0.1:1".parse().unwrap()],
+                active_seed_addr: "127.0.0.1:1".parse().unwrap(),
+                topology: None,
+            }),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(Some(global_auth)),
+            tls: Some(global_tls),
+            timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec!["127.0.0.1:1".parse().unwrap()],
+            )]),
+            cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(overrides),
+        });
+
+        let (auth, tls) = client.effective_auth_and_tls("auth-only");
+        assert!(matches!(
+            auth,
+            Some(AuthMethod::Plain { ref authcid, .. }) if authcid == "dr-user"
+        ));
+        assert_eq!(tls.unwrap().server_name, "global.example");
+
+        let (auth, tls) = client.effective_auth_and_tls("tls-only");
+        assert!(matches!(
+            auth,
+            Some(AuthMethod::Plain { ref authcid, .. }) if authcid == "global-user"
+        ));
+        assert_eq!(tls.unwrap().server_name, "dr.example");
+
+        let (auth, tls) = client.effective_auth_and_tls(HotRodClient::DEFAULT_CLUSTER_NAME);
+        assert!(matches!(
+            auth,
+            Some(AuthMethod::Plain { ref authcid, .. }) if authcid == "global-user"
+        ));
+        assert_eq!(tls.unwrap().server_name, "global.example");
+    }
+
+    /// `authenticate_plain_for_cluster` and `set_cluster_tls` validate
+    /// `name` the same way `switch_to_cluster` does, before anything
+    /// dials: no network involvement needed to confirm this.
+    #[tokio::test]
+    async fn authenticate_for_cluster_and_set_cluster_tls_reject_an_unknown_cluster() {
+        let seed_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = HotRodClient::from_inner(ClientInner {
+            active: RwLock::new(ActiveCluster {
+                name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                seed_addrs: vec![seed_addr],
+                active_seed_addr: seed_addr,
+                topology: None,
+            }),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(None),
+            tls: None,
+            timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![(
+                HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                vec![seed_addr],
+            )]),
+            cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
+        });
+
+        assert!(matches!(
+            client
+                .authenticate_plain_for_cluster("missing", "", "user", "pass")
+                .await,
+            Err(Error::UnknownCluster(name)) if name == "missing"
+        ));
+        assert!(matches!(
+            client.set_cluster_tls("missing", None),
+            Err(Error::UnknownCluster(name)) if name == "missing"
+        ));
+    }
+
+    /// End-to-end confirmation (`docs/adr/0021-multicluster-per-cluster-auth-and-tls.md`):
+    /// a cluster with its own auth override uses those credentials over
+    /// the wire, not the global ones, both for `authenticate_plain_for_cluster`'s
+    /// own validation dial and for the real connection a later operation
+    /// opens once switched to it.
+    #[tokio::test]
+    async fn authenticate_plain_for_cluster_is_used_once_switched_to_that_cluster() {
+        async fn serve_ping(stream: &mut TcpStream) {
+            use tokio::io::AsyncWriteExt;
+            let (id, opcode) = read_request_opcode(stream).await;
+            assert_eq!(opcode, 0x17, "expected a Ping request");
+            let mut resp = response_header(id, 0x18, 0x00);
+            resp.push(0);
+            resp.push(0);
+            resp.push(41);
+            write_vint(&mut resp, 0);
+            stream.write_all(&resp).await.unwrap();
+        }
+
+        let default_response = b"\0global-user\0global-pass".to_vec();
+        let dr_response = b"\0dr-user\0dr-pass".to_vec();
+
+        let default_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let default_addr = default_listener.local_addr().unwrap();
+        let dr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dr_addr = dr_listener.local_addr().unwrap();
+
+        let expected_default = default_response.clone();
+        let default_task = tokio::spawn(async move {
+            // Only `authenticate_plain`'s own validation dial: the
+            // default cluster is never switched to or operated on in
+            // this test.
+            let (mut probe, _) = default_listener.accept().await.unwrap();
+            serve_plain_auth(&mut probe, &expected_default).await;
+        });
+
+        let expected_dr = dr_response.clone();
+        let dr_task = tokio::spawn(async move {
+            // `authenticate_plain_for_cluster`'s own validation dial...
+            let (mut probe, _) = dr_listener.accept().await.unwrap();
+            serve_plain_auth(&mut probe, &expected_dr).await;
+
+            // ...then the real connection `ping` opens once this client
+            // has switched to "dr", which must replay the same
+            // "dr"-specific credentials, not the global ones.
+            let (mut real, _) = dr_listener.accept().await.unwrap();
+            serve_plain_auth(&mut real, &expected_dr).await;
+            serve_ping(&mut real).await;
+        });
+
+        let client = HotRodClient::from_inner(ClientInner {
+            active: RwLock::new(ActiveCluster {
+                name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                seed_addrs: vec![default_addr],
+                active_seed_addr: default_addr,
+                topology: None,
+            }),
+            node_origin: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            auth: RwLock::new(None),
+            tls: None,
+            timeout: RwLock::new(Duration::from_secs(5)),
+            cache_stats: RwLock::new(HashMap::new()),
+            node_health: NodeHealth::default(),
+            server_failure_timeout: RwLock::new(Some(DEFAULT_SERVER_FAILURE_TIMEOUT)),
+            max_retries: RwLock::new(DEFAULT_MAX_RETRIES),
+            clusters: RwLock::new(vec![
+                (
+                    HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
+                    vec![default_addr],
+                ),
+                ("dr".to_string(), vec![dr_addr]),
+            ]),
+            cluster_generation: watch::channel(0).0,
+            switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
+        });
+
+        client
+            .authenticate_plain("", "global-user", "global-pass")
+            .await
+            .expect("authenticate the global default");
+        client
+            .authenticate_plain_for_cluster("dr", "", "dr-user", "dr-pass")
+            .await
+            .expect("authenticate the dr cluster's own override");
+
+        client
+            .switch_to_cluster("dr")
+            .expect("dr is a configured cluster");
+        client
+            .cache("my-cache")
+            .ping()
+            .await
+            .expect("ping against dr should replay dr's own credentials");
+
+        default_task.await.unwrap();
+        dr_task.await.unwrap();
     }
 
     /// Reproduces the review finding on `checkout`/`PendingSlot`: before
@@ -2426,6 +2907,7 @@ pub(crate) mod tests {
             )]),
             cluster_generation: watch::channel(0).0,
             switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
         });
 
         // DEFAULT_MAX_CONNECTIONS_PER_NODE is 8: twice that many failed

@@ -1383,6 +1383,7 @@ pub(crate) mod tests {
             )]),
             cluster_generation: watch::channel(0).0,
             switch_back_check_interval: RwLock::new(Some(DEFAULT_SWITCH_BACK_CHECK_INTERVAL)),
+            cluster_overrides: RwLock::new(HashMap::new()),
             active: RwLock::new(ActiveCluster {
                 name: HotRodClient::DEFAULT_CLUSTER_NAME.to_string(),
                 seed_addrs,
