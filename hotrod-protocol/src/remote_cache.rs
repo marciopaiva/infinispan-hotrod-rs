@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crate::client::HotRodClient;
 use crate::connection::{HotRodConnection, VersionedResult, VersionedValue};
 use crate::counter::CounterConfiguration;
+use crate::counter_listener::CounterListener;
 use crate::error::{Error, Result};
 use crate::health::NodeHealth;
 use crate::iteration::{CacheIterator, IterationOptions, NodeIterator};
@@ -531,6 +532,30 @@ impl RemoteCache {
             self.cache_name.as_bytes(),
             self.client.timeout(),
             options,
+            generation_rx,
+        )
+        .await
+    }
+
+    /// `StrongCounter::listen`/`WeakCounter::listen`'s own entry
+    /// point (`docs/adr/0022-distributed-counter-listeners.md`): same
+    /// shape as `listen_with` above (the active seed, dedicated
+    /// connection, race-free seed+generation read), for `counter_name`
+    /// on this cache, which is always `org.infinispan.COUNTER` by the
+    /// time a `StrongCounter`/`WeakCounter` reaches this. `pub(crate)`
+    /// only: not a supported entry point through a bare `RemoteCache`,
+    /// the same as counters' own CRUD operations.
+    pub(crate) async fn listen_for_counter(&self, counter_name: &str) -> Result<CounterListener> {
+        let (seed, generation_rx) = self.client.active_seed_addr_and_generation();
+        let conn = self
+            .client
+            .open_and_authenticate(seed, &self.cache_name, None)
+            .await?;
+        CounterListener::register(
+            conn,
+            counter_name,
+            self.cache_name.as_bytes(),
+            self.client.timeout(),
             generation_rx,
         )
         .await

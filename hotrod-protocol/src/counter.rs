@@ -10,6 +10,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::client::HotRodClient;
+use crate::counter_listener::CounterListener;
 use crate::error::{Error, Result};
 use crate::remote_cache::RemoteCache;
 use crate::varint::{read_vint, write_vint};
@@ -278,6 +279,13 @@ impl StrongCounter {
     pub async fn remove(&self) -> Result<()> {
         self.cache.counter_remove(self.name.clone()).await
     }
+
+    /// Registers a listener for this counter's value-change events,
+    /// on a connection dedicated to it alone
+    /// (`docs/adr/0022-distributed-counter-listeners.md`).
+    pub async fn listen(&self) -> Result<CounterListener> {
+        self.cache.listen_for_counter(&self.name).await
+    }
 }
 
 /// A handle to one weak counter: not atomic (reads may lag writes),
@@ -335,6 +343,11 @@ impl WeakCounter {
     /// confirmed against a live server.
     pub async fn remove(&self) -> Result<()> {
         self.cache.counter_remove(self.name.clone()).await
+    }
+
+    /// Same as `StrongCounter::listen`, for a weak counter.
+    pub async fn listen(&self) -> Result<CounterListener> {
+        self.cache.listen_for_counter(&self.name).await
     }
 }
 

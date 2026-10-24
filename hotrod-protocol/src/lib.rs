@@ -40,6 +40,7 @@ mod admin;
 mod client;
 mod connection;
 mod counter;
+mod counter_listener;
 mod digest;
 mod error;
 mod hash;
@@ -72,6 +73,7 @@ pub use connection::{HotRodConnection, VersionedResult, VersionedValue, DEFAULT_
 pub use counter::{
     CounterConfiguration, CounterManager, CounterType, Storage, StrongCounter, WeakCounter,
 };
+pub use counter_listener::{CounterEvent, CounterListener, CounterState};
 pub use error::{Error, MarshallingSide, Result};
 pub use iteration::{CacheIterator, IterationEntry, IterationOptions};
 pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions, ServerFactory};

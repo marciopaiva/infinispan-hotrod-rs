@@ -88,6 +88,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   falls back to. Scoped to authentication and TLS only, not
   `ClientIntelligence`. See
   `docs/adr/0021-multicluster-per-cluster-auth-and-tls.md` (#114).
+- Distributed counters: `StrongCounter::listen`/`WeakCounter::listen`
+  register a value-change listener on a dedicated connection,
+  mirroring `RemoteCache::listen`'s own shape (ADR 0006). No
+  server-side filtering exists in this protocol, unlike cache
+  listeners. See
+  `docs/adr/0022-distributed-counter-listeners.md` (#113).
 
 ### Fixed
 
