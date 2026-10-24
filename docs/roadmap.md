@@ -215,6 +215,10 @@ individual surfaces.
   does for strong counters, a deliberate simplification (correctness
   unaffected, a cluster deployment pays an extra hop the Java client
   would not). See `docs/adr/0015-distributed-counters.md`.
+  `StrongCounter::listen`/`WeakCounter::listen` (#113) register a
+  value-change listener on a dedicated connection, mirroring
+  `RemoteCache::listen`'s own shape (ADR 0006). See
+  `docs/adr/0022-distributed-counter-listeners.md`.
 * ~~Remote administration (#55)~~ (done). `HotRodClient::administration()`
   creates, removes and lists caches
   (`create_cache`/`get_or_create_cache`/`remove_cache`/`cache_names`),

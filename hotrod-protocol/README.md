@@ -28,7 +28,7 @@ for release notes.
 | Near caching | Yes | Yes |
 | Transactions | Yes | Yes (`NON_XA`, one-phase commit only; real XA and recovery not yet implemented) |
 | Multimap cache | Yes | Yes |
-| Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed) |
+| Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed; value-change listeners supported) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise) |
 | Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE) |
 | Remote task execution | Yes | No |
@@ -257,6 +257,12 @@ counters
 
 let counter = counters.strong_counter("requests-served");
 let total = counter.increment_and_get().await?;
+
+let mut listener = counter.listen().await?;
+while let Some(event) = listener.next().await {
+    let event = event?;
+    println!("{} -> {}", event.old_value, event.new_value);
+}
 ```
 
 `multimap_cache` is a cache where each key maps to a collection of
