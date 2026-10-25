@@ -186,3 +186,18 @@ dispatches the same variant through `call(key, ..)`.
 * A caller invoking a task that ignores its routing key, or passing
   none via `execute`, gets the same result either way; the key only
   ever affects which server receives the request.
+* **No live-server test for `execute`/`execute_near` themselves**, by
+  design, confirmed empirically during a later documentation and test
+  audit: `tests/live_server.rs`'s CI fixture (`infinispan/server:15.1`)
+  ships the `infinispan-scripting` module but no script engine to run
+  a user-defined task with (uploading a JavaScript task over REST
+  fails with `ISPN027510: Cannot find an appropriate script engine`,
+  confirmed by running the exact upload against that image). A real
+  live test would need either a heavier server image carrying a
+  script engine or a compiled Java task deployed into the server's
+  `lib` directory, both disproportionate to the gain for a mechanism
+  whose wire encoding is already covered end to end by two unit tests
+  (`remote_cache.rs`: one asserting the request's cache name, task
+  name and params and the response bytes; one asserting the routing
+  key never reaches the wire). Left as a known limitation rather than
+  worked around.
