@@ -19,8 +19,8 @@ real cost if gotten wrong:
 
 **Which TLS library.** The two realistic choices are `rustls` (pure
 Rust) and `native-tls`/`openssl` (a safe wrapper around the platform's
-TLS library, which on Linux means linking OpenSSL). `CLAUDE.md` section 2
-already rules out "no unsafe FFI, no C++ client wrapped" for
+TLS library, which on Linux means linking OpenSSL). This project's stack
+agreement already rules out "no unsafe FFI, no C++ client wrapped" for
 `hotrod-protocol`. A safe wrapper crate does not violate that rule
 literally, since the `unsafe` lives inside the wrapper, not in this
 crate. But it does pull in a C library and its own build-time

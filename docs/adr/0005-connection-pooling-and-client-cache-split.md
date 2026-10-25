@@ -29,7 +29,7 @@ A generic pooling crate (`deadpool`, `bb8`) does not know this rule, so
 it would not save the part of the work that is actually specific to
 Hot Rod; it would only replace the `Vec`/semaphore bookkeeping, which is
 small by comparison. Pulling in such a crate is also a new dependency,
-a stop-and-ask item under CLAUDE.md section 5.
+a stop-and-ask item under this project's working agreement.
 
 **Public API shape.** `HotRodCluster` manages exactly one cache today,
 same as `HotRodConnection`. ADR 0003 already flagged that a

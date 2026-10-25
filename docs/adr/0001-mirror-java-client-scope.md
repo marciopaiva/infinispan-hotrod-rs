@@ -34,7 +34,7 @@ a working, testable increment:
    eviction.
 
 Each phase is tracked as a GitHub issue. Starting a phase still goes
-through the Analyze/Propose steps in `CLAUDE.md` section 4, since each one
+through this project's Analyze/Propose workflow, since each one
 touches the public API of `hotrod-protocol`.
 
 ## Consequences

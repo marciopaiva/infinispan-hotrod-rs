@@ -331,8 +331,8 @@ implementation of the same two messages.
 Issue #110 names no caller who needs this; it was filed to track the
 gap rather than to request the feature. Building a second wire
 encoding for a message pair with zero known callers contradicts this
-project's own rule against speculative work (CLAUDE.md, workflow
-section): there is nothing to Propose a design against yet, because
+project's own rule against speculative work (the working agreement's
+workflow section): there is nothing to Propose a design against yet, because
 there is no concrete request shape to design for (whole entities only?
 projected columns? how do named parameter types map to JSON, given
 `QueryValue` has no JSON-native encoding today?).
