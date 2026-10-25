@@ -254,3 +254,12 @@ themselves. Confirmed against the Java client's own source
   already accepted, deliberately, for distributed counters. The six
   new tasks here follow the existing, already-decided choice rather
   than introducing a second, inconsistent one.
+
+### Addendum: user-defined remote task execution (#51)
+
+The mechanism this ADR named as "out of scope here" for a
+user-defined task is implemented, in its own ADR: `execute_task`'s
+shared wire encoding now also backs a public `RemoteCache::execute`/
+`execute_near`, declaring the connection's real cache name instead of
+the empty one admin tasks use. See
+`docs/adr/0025-remote-task-execution.md`.

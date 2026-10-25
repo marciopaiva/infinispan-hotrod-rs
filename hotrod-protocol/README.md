@@ -31,7 +31,7 @@ for release notes.
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed; value-change listeners supported) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise; also covers remote query and multimap cache) |
 | Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE; `stream` pages through large result sets instead of buffering) |
-| Remote task execution | Yes | No |
+| Remote task execution | Yes | Yes (`execute`/`execute_near`; params and result are raw bytes, no typed wrapper yet) |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
 | Client statistics | Yes | Yes |
@@ -270,6 +270,24 @@ client
     .update_configuration_attribute("sessions", "clustering.remote-timeout", "30000")
     .await?;
 client.administration().assign_alias("web-sessions", "sessions").await?;
+```
+
+`execute` runs an arbitrary server-side named task, not just the
+built-in remote-administration ones: the same `EXEC_REQUEST`/
+`EXEC_RESPONSE` mechanism, against this cache rather than at the
+cache-manager level. Params and the result are raw bytes; the task's
+own contract decides how to interpret them. `execute_near` takes an
+extra routing key, sent to that key's owner but never put on the wire
+itself:
+
+```rust
+let result = cache
+    .execute("my-task", &[("greeting".to_string(), b"hello".to_vec())])
+    .await?;
+
+let result = cache
+    .execute_near("my-task", &[], b"some-key")
+    .await?;
 ```
 
 `counters` defines and uses distributed counters. A `StrongCounter`

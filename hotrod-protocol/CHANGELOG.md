@@ -117,6 +117,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   if set on the builder, still caps the stream's total row count
   rather than meaning page size. No new opcode. See
   `docs/adr/0024-remote-query-streaming.md` (#109).
+- `RemoteCache::execute`/`execute_near` run an arbitrary server-side
+  named task, not just the built-in remote-administration ones, on
+  the same `EXEC_REQUEST`/`EXEC_RESPONSE` mechanism, confirmed against
+  the Java client's own source to differ only in declaring the real
+  cache name rather than an empty one. `execute_near` routes to a
+  key's owner; the key is never sent on the wire. Params and the
+  result stay raw bytes; no new opcode. See
+  `docs/adr/0025-remote-task-execution.md` (#51).
 
 ### Fixed
 
