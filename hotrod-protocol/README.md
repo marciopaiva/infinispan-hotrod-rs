@@ -30,7 +30,7 @@ for release notes.
 | Multimap cache | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed; value-change listeners supported) |
 | Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise; also covers remote query and multimap cache) |
-| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE) |
+| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE; `stream` pages through large result sets instead of buffering) |
 | Remote task execution | Yes | No |
 | Streaming for large values | Yes | Yes |
 | Server-side iteration | Yes | Yes |
@@ -206,6 +206,20 @@ let removed = cache
     .param("title", QueryValue::String("Dune".to_string()))
     .execute_statement()
     .await?;
+```
+
+`stream` pages through a large result set instead of buffering it all
+in one `QueryResult`: there is no server-side cursor for query
+results on this wire, so this repeats the request with an advancing
+offset, `page_size` rows at a time:
+
+```rust
+let mut rows = cache.query("FROM demo.Book").stream(100);
+while let Some(row) = rows.next_row().await? {
+    if let QueryRow::Entity(bytes) = row {
+        // decode `bytes` with whatever Marshaller matches the Book schema
+    }
+}
 ```
 
 `typed`'s own `query` unmarshals a whole-entity row through the
