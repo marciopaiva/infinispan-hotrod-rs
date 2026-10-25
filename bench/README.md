@@ -92,6 +92,26 @@ call to compare:
 of scope: comparing it fairly needs a distributed cache across a
 multi-node cluster, a different setup than this single-connection bench.
 
+Three features added after the table above was first written are timed
+on the Rust side only, with no Java-side equivalent yet: remote query
+(`query`, `execute_statement`, `query_stream`, #109) and the six
+additional remote-administration tasks from #112
+(`update_configuration_attribute`, `assign_alias`, `reindex_cache`,
+`update_index_schema`, `create_template`, `remove_template`). Query
+runs with zero matching rows, the same scope decision
+`tests/live_server.rs`'s own query tests make
+(`docs/adr/0013-remote-query.md`): this crate has no Protobuf
+marshaller of its own to store a real entity with, so these three
+lines measure the Rust side's request/response overhead only, not a
+real query workload. The six administration tasks are real
+cluster-coordinated operations, not cheap per-call round trips like
+everything above, so they run `BENCH_ADMIN_ITERS` times each instead
+of `BENCH_ITERS`; their very low ops/ms numbers reflect that real
+cost, not a problem with the measurement. `execute`/`execute_near`
+(#51) are not benchmarked at all: see the live-server-test addendum in
+`docs/adr/0025-remote-task-execution.md`, the same server-image
+limitation applies here (no script engine to deploy a task with).
+
 ## Parameters
 
 Both sides read the same environment variables, so a run can be adjusted
@@ -108,6 +128,7 @@ without recompiling:
 | `BENCH_VALUE_SIZE` | `100` | Value size in bytes |
 | `BENCH_BULK_REPEATS` | `5` | Repeats of `put_all`/`get_all` over the same batch |
 | `BENCH_CLEAR_ITERS` | `50` | Repeats of `clear`, kept low since it is destructive |
+| `BENCH_ADMIN_ITERS` | `5` | Repeats of each #112 administration task, kept low since these are real cluster-coordinated operations, not cheap round trips |
 
 ## Results
 
@@ -134,8 +155,22 @@ measurement.
 | `ping` | 12.08 | 82.79 | n/a | n/a |
 | `clear` | 3.69 | 271.33 | 4.63 | 215.92 |
 | `iter` | 529.57 | 1.89 | 241.88 | 4.13 |
+| `query` | 2.84 | 352.69 | n/a | n/a |
+| `execute_statement` | 3.05 | 328.07 | n/a | n/a |
+| `query_stream` | 2.96 | 338.22 | n/a | n/a |
+| `update_configuration_attribute` | 0.09 | 10943.58 | n/a | n/a |
+| `assign_alias` | 0.09 | 11756.79 | n/a | n/a |
+| `reindex_cache` | 0.01 | 99158.52 | n/a | n/a |
+| `update_index_schema` | 0.14 | 7291.07 | n/a | n/a |
+| `create_template` | 0.13 | 7413.73 | n/a | n/a |
+| `remove_template` | 0.26 | 3888.61 | n/a | n/a |
 
 `ping` has no Java number, per the exclusion noted above. `clear` is the
 one operation where the Java client comes out ahead in this run; every
 other operation, including the newly added `iter`, favors
-`hotrod-protocol`.
+`hotrod-protocol`. `query`/`execute_statement`/`query_stream` and the
+six administration tasks have no Java number yet, per the note above
+this table; the administration tasks' own `us/op` numbers (milliseconds,
+really) look nothing like every other row's, because they are real
+cluster-coordinated operations timed `BENCH_ADMIN_ITERS` (5) times
+each, not `BENCH_ITERS` (20000).
