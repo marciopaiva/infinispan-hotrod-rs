@@ -875,6 +875,53 @@ async fn query_round_trips_against_a_real_server_after_registering_a_schema() {
     assert_eq!(result.hit_count, 0);
 }
 
+#[tokio::test]
+#[ignore]
+async fn query_stream_and_execute_statement_round_trip_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    client
+        .register_proto_schema(
+            "live-server-test.proto",
+            "package live_server_test;\nmessage Widget {\n   optional string name = 1;\n}\n",
+        )
+        .await
+        .expect("register schema");
+
+    // Same scope decision as `query_round_trips_against_a_real_server_...`
+    // above (no Protobuf marshaller of this crate's own to store a real
+    // `Widget` with): this exercises `stream`'s and `execute_statement`'s
+    // own repeated `QueryRequest`/`QueryResponse` round trip against a
+    // real server (`docs/adr/0024-remote-query-streaming.md`), not that
+    // either one finds or affects any entry.
+    let cache = client.cache("");
+    let mut stream = cache.query("FROM live_server_test.Widget").stream(2);
+    let first_row = stream
+        .next_row()
+        .await
+        .expect("stream should round-trip against a real server");
+    assert_eq!(first_row, None);
+    assert_eq!(stream.hit_count(), 0);
+
+    let affected = cache
+        .query("DELETE FROM live_server_test.Widget")
+        .execute_statement()
+        .await
+        .expect("execute_statement should round-trip against a real server");
+    assert_eq!(affected, 0);
+}
+
 /// A minimal cache configuration fragment, confirmed against a real
 /// server to need no enclosing `<infinispan>`/`<cache-container>` or
 /// `name` attribute (the task's own `name` parameter supplies that):
@@ -956,6 +1003,173 @@ async fn administration_create_cache_names_and_remove_round_trip_against_a_real_
         !names.contains(&cache_name.to_string()),
         "expected {cache_name:?} to be gone from {names:?}"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn administration_additional_tasks_round_trip_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    let cache_name = "ci-admin-extra-test-cache";
+    let alias_name = "ci-admin-extra-test-alias";
+    let template_name = "ci-admin-extra-test-template";
+    let from_template_name = "ci-admin-extra-test-from-template";
+
+    // Best-effort cleanup from a previous run that may have failed
+    // partway through, same rationale as the administration test above.
+    let _ = client
+        .administration()
+        .remove_cache(from_template_name)
+        .await;
+    let _ = client.administration().remove_template(template_name).await;
+    let _ = client.administration().remove_cache(cache_name).await;
+
+    client
+        .administration()
+        .create_cache(
+            cache_name,
+            CacheConfig::Definition(ADMIN_TEST_CACHE_DEFINITION.to_string()),
+        )
+        .await
+        .expect("create_cache should succeed");
+
+    client
+        .administration()
+        .update_configuration_attribute(cache_name, "clustering.remote-timeout", "30000")
+        .await
+        .expect("update_configuration_attribute should succeed against a real server");
+
+    client
+        .administration()
+        .assign_alias(alias_name, cache_name)
+        .await
+        .expect("assign_alias should succeed against a real server");
+
+    // A write through the alias must be visible under the original cache
+    // name: this confirms the alias actually points at the same cache,
+    // not just that the task returned without error.
+    client
+        .cache(alias_name)
+        .put(
+            b"alias-key",
+            b"alias-value",
+            Expiration::Default,
+            Expiration::Default,
+        )
+        .await
+        .expect("put through the alias should succeed");
+    let value = client
+        .cache(cache_name)
+        .get(b"alias-key")
+        .await
+        .expect("get should succeed")
+        .expect("value written through the alias should be visible under the real cache name");
+    assert_eq!(value, b"alias-value".to_vec());
+
+    client
+        .administration()
+        .create_template(template_name, Some(ADMIN_TEST_CACHE_DEFINITION))
+        .await
+        .expect("create_template should succeed against a real server");
+
+    client
+        .administration()
+        .create_cache(
+            from_template_name,
+            CacheConfig::Template(template_name.to_string()),
+        )
+        .await
+        .expect("create_cache from the just-created template should succeed");
+
+    client
+        .administration()
+        .remove_cache(from_template_name)
+        .await
+        .expect("remove_cache should succeed");
+
+    client
+        .administration()
+        .remove_template(template_name)
+        .await
+        .expect("remove_template should succeed against a real server");
+
+    client
+        .administration()
+        .remove_cache(cache_name)
+        .await
+        .expect("remove_cache should succeed");
+}
+
+/// Schema for `administration_reindex_and_update_index_schema_round_trip_against_a_real_server`:
+/// `@@cache@reindex`/`@@cache@updateindexschema` both require a cache
+/// actually configured with indexing, confirmed empirically (both tasks
+/// fail against a plain cache with a server error naming the missing
+/// index), which `ADMIN_TEST_CACHE_DEFINITION` above deliberately is not,
+/// to keep that test's scope to the four tasks that do not need one.
+const ADMIN_INDEXED_SCHEMA: &str = "package live_server_admin_test;\n/** @Indexed */\nmessage IndexedWidget {\n   /** @Basic */\n   optional string name = 1;\n}\n";
+
+const ADMIN_INDEXED_CACHE_DEFINITION: &str = "<distributed-cache><encoding media-type=\"application/x-protostream\"/><indexing><indexed-entities><indexed-entity>live_server_admin_test.IndexedWidget</indexed-entity></indexed-entities></indexing></distributed-cache>";
+
+#[tokio::test]
+#[ignore]
+async fn administration_reindex_and_update_index_schema_round_trip_against_a_real_server() {
+    let _guard = lock_live_server();
+    let addr: SocketAddr = env_or("INFINISPAN_ADDR", "127.0.0.1:11222")
+        .parse()
+        .expect("valid socket address");
+    let user = env_or("INFINISPAN_USER", "testuser");
+    let pass = env_or("INFINISPAN_PASS", "testpass");
+
+    let client = HotRodClient::connect(&[addr]).await.expect("connect");
+    client
+        .authenticate_plain("", &user, &pass)
+        .await
+        .expect("authenticate");
+
+    client
+        .register_proto_schema("live-server-admin-test.proto", ADMIN_INDEXED_SCHEMA)
+        .await
+        .expect("register schema");
+
+    let cache_name = "ci-admin-indexed-test-cache";
+    let _ = client.administration().remove_cache(cache_name).await;
+    client
+        .administration()
+        .create_cache(
+            cache_name,
+            CacheConfig::Definition(ADMIN_INDEXED_CACHE_DEFINITION.to_string()),
+        )
+        .await
+        .expect("create_cache with indexing should succeed");
+
+    client
+        .administration()
+        .reindex_cache(cache_name)
+        .await
+        .expect("reindex_cache should succeed against a real indexed cache");
+
+    client
+        .administration()
+        .update_index_schema(cache_name)
+        .await
+        .expect("update_index_schema should succeed against a real indexed cache");
+
+    client
+        .administration()
+        .remove_cache(cache_name)
+        .await
+        .expect("remove_cache should succeed");
 }
 
 #[tokio::test]
