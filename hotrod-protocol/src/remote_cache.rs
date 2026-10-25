@@ -2494,6 +2494,286 @@ pub(crate) mod tests {
         seed_task.await.unwrap();
     }
 
+    /// `Query::stream` (issue #109) repeats the request with an
+    /// advancing `start_offset`, `page_size` rows at a time, stopping
+    /// at the first page shorter than requested.
+    /// `docs/adr/0024-remote-query-streaming.md`.
+    #[tokio::test]
+    async fn query_stream_yields_rows_across_multiple_pages_then_exhausts() {
+        use crate::protobuf_wire::{read_int32, read_int64, skip_field};
+
+        fn parse_offset_and_max_results(body: &[u8]) -> (i64, Option<i32>) {
+            let mut pos = 0;
+            let mut start_offset = 0i64;
+            let mut max_results = None;
+            while let Some((field, wire_type)) = read_tag(body, &mut pos).unwrap() {
+                match field {
+                    3 => start_offset = read_int64(body, &mut pos).unwrap(),
+                    4 => max_results = Some(read_int32(body, &mut pos).unwrap()),
+                    _ => skip_field(body, &mut pos, wire_type).unwrap(),
+                }
+            }
+            (start_offset, max_results)
+        }
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            // Page 1: offset 0, a full page of 2.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let body = read_array(&mut stream).await.unwrap();
+            assert_eq!(parse_offset_and_max_results(&body), (0, Some(2)));
+            let response = query_response_bytes(
+                0,
+                &[
+                    wrapped_entity_bytes("org.example.User", b"one"),
+                    wrapped_entity_bytes("org.example.User", b"two"),
+                ],
+                5,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+
+            // Page 2: offset 2, another full page of 2.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let body = read_array(&mut stream).await.unwrap();
+            assert_eq!(parse_offset_and_max_results(&body), (2, Some(2)));
+            let response = query_response_bytes(
+                0,
+                &[
+                    wrapped_entity_bytes("org.example.User", b"three"),
+                    wrapped_entity_bytes("org.example.User", b"four"),
+                ],
+                5,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+
+            // Page 3: offset 4, a short final page of 1: no further
+            // request follows.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let body = read_array(&mut stream).await.unwrap();
+            assert_eq!(parse_offset_and_max_results(&body), (4, Some(2)));
+            let response =
+                query_response_bytes(0, &[wrapped_entity_bytes("org.example.User", b"five")], 5);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+        let mut rows = cache.query("FROM org.example.User").stream(2);
+
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next_row().await.expect("next_row should succeed") {
+            collected.push(row);
+        }
+
+        assert_eq!(
+            collected,
+            vec![
+                QueryRow::Entity(b"one".to_vec()),
+                QueryRow::Entity(b"two".to_vec()),
+                QueryRow::Entity(b"three".to_vec()),
+                QueryRow::Entity(b"four".to_vec()),
+                QueryRow::Entity(b"five".to_vec()),
+            ]
+        );
+        assert_eq!(rows.hit_count(), 5);
+
+        seed_task.await.unwrap();
+    }
+
+    /// `page_size(0)` falls back to the built-in default rather than
+    /// sending a literal `0` as `maxResults`.
+    #[tokio::test]
+    async fn query_stream_page_size_zero_uses_the_built_in_default() {
+        use crate::protobuf_wire::{read_int32, read_int64, skip_field};
+
+        fn parse_max_results(body: &[u8]) -> Option<i32> {
+            let mut pos = 0;
+            let mut max_results = None;
+            while let Some((field, wire_type)) = read_tag(body, &mut pos).unwrap() {
+                match field {
+                    4 => max_results = Some(read_int32(body, &mut pos).unwrap()),
+                    3 => {
+                        read_int64(body, &mut pos).unwrap();
+                    }
+                    _ => skip_field(body, &mut pos, wire_type).unwrap(),
+                }
+            }
+            max_results
+        }
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let body = read_array(&mut stream).await.unwrap();
+            assert_eq!(parse_max_results(&body), Some(100));
+            let response = query_response_bytes(0, &[], 0);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+        let mut rows = cache.query("FROM org.example.User").stream(0);
+
+        assert_eq!(
+            rows.next_row().await.expect("next_row should succeed"),
+            None
+        );
+
+        seed_task.await.unwrap();
+    }
+
+    /// `max_results`, set on the builder before `.stream()`, caps the
+    /// stream's total row count across every page rather than meaning
+    /// page size: the final page's own request is shrunk to fit the
+    /// remaining budget.
+    #[tokio::test]
+    async fn query_stream_shrinks_the_final_page_to_fit_max_results_budget() {
+        use crate::protobuf_wire::{read_int32, read_int64, skip_field};
+
+        fn parse_max_results(body: &[u8]) -> Option<i32> {
+            let mut pos = 0;
+            let mut max_results = None;
+            while let Some((field, wire_type)) = read_tag(body, &mut pos).unwrap() {
+                match field {
+                    4 => max_results = Some(read_int32(body, &mut pos).unwrap()),
+                    3 => {
+                        read_int64(body, &mut pos).unwrap();
+                    }
+                    _ => skip_field(body, &mut pos, wire_type).unwrap(),
+                }
+            }
+            max_results
+        }
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            // First page: the full page_size of 2, well within budget.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let body = read_array(&mut stream).await.unwrap();
+            assert_eq!(parse_max_results(&body), Some(2));
+            let response = query_response_bytes(
+                0,
+                &[
+                    wrapped_entity_bytes("org.example.User", b"one"),
+                    wrapped_entity_bytes("org.example.User", b"two"),
+                ],
+                3,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+
+            // Second page: only 1 remains in the budget, so the
+            // request's own maxResults is shrunk from page_size (2)
+            // down to 1, not sent as 2.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let body = read_array(&mut stream).await.unwrap();
+            assert_eq!(parse_max_results(&body), Some(1));
+            let response =
+                query_response_bytes(0, &[wrapped_entity_bytes("org.example.User", b"three")], 3);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+        let mut rows = cache
+            .query("FROM org.example.User")
+            .max_results(3)
+            .stream(2);
+
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next_row().await.expect("next_row should succeed") {
+            collected.push(row);
+        }
+
+        assert_eq!(
+            collected,
+            vec![
+                QueryRow::Entity(b"one".to_vec()),
+                QueryRow::Entity(b"two".to_vec()),
+                QueryRow::Entity(b"three".to_vec()),
+            ]
+        );
+
+        seed_task.await.unwrap();
+    }
+
+    /// An exactly-page-sized final page is indistinguishable from "a
+    /// full page with more rows after it" until one more, empty round
+    /// trip confirms exhaustion: the same ambiguity any offset/limit
+    /// pagination scheme has.
+    #[tokio::test]
+    async fn query_stream_sends_one_more_request_after_an_exact_full_final_page() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _body = read_array(&mut stream).await.unwrap();
+            let response = query_response_bytes(
+                0,
+                &[
+                    wrapped_entity_bytes("org.example.User", b"one"),
+                    wrapped_entity_bytes("org.example.User", b"two"),
+                ],
+                2,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _body = read_array(&mut stream).await.unwrap();
+            let response = query_response_bytes(0, &[], 2);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let cache = client.cache("my-cache");
+        let mut rows = cache.query("FROM org.example.User").stream(2);
+
+        assert_eq!(
+            rows.next_row().await.unwrap(),
+            Some(QueryRow::Entity(b"one".to_vec()))
+        );
+        assert_eq!(
+            rows.next_row().await.unwrap(),
+            Some(QueryRow::Entity(b"two".to_vec()))
+        );
+        assert_eq!(rows.next_row().await.unwrap(), None);
+
+        seed_task.await.unwrap();
+    }
+
     /// `execute_statement` (issue #108) runs the exact same
     /// `OpCode::Query` round trip as `execute`
     /// (`docs/adr/0013-remote-query.md`), with `hitCountAccuracy`

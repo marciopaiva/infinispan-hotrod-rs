@@ -501,6 +501,144 @@ impl<'a> Query<'a> {
             .await?;
         Ok(result.hit_count)
     }
+
+    /// Streams this query's results page by page instead of buffering
+    /// them all at once in `execute`'s one `QueryResult`
+    /// (`docs/adr/0024-remote-query-streaming.md`): there is no
+    /// server-side cursor for query results on this wire, confirmed
+    /// against the Java client's own `RemoteQuery`, which does this
+    /// exact repeated-request pagination by hand too. `page_size` is
+    /// how many rows each underlying request asks for; `0` uses a
+    /// built-in default. `max_results`, if set on this builder before
+    /// calling this, still caps the stream's total row count across
+    /// every page (not the page size); `start_offset`, if set, is
+    /// still where the first page starts.
+    pub fn stream(self, page_size: u32) -> QueryStream<'a> {
+        QueryStream::new(self, page_size)
+    }
+}
+
+/// `0` for `QueryStream::page_size` falls back to this. Not a
+/// wire-level default: the query protocol has no page/cursor concept
+/// of its own to mirror (`docs/adr/0024-remote-query-streaming.md`),
+/// unlike `IterationOptions::batch_size_or_default`'s `0`, which does
+/// have a real server-side default to fall back to.
+const DEFAULT_QUERY_STREAM_PAGE_SIZE: u32 = 100;
+
+/// Incremental results of a `Query::stream` call: repeats the same
+/// `execute`-shaped request with an advancing `start_offset` one page
+/// at a time, instead of one request that buffers every matching row
+/// (`docs/adr/0024-remote-query-streaming.md`). A page shorter than
+/// requested is the only exhaustion signal this protocol offers (the
+/// same ambiguity any offset/limit pagination scheme has): an
+/// exactly-page-sized final page still needs one more, empty round
+/// trip before this reports exhaustion.
+///
+/// Not related to this crate's `GetStreamStart`/`PutStreamStart`
+/// feature (`docs/adr/0008-streaming.md`), which streams one large
+/// value's own bytes; this streams a query's rows.
+pub struct QueryStream<'a> {
+    cache: &'a RemoteCache,
+    query: String,
+    named_parameters: Vec<(String, QueryValue)>,
+    next_offset: i64,
+    page_size: i32,
+    /// From `Query::max_results`, if the caller set it before
+    /// `.stream()`: the remaining row budget across the whole stream,
+    /// decremented as pages come back.
+    remaining_cap: Option<i64>,
+    buffer: std::collections::VecDeque<QueryRow>,
+    exhausted: bool,
+    hit_count: u32,
+    hit_count_exact: bool,
+}
+
+impl<'a> QueryStream<'a> {
+    fn new(query: Query<'a>, page_size: u32) -> Self {
+        let page_size = page_size.min(i32::MAX as u32);
+        let page_size = if page_size == 0 {
+            DEFAULT_QUERY_STREAM_PAGE_SIZE
+        } else {
+            page_size
+        } as i32;
+
+        Self {
+            cache: query.cache,
+            query: query.query,
+            named_parameters: query.named_parameters,
+            next_offset: query.start_offset,
+            page_size,
+            remaining_cap: query.max_results.map(i64::from),
+            buffer: std::collections::VecDeque::new(),
+            exhausted: false,
+            hit_count: 0,
+            hit_count_exact: false,
+        }
+    }
+
+    /// Returns the next row, fetching another page from the server
+    /// once the current one is drained. `Ok(None)` once the query is
+    /// exhausted (no more rows, or the `max_results` budget is spent).
+    pub async fn next_row(&mut self) -> Result<Option<QueryRow>> {
+        loop {
+            if let Some(row) = self.buffer.pop_front() {
+                return Ok(Some(row));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+
+            let fetch = match self.remaining_cap {
+                Some(remaining) if remaining <= 0 => {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+                Some(remaining) => self.page_size.min(remaining as i32),
+                None => self.page_size,
+            };
+
+            let result = self
+                .cache
+                .run_query(encode_query_request(
+                    &self.query,
+                    self.next_offset,
+                    Some(fetch),
+                    None,
+                    &self.named_parameters,
+                ))
+                .await?;
+
+            self.hit_count = result.hit_count;
+            self.hit_count_exact = result.hit_count_exact;
+
+            let returned = result.rows.len() as i64;
+            self.next_offset += returned;
+            if let Some(remaining) = self.remaining_cap.as_mut() {
+                *remaining -= returned;
+            }
+            if returned < i64::from(fetch) {
+                self.exhausted = true;
+            }
+            if returned == 0 {
+                return Ok(None);
+            }
+            self.buffer.extend(result.rows);
+        }
+    }
+
+    /// The total number of matching entries Infinispan reported, from
+    /// whichever page most recently answered (`0` before the first
+    /// page arrives). Not a single frozen count across the whole
+    /// stream: see `docs/adr/0024-remote-query-streaming.md`.
+    pub fn hit_count(&self) -> u32 {
+        self.hit_count
+    }
+
+    /// Whether `hit_count` is exact rather than a server-side
+    /// estimate, from the same most-recent page.
+    pub fn hit_count_exact(&self) -> bool {
+        self.hit_count_exact
+    }
 }
 
 /// Test-only wire-building helpers shared across modules

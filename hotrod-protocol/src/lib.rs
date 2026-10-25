@@ -81,14 +81,14 @@ pub use listener::{CacheEvent, CacheEventInterests, CacheListener, ListenOptions
 pub use marshall::{BytesMarshaller, Marshaller, Utf8Marshaller};
 pub use multimap::{MultimapCache, MultimapEntry};
 pub use near_cache::{NearCacheOptions, NearCachedCache};
-pub use query::{Query, QueryResult, QueryRow, QueryValue};
+pub use query::{Query, QueryResult, QueryRow, QueryStream, QueryValue};
 pub use remote_cache::RemoteCache;
 pub use stats::{ClientStatistics, NearCacheStatistics, PoolStatistics};
 pub use streaming::{GetStream, PutStream};
 pub use tls::TlsConfig;
 pub use transaction::Transaction;
 pub use typed_cache::{
-    TypedCache, TypedQuery, TypedQueryResult, TypedQueryRow, TypedVersionedValue,
+    TypedCache, TypedQuery, TypedQueryResult, TypedQueryRow, TypedQueryStream, TypedVersionedValue,
 };
 pub use typed_multimap::{TypedMultimapCache, TypedMultimapEntry};
 pub use wire::Expiration;
