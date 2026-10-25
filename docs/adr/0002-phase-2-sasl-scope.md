@@ -17,8 +17,8 @@ SCRAM-SHA-512, GSSAPI, OAUTHBEARER." Looking at what each mechanism needs:
 * GSSAPI is different in kind. It authenticates against Kerberos, which
   in practice means binding to a system GSSAPI library. That is FFI to
   code this project does not control, on a library that is not present
-  on every platform. Section 2 of `CLAUDE.md` rules out unsafe FFI for
-  the protocol core, and GSSAPI cannot be done without it.
+  on every platform. This project's stack agreement rules out unsafe
+  FFI for the protocol core, and GSSAPI cannot be done without it.
 
 Building all four together would gate DIGEST, SCRAM and OAUTHBEARER,
 which are ready to implement now, behind a much larger decision about

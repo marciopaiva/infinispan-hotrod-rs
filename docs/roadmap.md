@@ -3,8 +3,8 @@
 This document is a proposal, not a decision. It is a candidate ordering
 for the open issues, based on an external review of the current `main`
 against the Hot Rod protocol spec and the official Java and Go clients.
-Individual items still go through the Analyze/Propose/Resolve steps in
-`CLAUDE.md` section 4 before any code is written; this file exists so
+Individual items still go through this project's Analyze/Propose/Resolve
+workflow before any code is written; this file exists so
 that step starts from a shared picture of the whole gap instead of one
 issue at a time. It groups the open issues by theme rather than listing
 them as one flat queue, but the ordering within and across themes is

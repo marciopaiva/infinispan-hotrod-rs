@@ -56,8 +56,8 @@ just does so over a noisier event stream.
 
 **Bounded eviction, without a new dependency:**
 
-1. **A crate like `lru`.** Would need the Analyze/Propose step CLAUDE.md
-   section 5 requires for any new dependency, and this project has
+1. **A crate like `lru`.** Would need the Analyze/Propose step this
+   project's working agreement requires for any new dependency, and it has
    turned that down before for less (ADR 0002 partly rejected GSSAPI
    over a system dependency, ADR 0004 picked `rustls` over `native-tls`
    specifically to avoid a C one, ADR 0005 shipped connection pooling
