@@ -2,7 +2,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hotrod_protocol::{Expiration, HotRodClient, HotRodConnection};
+use hotrod_protocol::{CacheConfig, Expiration, HotRodClient, HotRodConnection};
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
@@ -214,6 +214,169 @@ async fn main() -> hotrod_protocol::Result<()> {
     report("iter", iterated, start.elapsed());
 
     remote_cache.clear().await?;
+
+    // Remote query (#109): round-trip and pagination overhead with zero
+    // matching rows, the same scope decision
+    // `tests/live_server.rs`'s own query tests make
+    // (`docs/adr/0013-remote-query.md`): this crate has no Protobuf
+    // marshaller of its own to store a real entity with, so there is
+    // nothing to compare against the Java side for yet. Only the Rust
+    // side's own request/response overhead is measured here; `bench/
+    // README.md` says so.
+    client
+        .register_proto_schema(
+            "bench-query.proto",
+            "package bench;\nmessage Widget {\n   optional string name = 1;\n}\n",
+        )
+        .await?;
+
+    let start = Instant::now();
+    for _ in 0..iters {
+        remote_cache.query("FROM bench.Widget").execute().await?;
+    }
+    report("query", iters, start.elapsed());
+
+    let start = Instant::now();
+    for _ in 0..iters {
+        remote_cache
+            .query("DELETE FROM bench.Widget")
+            .execute_statement()
+            .await?;
+    }
+    report("execute_statement", iters, start.elapsed());
+
+    let start = Instant::now();
+    for _ in 0..iters {
+        let mut stream = remote_cache.query("FROM bench.Widget").stream(10);
+        while stream.next_row().await?.is_some() {}
+    }
+    report("query_stream", iters, start.elapsed());
+
+    // Remote administration's six additional tasks from #112. Unlike
+    // every operation above, these are real cluster-coordinated
+    // operations (a cache configuration change, a reindex, a template
+    // definition), not cheap per-call round trips, so they get their
+    // own, much smaller iteration count (`BENCH_ADMIN_ITERS`): running
+    // them `iters` (20000) times each would turn one bench run into an
+    // hours-long one. The resulting ops/ms numbers are expected to look
+    // nothing like put/get's, and that is the point: they show the real
+    // cost of these operations instead of hiding it behind the same
+    // iteration count every cheap operation above uses.
+    let admin_iters: usize = env_or("BENCH_ADMIN_ITERS", 5);
+    let admin_cache_name = "bench-admin-cache";
+    let admin_alias_name = "bench-admin-alias";
+    let admin_indexed_cache_name = "bench-admin-indexed-cache";
+
+    let _ = client.administration().remove_cache(admin_cache_name).await;
+    client
+        .administration()
+        .create_cache(
+            admin_cache_name,
+            CacheConfig::Definition(
+                "<distributed-cache><encoding media-type=\"application/octet-stream\"/></distributed-cache>"
+                    .to_string(),
+            ),
+        )
+        .await?;
+
+    let start = Instant::now();
+    for _ in 0..admin_iters {
+        client
+            .administration()
+            .update_configuration_attribute(admin_cache_name, "clustering.remote-timeout", "30000")
+            .await?;
+    }
+    report(
+        "update_configuration_attribute",
+        admin_iters,
+        start.elapsed(),
+    );
+
+    let start = Instant::now();
+    for _ in 0..admin_iters {
+        client
+            .administration()
+            .assign_alias(admin_alias_name, admin_cache_name)
+            .await?;
+    }
+    report("assign_alias", admin_iters, start.elapsed());
+
+    client
+        .register_proto_schema(
+            "bench-admin.proto",
+            "package bench_admin;\n/** @Indexed */\nmessage IndexedWidget {\n   /** @Basic */\n   optional string name = 1;\n}\n",
+        )
+        .await?;
+    let _ = client
+        .administration()
+        .remove_cache(admin_indexed_cache_name)
+        .await;
+    client
+        .administration()
+        .create_cache(
+            admin_indexed_cache_name,
+            CacheConfig::Definition(
+                "<distributed-cache><encoding media-type=\"application/x-protostream\"/>\
+                 <indexing><indexed-entities>\
+                 <indexed-entity>bench_admin.IndexedWidget</indexed-entity>\
+                 </indexed-entities></indexing></distributed-cache>"
+                    .to_string(),
+            ),
+        )
+        .await?;
+
+    let start = Instant::now();
+    for _ in 0..admin_iters {
+        client
+            .administration()
+            .reindex_cache(admin_indexed_cache_name)
+            .await?;
+    }
+    report("reindex_cache", admin_iters, start.elapsed());
+
+    let start = Instant::now();
+    for _ in 0..admin_iters {
+        client
+            .administration()
+            .update_index_schema(admin_indexed_cache_name)
+            .await?;
+    }
+    report("update_index_schema", admin_iters, start.elapsed());
+
+    let template_names: Vec<String> = (0..admin_iters)
+        .map(|i| format!("bench-admin-template-{i}"))
+        .collect();
+
+    // `None` is not used here: confirmed against a real server
+    // (`create_template`'s own doc comment) to be rejected with a
+    // server error asking for a configuration, despite being valid on
+    // the wire.
+    let start = Instant::now();
+    for name in &template_names {
+        client
+            .administration()
+            .create_template(
+                name,
+                Some("<distributed-cache><encoding media-type=\"application/octet-stream\"/></distributed-cache>"),
+            )
+            .await?;
+    }
+    report("create_template", admin_iters, start.elapsed());
+
+    let start = Instant::now();
+    for name in &template_names {
+        client.administration().remove_template(name).await?;
+    }
+    report("remove_template", admin_iters, start.elapsed());
+
+    client
+        .administration()
+        .remove_cache(admin_indexed_cache_name)
+        .await?;
+    client
+        .administration()
+        .remove_cache(admin_cache_name)
+        .await?;
 
     Ok(())
 }
