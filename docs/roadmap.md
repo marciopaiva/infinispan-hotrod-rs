@@ -250,6 +250,15 @@ individual surfaces.
   `assign_alias`/`create_template`/`remove_template` (#112) round out
   every confirmed-real `@@cache@...`/`@@template@...` task on the same
   primitive, with no new opcode.
+* ~~Remote task execution (#51)~~ (done). `RemoteCache::execute`/
+  `execute_near` invoke an arbitrary user-defined server-side task,
+  the same `EXEC_REQUEST`/`EXEC_RESPONSE` mechanism remote
+  administration already uses, confirmed against the Java client's
+  own source to differ only in declaring the cache's real name
+  instead of an empty one. Params and the result stay raw bytes; no
+  `TypedCache::execute` in this phase, since neither maps cleanly onto
+  `TypedCache`'s key/value marshallers. See
+  `docs/adr/0025-remote-task-execution.md`.
 
 ### Transactions
 
@@ -270,7 +279,6 @@ Every item in this theme is done.
   Kerberos library, which conflicts with this project's preference for
   no new system dependencies (the same reasoning ADR 0002 used to
   defer it originally).
-* **Remote task execution (#51).** No current use case pulling on it.
 
 This intentionally does not try to move on everything at once. Each
 theme, and each item within one, lands after what it depends on, not

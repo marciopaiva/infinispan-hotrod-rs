@@ -826,19 +826,20 @@ impl HotRodConnection {
         result
     }
 
-    /// Executes a named task (`docs/adr/0014-remote-administration.md`):
-    /// the mechanism remote administration (`@@cache@create`, etc) and,
-    /// if ever revisited, user-defined remote task execution (#51) both
-    /// build on. Every parameter is sent as a plain byte array, never
-    /// through a `Marshaller`: confirmed against the Java client's own
-    /// `NoCacheExecuteOperation`, which always UTF-8-encodes its string
-    /// parameters by hand rather than marshalling them. Targets no
-    /// specific cache, the same way `AuthMechList`/`Auth` already use an
-    /// empty cache name rather than `self.cache_name`: the task runs at
-    /// the cache-manager level, not against whichever cache this
-    /// connection happens to be pooled for.
-    pub(crate) async fn execute_task(
+    /// Shared wire encoding for `EXEC_REQUEST`/`EXEC_RESPONSE`
+    /// (`docs/adr/0014-remote-administration.md`,
+    /// `docs/adr/0025-remote-task-execution.md`): task name, a vint
+    /// count, then `(name, byte[])` pairs, with `cache_name` the only
+    /// thing that differs between an admin task and a user-defined
+    /// one (see the two callers below). Every parameter is sent as a
+    /// plain byte array, never through a `Marshaller`: confirmed
+    /// against the Java client's own `CacheExecuteOperation`/
+    /// `NoCacheExecuteOperation`, which both hand the server
+    /// already-marshalled `byte[]` values, not objects for this crate
+    /// to marshal itself.
+    async fn exec_request(
         &mut self,
+        cache_name: &[u8],
         task_name: &str,
         params: &[(String, Vec<u8>)],
     ) -> Result<Vec<u8>> {
@@ -852,14 +853,43 @@ impl HotRodConnection {
                 write_array(&mut body, name.as_bytes());
                 write_array(&mut body, value);
             }
-            let empty_cache_name: Vec<u8> = Vec::new();
-            self.write_and_read_header(&empty_cache_name, OpCode::Exec, &body)
+            self.write_and_read_header(cache_name, OpCode::Exec, &body)
                 .await?;
             read_array(&mut self.stream).await
         })
         .await;
         self.end_operation(result.is_ok());
         result
+    }
+
+    /// Executes a named task at the cache-manager level
+    /// (`docs/adr/0014-remote-administration.md`): the mechanism
+    /// every `@@cache@create`-style remote administration call in
+    /// `admin.rs` builds on. Targets no specific cache, the same way
+    /// `AuthMechList`/`Auth` already use an empty cache name rather
+    /// than `self.cache_name`: the task runs at the cache-manager
+    /// level, not against whichever cache this connection happens to
+    /// be pooled for.
+    pub(crate) async fn execute_task(
+        &mut self,
+        task_name: &str,
+        params: &[(String, Vec<u8>)],
+    ) -> Result<Vec<u8>> {
+        self.exec_request(&[], task_name, params).await
+    }
+
+    /// Executes a user-defined named task against this connection's
+    /// own cache (#51, `docs/adr/0025-remote-task-execution.md`),
+    /// confirmed against the Java client's `CacheExecuteOperation` to
+    /// be the only wire difference from `execute_task`: the real
+    /// cache name on the header instead of an empty one.
+    pub(crate) async fn execute_cache_task(
+        &mut self,
+        task_name: &str,
+        params: &[(String, Vec<u8>)],
+    ) -> Result<Vec<u8>> {
+        let cache_name = self.cache_name.clone();
+        self.exec_request(&cache_name, task_name, params).await
     }
 
     // Distributed counters (`docs/adr/0015-distributed-counters.md`).
