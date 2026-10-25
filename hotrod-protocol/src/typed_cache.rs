@@ -25,7 +25,7 @@ use std::time::SystemTime;
 use crate::connection::VersionedResult;
 use crate::error::{wrap_marshalling_error as wrap, MarshallingSide, Result};
 use crate::marshall::Marshaller;
-use crate::query::{Query, QueryRow, QueryValue};
+use crate::query::{Query, QueryRow, QueryStream, QueryValue};
 use crate::remote_cache::RemoteCache;
 use crate::wire::Expiration;
 
@@ -355,6 +355,51 @@ impl<'a, MV: Marshaller> TypedQuery<'a, MV> {
     /// passes through unchanged rather than needing a typed result.
     pub async fn execute_statement(self) -> Result<u32> {
         self.query.execute_statement().await
+    }
+
+    /// Same as `Query::stream`, carrying this query's own value
+    /// marshaller over to each page's rows.
+    pub fn stream(self, page_size: u32) -> TypedQueryStream<'a, MV> {
+        TypedQueryStream {
+            stream: self.query.stream(page_size),
+            value_marshaller: self.value_marshaller,
+        }
+    }
+}
+
+/// `Query::stream`'s typed counterpart, see `TypedQuery::stream`.
+pub struct TypedQueryStream<'a, MV: Marshaller> {
+    stream: QueryStream<'a>,
+    value_marshaller: Arc<MV>,
+}
+
+impl<'a, MV: Marshaller> TypedQueryStream<'a, MV> {
+    /// Same per-row unmarshalling as `TypedQuery::execute`: a whole
+    /// entity goes through this query's value marshaller, a projected
+    /// column passes through unchanged.
+    pub async fn next_row(&mut self) -> Result<Option<TypedQueryRow<MV::Value>>> {
+        let row = match self.stream.next_row().await? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        Ok(Some(match row {
+            QueryRow::Entity(bytes) => TypedQueryRow::Entity(
+                self.value_marshaller
+                    .unmarshall(&bytes)
+                    .map_err(|err| wrap(MarshallingSide::Value, err))?,
+            ),
+            QueryRow::Columns(columns) => TypedQueryRow::Columns(columns),
+        }))
+    }
+
+    /// Same as `QueryStream::hit_count`.
+    pub fn hit_count(&self) -> u32 {
+        self.stream.hit_count()
+    }
+
+    /// Same as `QueryStream::hit_count_exact`.
+    pub fn hit_count_exact(&self) -> bool {
+        self.stream.hit_count_exact()
     }
 }
 
@@ -809,6 +854,79 @@ mod tests {
             .expect("execute_statement should succeed");
 
         assert_eq!(affected, 3);
+
+        seed_task.await.unwrap();
+    }
+
+    /// `TypedQuery::stream` (issue #109) unmarshals each page's whole
+    /// entities through the value marshaller, across more than one
+    /// page. `docs/adr/0024-remote-query-streaming.md`.
+    #[tokio::test]
+    async fn typed_query_stream_unmarshalls_whole_entities_across_pages() {
+        use crate::query::test_support::{query_response_bytes, wrapped_entity_bytes};
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            // Page 1: one row, as many as requested, so one more
+            // request is still needed to confirm exhaustion.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+            let response = query_response_bytes(
+                0,
+                &[wrapped_entity_bytes("org.example.Greeting", b"hello")],
+                2,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+
+            // Page 2: the second entity, again exactly one row.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+            let response = query_response_bytes(
+                0,
+                &[wrapped_entity_bytes("org.example.Greeting", b"world")],
+                2,
+            );
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+
+            // Page 3: empty, confirming exhaustion.
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x1F, "expected a Query request");
+            let _request_body = read_array(&mut stream).await.unwrap();
+            let response = query_response_bytes(0, &[], 2);
+            let mut resp = response_header(id, 0x20, 0x00);
+            write_array(&mut resp, &response);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        let typed = client
+            .cache("my-cache")
+            .typed(BytesMarshaller, Utf8Marshaller);
+
+        let mut rows = typed.query("FROM org.example.Greeting").stream(1);
+
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next_row().await.expect("next_row should succeed") {
+            collected.push(row);
+        }
+
+        assert_eq!(
+            collected,
+            vec![
+                TypedQueryRow::Entity("hello".to_string()),
+                TypedQueryRow::Entity("world".to_string()),
+            ]
+        );
+        assert_eq!(rows.hit_count(), 2);
 
         seed_task.await.unwrap();
     }

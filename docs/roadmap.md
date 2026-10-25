@@ -163,6 +163,13 @@ Both items in this theme are done.
   cache's own value marshaller; a projected column passes through
   unchanged, since it is already scalar-typed by the wire format. See
   `docs/adr/0023-typed-remote-query-and-multimap.md`.
+  `Query::stream`/`TypedQuery::stream` (#109) page through a large
+  result set instead of buffering it all in one `QueryResult`: there
+  is no server-side cursor for query results on this wire, confirmed
+  against the Java client's own source, so this repeats the request
+  with an advancing `start_offset` by hand, the same pagination the
+  Java client leaves entirely to its own callers. See
+  `docs/adr/0024-remote-query-streaming.md`.
 
 ### High availability
 

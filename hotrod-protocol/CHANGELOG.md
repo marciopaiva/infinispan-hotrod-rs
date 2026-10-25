@@ -108,6 +108,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `execute_task` primitive `create_cache`/`remove_cache`/`cache_names`
   already use; no new opcode. See
   `docs/adr/0014-remote-administration.md` (#112).
+- Remote query: `Query::stream(page_size)`/`TypedQuery::stream(page_size)`
+  return a `QueryStream`/`TypedQueryStream` that repeats the same
+  request with an advancing `start_offset`, `page_size` rows at a
+  time, instead of buffering the whole result set in one
+  `QueryResult`. Confirmed against the Java client's own `RemoteQuery`
+  that no server-side cursor exists for query results; `max_results`,
+  if set on the builder, still caps the stream's total row count
+  rather than meaning page size. No new opcode. See
+  `docs/adr/0024-remote-query-streaming.md` (#109).
 
 ### Fixed
 

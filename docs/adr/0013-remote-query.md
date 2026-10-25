@@ -300,3 +300,12 @@ It calls the same `run_query`/`decode_query_response` path `execute`
 already uses, with `hit_count_accuracy = Some(1)`, and returns
 `QueryResult::hit_count` as the affected-entry count. No new opcode,
 no new message, no change to `connection.rs` or `header.rs`.
+
+### Addendum: streaming large result sets (#109)
+
+The "Not implemented... streaming/iterating very large result sets"
+line above is addressed, in its own ADR rather than a short addendum
+here: the design question it left open (whether the query opcode has
+a paging/cursor mechanism, confirmed to not exist) and the resulting
+public API (`QueryStream`, `TypedQueryStream`) are substantial enough
+to document on their own. See `docs/adr/0024-remote-query-streaming.md`.
