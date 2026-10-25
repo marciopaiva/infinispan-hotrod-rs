@@ -242,12 +242,19 @@ impl<'a> Administration<'a> {
 
     /// Defines a cache template named `name`, from `configuration` (a
     /// full configuration document, a bare fragment, JSON or YAML;
-    /// same auto-detection as `CacheConfig::Definition`) if given, or
-    /// the server's own default otherwise: confirmed against the Java
-    /// client's own `createTemplate`, which accepts a nullable
-    /// configuration. Unlike `create_cache`, there is no way to base a
-    /// template on another already-defined template through this
-    /// task.
+    /// same auto-detection as `CacheConfig::Definition`) if given.
+    /// `None` is accepted by this crate's own request (the
+    /// `configuration` parameter is simply omitted on the wire, same
+    /// as the Java client's own `createTemplate`, which takes a
+    /// nullable configuration), but a real server is not guaranteed to
+    /// accept it: confirmed against Infinispan 15.1.7, which rejects a
+    /// template created with `None` with a server error naming
+    /// `configuration` as a required parameter
+    /// (`ISPN005030`), despite having no documented default of its
+    /// own to fall back to. Pass a configuration until a server
+    /// version is found that actually honors the nullable case. Unlike
+    /// `create_cache`, there is no way to base a template on another
+    /// already-defined template through this task.
     pub async fn create_template(&self, name: &str, configuration: Option<&str>) -> Result<()> {
         let mut params = vec![("name".to_string(), name.as_bytes().to_vec())];
         if let Some(configuration) = configuration {
@@ -800,7 +807,9 @@ mod tests {
     /// `create_template` with no configuration omits the
     /// `configuration` parameter entirely, the same "omitted, not
     /// empty" convention `remove_cache`'s own `flags` test already
-    /// confirms.
+    /// confirms. Wire shape only: `create_template`'s own doc comment
+    /// notes that a real server is not guaranteed to accept the
+    /// resulting request.
     #[tokio::test]
     async fn create_template_omits_configuration_when_none() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
