@@ -309,3 +309,37 @@ here: the design question it left open (whether the query opcode has
 a paging/cursor mechanism, confirmed to not exist) and the resulting
 public API (`QueryStream`, `TypedQueryStream`) are substantial enough
 to document on their own. See `docs/adr/0024-remote-query-streaming.md`.
+
+### Addendum: JSON media-type variant, decided against (#110)
+
+The remaining "Not implemented" line above, the protocol's JSON
+variant, is now a closed decision rather than an open gap.
+
+Checked against the server's own source
+(`server/core/.../query/impl/DefaultQuerySerializer.java`):
+`decodeQueryRequest`/`encodeQueryResponse` go through a generic
+`Transcoder` looked up from the request's declared media type, with
+`application/x-protostream` unwrapped to a dedicated internal type
+first. A client that declared `application/json` instead would need
+the server to hold a JSON `Transcoder` for `QueryRequest`/
+`QueryResponse`, and this crate would need its own, separate JSON
+encoder and decoder for those two messages: a JSON document has no
+tag/wire-type framing to reuse from `protobuf_wire.rs`, so this is not
+a flag on the existing Protobuf path but a second, parallel
+implementation of the same two messages.
+
+Issue #110 names no caller who needs this; it was filed to track the
+gap rather than to request the feature. Building a second wire
+encoding for a message pair with zero known callers contradicts this
+project's own rule against speculative work (CLAUDE.md, workflow
+section): there is nothing to Propose a design against yet, because
+there is no concrete request shape to design for (whole entities only?
+projected columns? how do named parameter types map to JSON, given
+`QueryValue` has no JSON-native encoding today?).
+
+**Decision**: not implemented. Issue #110 is closed instead of left
+open, since "no known use case" is unlikely to resolve itself by
+sitting in the backlog; a real caller surfacing is what would turn
+this back into a proposal, not time passing. If that happens, this
+addendum and the server-side confirmation above are the starting
+point for the Analyze step.

@@ -170,6 +170,12 @@ Both items in this theme are done.
   with an advancing `start_offset` by hand, the same pagination the
   Java client leaves entirely to its own callers. See
   `docs/adr/0024-remote-query-streaming.md`.
+  The protocol's JSON media-type variant (#110) is decided against:
+  confirmed against the server's own source that it would need a
+  second, parallel encoder and decoder for `QueryRequest`/
+  `QueryResponse`, not a flag on the existing Protobuf path, and no
+  caller needs it today. See the addendum in
+  `docs/adr/0013-remote-query.md`.
 
 ### High availability
 
