@@ -37,7 +37,7 @@ for release notes.
 | Client statistics | Yes | Yes |
 | Tracing: local spans (via the `tracing` crate) | No | Yes |
 | Tracing: trace-context propagation to the server | Yes | No |
-| Remote administration (create/remove/list caches) | Yes | Yes |
+| Remote administration (create/remove/list caches, reindex, index schema, config attribute, alias, templates) | Yes | Yes |
 | Multi-cluster failover | Yes | Yes (plus proactively switching back once an abandoned cluster recovers, and per-cluster auth/TLS overrides, neither of which the Java client does) |
 
 ## Usage
@@ -242,6 +242,20 @@ client
 
 let names = client.administration().cache_names().await?;
 client.administration().remove_cache("sessions").await?;
+```
+
+`reindex_cache`/`update_index_schema`/`update_configuration_attribute`/
+`assign_alias` and `create_template`/`remove_template` round out the
+rest of the confirmed-real `@@cache@...`/`@@template@...` tasks on
+the same `administration()` handle:
+
+```rust
+client.administration().reindex_cache("sessions").await?;
+client
+    .administration()
+    .update_configuration_attribute("sessions", "clustering.remote-timeout", "30000")
+    .await?;
+client.administration().assign_alias("web-sessions", "sessions").await?;
 ```
 
 `counters` defines and uses distributed counters. A `StrongCounter`
