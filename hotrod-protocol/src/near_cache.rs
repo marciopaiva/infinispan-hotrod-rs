@@ -16,28 +16,64 @@
 //! plain passthrough from then on, rather than risk serving data no
 //! invalidation feed can ever correct again.
 //!
-//! Does not track per-entry lifespan or max idle. A local hit never
-//! reaches the server, so it never refreshes a `max_idle` timer there
-//! either; an entry can also outlive its own `lifespan` locally until
-//! an `Expired` event (or capacity pressure) removes it. Honoring
-//! either would need fetching entry metadata, not just a value (see
-//! `connection::VersionedValue`), which this phase leaves out. Treat
-//! near caching as an optimization for data that does not depend on
-//! either expiration to be observed promptly.
+//! Tracks each entry's own `lifespan`/`max_idle`, fetched alongside
+//! the value (`RemoteCache::get_with_version`) rather than a bare
+//! value: a lookup past an entry's own deadline is treated as a miss
+//! and the entry is dropped, instead of being served until an
+//! `Expired` event or capacity pressure happens to remove it. This is
+//! one-directional only: a local hit never reaches the server, so it
+//! never refreshes `max_idle` there, and this client does not
+//! approximate that refresh locally either. The deadline a `get` fixes
+//! at insert time only ever gets closer, never further away, as the
+//! entry is read locally; honoring a true, server-refreshed
+//! `max_idle` would need a write back to the server on every local
+//! hit, a different, heavier proposal this phase does not take on.
+//! The deadline comparison also assumes the client and server clocks
+//! are reasonably in sync; no correction is attempted.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use tokio::task::JoinHandle;
 
+use crate::connection::VersionedValue;
 use crate::error::Result;
 use crate::listener::{CacheEvent, CacheEventInterests, ListenOptions};
 use crate::remote_cache::RemoteCache;
 use crate::stats::{NearCacheStatistics, NearCacheStatisticsInner};
 use crate::wire::Expiration;
+
+/// The earlier of `created + lifespan` and `last_used + max_idle`, or
+/// `None` if neither dimension carries a finite deadline (both
+/// `Expiration::Immortal`, the only way `VersionedValue` leaves the
+/// matching timestamp `None` too). `Expiration::Default` never reaches
+/// here (read-side metadata never produces it) and `checked_add`
+/// overflowing (an unrealistically large `Seconds`) is treated the
+/// same way as `Immortal`: no deadline from that dimension, not a
+/// panic.
+fn local_deadline(value: &VersionedValue) -> Option<SystemTime> {
+    let lifespan_deadline = match (value.created, value.lifespan) {
+        (Some(created), Expiration::Seconds(secs)) => {
+            created.checked_add(Duration::from_secs(secs))
+        }
+        _ => None,
+    };
+    let max_idle_deadline = match (value.last_used, value.max_idle) {
+        (Some(last_used), Expiration::Seconds(secs)) => {
+            last_used.checked_add(Duration::from_secs(secs))
+        }
+        _ => None,
+    };
+    match (lifespan_deadline, max_idle_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
 
 /// Options for `RemoteCache::near_cache`, kept as its own type so a
 /// future option (a bloom filter, a TTL override, see
@@ -82,7 +118,7 @@ struct LruStore {
     max_entries: usize,
     tick: u64,
     generation: u64,
-    entries: HashMap<Vec<u8>, (Vec<u8>, u64)>,
+    entries: HashMap<Vec<u8>, (Vec<u8>, u64, Option<SystemTime>)>,
     order: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -106,9 +142,22 @@ impl LruStore {
         self.generation
     }
 
+    /// Returns `key`'s value, unless it is either missing or past its
+    /// own deadline. A deadline that has passed is treated exactly
+    /// like a miss, and the stale entry is dropped right away: no
+    /// generation bump, since this is a self-inflicted eviction, not
+    /// an external invalidation (see the struct docs on why the two
+    /// are kept apart).
     fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let new_tick = self.next_tick();
         let entry = self.entries.get_mut(key)?;
+        if let Some(deadline) = entry.2 {
+            if SystemTime::now() >= deadline {
+                let (_, tick, _) = self.entries.remove(key).expect("just matched above");
+                self.order.remove(&tick);
+                return None;
+            }
+        }
         let old_tick = entry.1;
         entry.1 = new_tick;
         let value = entry.0.clone();
@@ -121,16 +170,24 @@ impl LruStore {
     /// otherwise some invalidation landed since the caller fetched
     /// this value, and inserting it now could resurrect a value an
     /// event already tried to invalidate. See the struct docs.
-    fn insert_if_current(&mut self, key: Vec<u8>, value: Vec<u8>, generation: u64) {
+    /// `deadline` is the entry's own local expiry (`local_deadline`),
+    /// or `None` for an entry that never expires locally.
+    fn insert_if_current(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        generation: u64,
+        deadline: Option<SystemTime>,
+    ) {
         if generation != self.generation {
             return;
         }
-        if let Some((_, old_tick)) = self.entries.get(&key) {
+        if let Some((_, old_tick, _)) = self.entries.get(&key) {
             self.order.remove(old_tick);
         }
         let new_tick = self.next_tick();
         self.order.insert(new_tick, key.clone());
-        self.entries.insert(key, (value, new_tick));
+        self.entries.insert(key, (value, new_tick, deadline));
         while self.entries.len() > self.max_entries {
             let Some((_, oldest_key)) = self.order.pop_first() else {
                 break;
@@ -141,7 +198,7 @@ impl LruStore {
 
     fn invalidate(&mut self, key: &[u8]) {
         self.generation = self.generation.wrapping_add(1);
-        if let Some((_, tick)) = self.entries.remove(key) {
+        if let Some((_, tick, _)) = self.entries.remove(key) {
             self.order.remove(&tick);
         }
     }
@@ -158,12 +215,12 @@ impl LruStore {
         self.entries.len()
     }
 
-    /// `insert_if_current` unconditionally, for tests that do not care
-    /// about the generation check itself.
+    /// `insert_if_current` unconditionally, with no deadline, for
+    /// tests that do not care about the generation check or expiry.
     #[cfg(test)]
     fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
         let generation = self.generation;
-        self.insert_if_current(key, value, generation);
+        self.insert_if_current(key, value, generation, None);
     }
 }
 
@@ -226,8 +283,15 @@ impl NearCacheState {
         }
     }
 
-    fn insert_if_current(&self, key: Vec<u8>, value: Vec<u8>, generation: u64) {
-        self.lock().insert_if_current(key, value, generation);
+    fn insert_if_current(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        generation: u64,
+        deadline: Option<SystemTime>,
+    ) {
+        self.lock()
+            .insert_if_current(key, value, generation, deadline);
     }
 
     fn invalidate(&self, key: &[u8]) {
@@ -393,11 +457,13 @@ impl NearCachedCache {
         })
     }
 
-    /// Returns `key`'s value from the local cache if present and the
-    /// invalidation feed is still alive; otherwise fetches it from the
-    /// remote cache and, on a hit, stores it locally for next time.
-    /// The local store is not updated if an invalidation for this key
-    /// (or a `clear`) happened while the fetch was in flight: see
+    /// Returns `key`'s value from the local cache if present, not past
+    /// its own `lifespan`/`max_idle` deadline, and the invalidation
+    /// feed is still alive; otherwise fetches it (with its metadata,
+    /// via `get_with_version`) from the remote cache and, on a hit,
+    /// stores it locally for next time, deadline included. The local
+    /// store is not updated if an invalidation for this key (or a
+    /// `clear`) happened while the fetch was in flight: see
     /// `LruStore`'s docs for why that matters.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // No generation snapshot, and so no later insert, once the feed
@@ -418,12 +484,13 @@ impl NearCachedCache {
             None
         };
         self.state.record_miss();
-        let value = self.cache.get(key).await?;
-        if let (Some(generation), Some(value)) = (generation, value.as_ref()) {
+        let fetched = self.cache.get_with_version(key).await?;
+        if let (Some(generation), Some(fetched)) = (generation, fetched.as_ref()) {
+            let deadline = local_deadline(fetched);
             self.state
-                .insert_if_current(key.to_vec(), value.clone(), generation);
+                .insert_if_current(key.to_vec(), fetched.value.clone(), generation, deadline);
         }
-        Ok(value)
+        Ok(fetched.map(|v| v.value))
     }
 
     /// Runs `op` against the remote cache, then invalidates local state
@@ -596,7 +663,7 @@ mod tests {
         let mut store = LruStore::new(10);
         let generation = store.generation();
         store.invalidate(b"key"); // not cached yet: a no-op besides the bump
-        store.insert_if_current(b"key".to_vec(), b"stale".to_vec(), generation);
+        store.insert_if_current(b"key".to_vec(), b"stale".to_vec(), generation, None);
         assert_eq!(store.get(b"key"), None);
     }
 
@@ -604,8 +671,44 @@ mod tests {
     fn insert_if_current_succeeds_when_the_generation_is_unchanged() {
         let mut store = LruStore::new(10);
         let generation = store.generation();
-        store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation);
+        store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation, None);
         assert_eq!(store.get(b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn get_treats_a_past_deadline_as_a_miss_and_drops_the_entry() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        let past = SystemTime::now() - Duration::from_secs(1);
+        store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation, Some(past));
+        assert_eq!(store.get(b"key"), None);
+        assert_eq!(
+            store.entries.len(),
+            0,
+            "the expired entry should be dropped"
+        );
+    }
+
+    #[test]
+    fn get_serves_an_entry_with_no_deadline_indefinitely() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation, None);
+        assert_eq!(store.get(b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn a_self_expired_entry_does_not_bump_the_generation() {
+        let mut store = LruStore::new(10);
+        let generation = store.generation();
+        let past = SystemTime::now() - Duration::from_secs(1);
+        store.insert_if_current(b"key".to_vec(), b"value".to_vec(), generation, Some(past));
+        assert_eq!(store.get(b"key"), None);
+        assert_eq!(
+            store.generation(),
+            generation,
+            "a self-inflicted expiry is not an external invalidation"
+        );
     }
 
     /// `register`'s background task relies on `MarkDeadOnDrop` to call
@@ -618,7 +721,7 @@ mod tests {
     #[test]
     fn mark_dead_on_drop_runs_even_if_the_owning_scope_panics() {
         let state = Arc::new(NearCacheState::new(10));
-        state.insert_if_current(b"key".to_vec(), b"value".to_vec(), state.generation());
+        state.insert_if_current(b"key".to_vec(), b"value".to_vec(), state.generation(), None);
         assert!(state.is_alive());
 
         let guard_state = state.clone();
@@ -675,6 +778,7 @@ mod tests {
         use crate::client::HotRodClient;
         use crate::listener::tests::{event_frame, read_listener_id};
         use crate::remote_cache::tests::client_with_seeds_and_timeout;
+        use crate::varint::write_vint;
         use crate::wire::{read_array, write_array};
 
         fn client_with_seed_and_timeout(seed_addr: SocketAddr, timeout: Duration) -> HotRodClient {
@@ -699,16 +803,60 @@ mod tests {
             (listener_id, listen_sock)
         }
 
-        /// Reads one Get request off `sock` and responds with `value`,
-        /// success. Shared by every wiring test below that needs the
-        /// server side of a Get round trip.
-        async fn serve_get(sock: &mut TcpStream, value: &[u8]) {
+        /// Reads one `GetWithMetadata` request off `sock` and responds
+        /// with `value` and metadata for `lifespan`/`max_idle`
+        /// (`Expiration::Seconds` for a finite deadline,
+        /// `Expiration::Immortal` otherwise, encoded the same way
+        /// `connection.rs`'s own `get_with_version_exposes_full_metadata`
+        /// test does). `created`/`last_used` are set to "now" whenever
+        /// the matching duration is finite, mirroring what a server
+        /// reports for an entry just written. The version field is
+        /// always `0`: nothing in `near_cache.rs` reads it.
+        async fn serve_get_with_metadata(
+            sock: &mut TcpStream,
+            value: &[u8],
+            lifespan: Expiration,
+            max_idle: Expiration,
+        ) {
+            const INFINITE_LIFESPAN: u8 = 0x01;
+            const INFINITE_MAXIDLE: u8 = 0x02;
+
             let (id, opcode) = read_request_opcode(sock).await;
-            assert_eq!(opcode, 0x03, "expected a Get request");
+            assert_eq!(opcode, 0x1B, "expected a GetWithMetadata request");
             let _key = read_array(sock).await.unwrap();
-            let mut resp = response_header(id, 0x04, 0x00);
+
+            let now_millis = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            let mut resp = response_header(id, 0x1C, 0x00);
+            let mut flags = 0u8;
+            if matches!(lifespan, Expiration::Immortal) {
+                flags |= INFINITE_LIFESPAN;
+            }
+            if matches!(max_idle, Expiration::Immortal) {
+                flags |= INFINITE_MAXIDLE;
+            }
+            resp.push(flags);
+            if let Expiration::Seconds(secs) = lifespan {
+                resp.extend_from_slice(&now_millis.to_be_bytes());
+                write_vint(&mut resp, secs as u32);
+            }
+            if let Expiration::Seconds(secs) = max_idle {
+                resp.extend_from_slice(&now_millis.to_be_bytes());
+                write_vint(&mut resp, secs as u32);
+            }
+            resp.extend_from_slice(&0u64.to_be_bytes()); // version
             write_array(&mut resp, value);
             sock.write_all(&resp).await.unwrap();
+        }
+
+        /// `serve_get_with_metadata` with both dimensions immortal: the
+        /// common case every wiring test but the deadline-specific one
+        /// below needs, kept under its old, shorter name.
+        async fn serve_get(sock: &mut TcpStream, value: &[u8]) {
+            serve_get_with_metadata(sock, value, Expiration::Immortal, Expiration::Immortal).await;
         }
 
         /// Polls `near.get(key)` until it returns `expected` or `attempts`
@@ -836,6 +984,64 @@ mod tests {
             assert!(
                 near.near_cache_statistics().invalidations >= 1,
                 "the Modified event must have recorded at least one invalidation"
+            );
+
+            drop(server.await.unwrap());
+        }
+
+        /// A key cached with a one-second `lifespan` must be fetched
+        /// again once that second has passed, with no invalidation
+        /// event involved at all: the deadline alone, not the
+        /// listener, drives the re-fetch. Proves the fix for the gap
+        /// `docs/adr/0007-near-caching.md`'s Consequences section
+        /// originally left open.
+        #[tokio::test]
+        async fn a_locally_expired_entry_is_fetched_again_without_an_invalidation_event() {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (_listener_id, listen_sock) = accept_and_register_listener(&tcp).await;
+
+                let (mut op_sock, _) = tcp.accept().await.unwrap();
+                serve_get_with_metadata(
+                    &mut op_sock,
+                    b"value",
+                    Expiration::Seconds(1),
+                    Expiration::Immortal,
+                )
+                .await;
+
+                // A second GetWithMetadata, once the entry's own
+                // deadline has passed; nothing invalidates it.
+                serve_get_with_metadata(
+                    &mut op_sock,
+                    b"value-after-expiry",
+                    Expiration::Seconds(1),
+                    Expiration::Immortal,
+                )
+                .await;
+
+                listen_sock
+            });
+
+            let client = client_with_seed(addr);
+            let cache = client.cache("my-cache");
+            let near = cache
+                .near_cache(NearCacheOptions::default())
+                .await
+                .expect("near_cache should register its listener");
+
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+            // Immediately after caching it, the entry is still within
+            // its own lifespan: served locally, no second request yet.
+            assert_eq!(near.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+
+            assert_eq!(
+                near.get(b"key").await.unwrap(),
+                Some(b"value-after-expiry".to_vec())
             );
 
             drop(server.await.unwrap());

@@ -291,11 +291,14 @@ LRU-evicted today (`NearCacheOptions::max_entries`), invalidated through
 a listener with a documented fail-safe if that listener dies. What the
 ADR explicitly left out, in order of how much it costs in practice:
 
-* No per-entry `lifespan`/`max_idle` tracking: a cached value can
-  outlive its own lifespan locally, and a local hit never refreshes
-  `max_idle` server-side. `get_with_version`/`VersionedValue` already
-  carry this metadata; using it instead of a bare value is the natural
-  fix, not yet taken on.
+* ~~No per-entry `lifespan`/`max_idle` tracking~~ (done). A cached
+  entry now carries its own local deadline (the earlier of
+  `created + lifespan` and `last_used + max_idle`, from
+  `get_with_version`), and a lookup past it is treated as a miss
+  rather than served until an `Expired` event removes it. Still
+  one-directional: a local hit never refreshes `max_idle`
+  server-side, by design; see the addendum in
+  `docs/adr/0007-near-caching.md`.
 * The race-closing generation counter is store-wide, not per key, so
   heavy concurrent writes to unrelated keys can push the local hit rate
   well below normal. A bounded per-key tombstone (reusing the same LRU

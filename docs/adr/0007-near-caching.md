@@ -258,3 +258,48 @@ from the wrapped `RemoteCache` unmodified.
   by a separate `generation` call for the same logical step). Caught
   by review as an unnecessary doubling of lock/unlock overhead on
   every miss, not a correctness issue.
+
+## Addendum: per-entry `lifespan`/`max_idle` tracking
+
+The gap this ADR's Consequences section originally named ("a future
+revision could fetch and track it instead of a bare value") is now
+closed. `NearCachedCache::get` fetches via `RemoteCache::
+get_with_version` instead of a plain `get`: the same `OpCode::
+GetWithMetadata` (`0x1B`) the versioned-write path already used, no
+new opcode, just a heavier response (the metadata block) on every
+near-cache miss. `LruStore` now keeps one absolute local deadline per
+entry alongside its value, the earlier of `created + lifespan` and
+`last_used + max_idle` (`None`, never locally expiring, when both are
+`Expiration::Immortal`). A lookup past that deadline is treated as a
+plain miss and the entry is dropped.
+
+Two things kept deliberately narrow:
+
+* **One-directional only.** A local hit still never reaches the
+  server, so it still never refreshes `max_idle` there; this client
+  does not approximate that refresh locally either. The deadline a
+  `get` fixes at insert time only ever gets closer as the entry keeps
+  being read locally, never further away. Inventing a longer local
+  deadline to pretend a refresh happened would mean serving data past
+  a lifetime the server was never asked to extend, which is exactly
+  the kind of drift this ADR already rejected for near caching's
+  other trade-offs (see "What happens when the invalidation feed
+  dies" above). Refreshing `max_idle` server-side on a local hit is a
+  different, heavier proposal (its own request, its own cost, its own
+  policy), left for later if real usage asks for it.
+* **A self-expiry does not bump `LruStore`'s generation counter.**
+  That counter exists to close one specific race (an invalidation
+  landing on a key while a fetch for it is still in flight); bumping
+  it for a purely local, self-inflicted eviction would cost every
+  other concurrent fetch its cached result too, reopening the same
+  store-wide generation cost this ADR's Consequences section already
+  flags above. A self-expired entry is just removed; the caller's
+  `get` falls through to the network the same way an ordinary miss
+  already does.
+
+The deadline comparison is `SystemTime::now()` against the server's
+own `created`/`last_used` timestamps, which assumes the client and
+server clocks are reasonably in sync. No correction is attempted; this
+is the same assumption this crate already makes anywhere else it
+surfaces a server `SystemTime` to a caller, not a new one introduced
+here.
