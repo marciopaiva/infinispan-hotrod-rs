@@ -2357,6 +2357,134 @@ pub(crate) mod tests {
         seed_task.await.unwrap();
     }
 
+    /// Every other operation family dispatched through `call` has at
+    /// least one fast test exercising `run_operation`'s match arm for
+    /// it (`contains_key_routes_to_the_computed_owner` above is the
+    /// representative one for every keyed operation). Multimap had
+    /// none: its nine `Operation`/`OperationResult` variants were
+    /// only ever reached by the wire-level tests in `connection.rs`
+    /// (which call `HotRodConnection::multimap_get` directly, bypassing
+    /// `run_operation` entirely) and by the live-server test gated
+    /// behind `#[ignore]`. A copy-paste mistake in `run_operation`'s
+    /// multimap arms, such as returning the wrong `OperationResult`
+    /// variant or dispatching to the wrong connection method, would
+    /// pass every local `cargo test` run and only surface once a real
+    /// server was involved. This test closes that gap for the keyed
+    /// half of multimap's operations; the one below covers the two
+    /// that target the seed instead.
+    #[tokio::test]
+    async fn multimap_get_routes_to_the_computed_owner() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = seed_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = owner_listener.local_addr().unwrap();
+        let owner_task = tokio::spawn(async move {
+            let (mut stream, _) = owner_listener.accept().await.unwrap();
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x67, "expected a MultimapGet request");
+            let key = read_array(&mut stream).await.unwrap();
+            assert_eq!(key, b"key");
+            let supports_duplicates = stream.read_u8().await.unwrap();
+            assert_eq!(supports_duplicates, 1);
+            let mut resp = response_header(id, 0x68, 0x00);
+            write_vint(&mut resp, 1);
+            write_array(&mut resp, b"value1");
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        set_topology(
+            &client,
+            ClusterTopology {
+                topology_id: 9,
+                servers: vec![TopologyServer {
+                    host: owner_addr.ip().to_string(),
+                    port: owner_addr.port(),
+                }],
+                hash_function_version: 3,
+                segment_owners: vec![vec![0]],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+
+        let result = client
+            .multimap_cache("my-multimap", true)
+            .get(b"key")
+            .await
+            .expect("multimap get against owner");
+        assert_eq!(result, vec![b"value1".to_vec()]);
+
+        owner_task.await.unwrap();
+    }
+
+    /// `multimap_size` and `multimap_contains_value` have no key to
+    /// route by, the same reason `size`/`clear`/`ping`/`stats` always
+    /// target the seed above. See the comment on
+    /// `multimap_get_routes_to_the_computed_owner` for why this exists
+    /// despite `connection.rs`'s own wire-level multimap tests.
+    #[tokio::test]
+    async fn multimap_size_and_contains_value_always_target_the_seed() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let seed_task = tokio::spawn(async move {
+            let (mut stream, _) = seed_listener.accept().await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x71, "expected a MultimapSize request");
+            let supports_duplicates = stream.read_u8().await.unwrap();
+            assert_eq!(supports_duplicates, 0);
+            let mut resp = response_header(id, 0x72, 0x00);
+            write_vint(&mut resp, 7);
+            stream.write_all(&resp).await.unwrap();
+
+            let (id, opcode) = read_request_opcode(&mut stream).await;
+            assert_eq!(opcode, 0x77, "expected a MultimapContainsValue request");
+            let time_units = stream.read_u8().await.unwrap();
+            assert_eq!(
+                time_units, 0x88,
+                "both lifespan and max idle infinite (unit nibble 8 each)"
+            );
+            let value = read_array(&mut stream).await.unwrap();
+            assert_eq!(value, b"value");
+            let supports_duplicates = stream.read_u8().await.unwrap();
+            assert_eq!(supports_duplicates, 0);
+            let mut resp = response_header(id, 0x78, 0x00);
+            resp.push(1);
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let unreachable = unreachable_addr().await;
+
+        let client = client_with_seeds(vec![seed_addr], seed_addr);
+        set_topology(
+            &client,
+            ClusterTopology {
+                topology_id: 9,
+                servers: vec![TopologyServer {
+                    host: unreachable.ip().to_string(),
+                    port: unreachable.port(),
+                }],
+                hash_function_version: 3,
+                segment_owners: vec![vec![0]],
+                resolved_addrs: RwLock::new(StdHashMap::new()),
+            },
+        );
+        let multimap = client.multimap_cache("my-multimap", false);
+
+        assert_eq!(multimap.size().await.expect("multimap size"), 7);
+        assert!(multimap
+            .contains_value(b"value")
+            .await
+            .expect("multimap contains_value"));
+
+        seed_task.await.unwrap();
+    }
+
     /// `register_proto_schema`'s wire format was confirmed only
     /// "empirically" against a live server
     /// (`docs/adr/0013-remote-query.md`); this is its fake-server

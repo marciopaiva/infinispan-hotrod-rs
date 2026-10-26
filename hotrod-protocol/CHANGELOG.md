@@ -14,6 +14,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
   until an `Expired` invalidation event or LRU pressure happens to
   remove it. See the addendum in `docs/adr/0007-near-caching.md`.
 
+### Tests
+
+- `RemoteCache`: added fast fake-server tests for the multimap
+  cache's `run_operation` dispatch, covering a key-routed operation
+  (`multimap_get`) and the two operations that target the seed
+  (`multimap_size`, `multimap_contains_value`). Every multimap
+  operation's dispatch arm was previously only exercised by
+  `connection.rs`'s wire-level tests (which bypass `run_operation`)
+  and by the `#[ignore]`d live-server test.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added
