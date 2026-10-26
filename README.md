@@ -37,7 +37,7 @@ validated.
 | Cluster topology tracking, hash-aware routing | Yes | Yes | Yes |
 | Configurable retry policy, per-node circuit breaker | Yes | Yes | No (no live test injects a mid-operation node failure yet; the ambiguous-execution-on-retry semantics in `docs/adr/0011-retry-policy-and-node-health.md` are documented, not failure-tested against a real server) |
 | Client listeners (cache events) | Yes | Yes | Yes |
-| Near caching | Yes | Yes | Partial (the invalidation path is; the documented gap in local `lifespan`/`max idle` tracking, see "Near cache: known gaps" in `docs/roadmap.md`, has no test either way since there is nothing passing yet to test) |
+| Near caching | Yes | Yes | Yes |
 | Transactions | Yes | Yes (`NON_XA`, one-phase commit only; real XA and recovery not yet implemented) | Yes |
 | Multimap cache | Yes | Yes | Yes |
 | Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed; value-change listeners supported) | Yes |

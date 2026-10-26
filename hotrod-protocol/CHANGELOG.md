@@ -6,6 +6,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Near caching: `NearCachedCache::get` now fetches entry metadata
+  (`get_with_version`) and evicts a locally cached entry once its own
+  `lifespan`/`max_idle` deadline has passed, instead of serving it
+  until an `Expired` invalidation event or LRU pressure happens to
+  remove it. See the addendum in `docs/adr/0007-near-caching.md`.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added

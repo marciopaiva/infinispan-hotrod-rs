@@ -246,9 +246,10 @@ impl NearCacheStatisticsInner {
 pub struct NearCacheStatistics {
     /// `get` calls served from the local store, no network round trip.
     pub hits: u64,
-    /// `get` calls that fell through to the network, either because
-    /// the key was not cached locally or because the invalidation
-    /// feed had already died (see the module docs on `NearCachedCache`).
+    /// `get` calls that fell through to the network: the key was not
+    /// cached locally, the invalidation feed had already died, or the
+    /// cached entry had passed its own `lifespan`/`max_idle` deadline
+    /// (see the module docs on `NearCachedCache`).
     pub misses: u64,
     /// How many invalidation events this near cache has processed:
     /// one per key invalidated by the background listener, by `put`/
