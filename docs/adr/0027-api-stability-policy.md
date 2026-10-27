@@ -16,10 +16,10 @@ iteration, transactions, multi-cluster failover, distributed
 counters, multimaps, remote query, administration and remote task
 execution. `docs/adr/0026-split-connection-and-remote-cache-by-domain.md`
 just settled the module boundaries behind that API. This is a natural
-point to say plainly what "stable" means from here, since CLAUDE.md
-section 5 already requires stopping to ask before a breaking change
-to this crate's public API, but names no definition of "breaking" to
-apply that rule against.
+point to say plainly what "stable" means from here, since this
+project's working agreement already requires stopping to ask before
+a breaking change to this crate's public API, but names no
+definition of "breaking" to apply that rule against.
 
 Checked directly against the crate as it stands today: no public
 type anywhere uses `#[non_exhaustive]`. Every public enum, `Error`
@@ -51,8 +51,8 @@ stricter promises that would come with it, is not decided by this
 ADR.
 
 **What counts as breaking**, and therefore needs its own Propose and
-Resolve step under CLAUDE.md section 5 before it is implemented, and
-a minor version bump when it ships:
+Resolve step under this project's existing stop-and-ask policy
+before it is implemented, and a minor version bump when it ships:
 
 * Removing or renaming a public item: a type, function, method,
   field or re-export.
@@ -104,14 +104,14 @@ for whatever ADR proposes reaching 1.0, not this one.
 **Record-keeping.** Every breaking change gets a CHANGELOG entry
 under "Changed" or "Removed" naming the old and the new shape, the
 version bump this policy calls for, and the Propose and Resolve step
-CLAUDE.md section 5 already requires. This ADR clarifies that rule;
-it does not relax it.
+this project's working agreement already requires. This ADR
+clarifies that rule; it does not relax it.
 
 ## Consequences
 
-* CLAUDE.md section 5's "stop and ask before breaking the public
-  API" rule now has a shared definition of "breaking" behind it,
-  so a future change does not need to re-derive one from scratch.
+* The existing "stop and ask before breaking the public API" rule
+  now has a shared definition of "breaking" behind it, so a future
+  change does not need to re-derive one from scratch.
 * `Error`, and every other public enum that is exhaustive today,
   stays a real source of friction: adding a new error case remains
   breaking until a separate, explicitly confirmed follow-up marks it
