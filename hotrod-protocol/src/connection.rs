@@ -33,17 +33,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::BufStream;
 use tokio::net::{TcpStream, ToSocketAddrs};
 
-use crate::digest::DigestSha256Mechanism;
 use crate::error::{Error, Result};
 use crate::header::OpCode;
-use crate::sasl::{OAuthBearerMechanism, PlainMechanism, SaslMechanism};
-use crate::scram::ScramSha512Mechanism;
 use crate::tls::{self, TlsConfig, Transport};
 use crate::topology::{ClientIntelligence, TopologyUpdate};
 use crate::varint::read_vint;
 use crate::wire::{
-    read_array, read_string, read_string_map, skip_media_type, write_array,
-    write_expiration_params, Expiration,
+    read_array, read_string_map, skip_media_type, write_array, write_expiration_params, Expiration,
 };
 
 // Domain submodules (`docs/adr/0026-split-connection-and-remote-cache-
@@ -53,9 +49,11 @@ use crate::wire::{
 // `key_value_body`, ...) since Rust's privacy rule makes a private
 // item visible to every descendant of its defining module, with no
 // visibility change needed anywhere.
+mod auth;
 mod bulk;
 mod counters;
 mod iteration;
+mod listeners;
 mod multimap;
 mod query;
 mod streaming;
@@ -358,94 +356,6 @@ impl HotRodConnection {
         self.timeout = timeout;
     }
 
-    /// Authenticates the connection using SASL PLAIN. Must be called before
-    /// any cache operation if the server requires authentication.
-    ///
-    /// `authzid` is the authorization id; pass an empty string unless the
-    /// server is configured to distinguish it from `authcid`.
-    pub async fn authenticate_plain(
-        &mut self,
-        authzid: &str,
-        authcid: &str,
-        password: &str,
-    ) -> Result<()> {
-        self.run_sasl(PlainMechanism::new(authzid, authcid, password))
-            .await
-    }
-
-    /// Authenticates the connection using SASL SCRAM-SHA-512 (RFC 5802).
-    pub async fn authenticate_scram(&mut self, authcid: &str, password: &str) -> Result<()> {
-        self.run_sasl(ScramSha512Mechanism::new(authcid, password))
-            .await
-    }
-
-    /// Authenticates the connection using SASL DIGEST-SHA-256, Elytron's
-    /// generalization of RFC 2831 DIGEST-MD5. The digest-uri's server-name
-    /// half is fixed to `infinispan`; see `digest.rs` for why.
-    pub async fn authenticate_digest(&mut self, authcid: &str, password: &str) -> Result<()> {
-        self.run_sasl(DigestSha256Mechanism::new(authcid, password))
-            .await
-    }
-
-    /// Authenticates the connection using SASL OAUTHBEARER (RFC 7628) with
-    /// a bearer token obtained elsewhere, typically from an OIDC provider.
-    ///
-    /// This mechanism has unit test coverage only: live-server coverage
-    /// needs a token-backed realm the CI fixture does not provide yet, see
-    /// `sasl.rs`.
-    pub async fn authenticate_oauthbearer(&mut self, authzid: &str, token: &str) -> Result<()> {
-        self.run_sasl(OAuthBearerMechanism::new(authzid, token))
-            .await
-    }
-
-    /// Drives a `SaslMechanism` through the server's `AuthMechList`/`Auth`
-    /// exchange: confirms the mechanism is offered, then loops sending
-    /// responses and feeding back challenges until the server marks the
-    /// exchange complete.
-    async fn run_sasl(&mut self, mut mechanism: impl SaslMechanism) -> Result<()> {
-        self.begin_operation()?;
-        let timeout = self.timeout;
-        let result = with_timeout(timeout, async {
-            let empty_cache_name: Vec<u8> = Vec::new();
-
-            self.write_and_read_header(&empty_cache_name, OpCode::AuthMechList, &[])
-                .await?;
-            let mech_count = read_vint(&mut self.stream).await?;
-            let mut offered = Vec::with_capacity(mech_count as usize);
-            for _ in 0..mech_count {
-                offered.push(read_string(&mut self.stream).await?);
-            }
-            if !offered.iter().any(|mech| mech == mechanism.name()) {
-                return Err(Error::UnsupportedSaslMechanism(
-                    mechanism.name().to_string(),
-                ));
-            }
-
-            let mut challenge: Option<Vec<u8>> = None;
-            loop {
-                let Some(response) = mechanism.respond(challenge.as_deref())? else {
-                    return Ok(());
-                };
-                let mut body = Vec::new();
-                write_array(&mut body, mechanism.name().as_bytes());
-                write_array(&mut body, &response);
-                self.write_and_read_header(&empty_cache_name, OpCode::Auth, &body)
-                    .await?;
-
-                let complete = tokio::io::AsyncReadExt::read_u8(&mut self.stream).await? > 0;
-                let bytes = read_array(&mut self.stream).await?;
-                if complete {
-                    mechanism.finish(&bytes)?;
-                    return Ok(());
-                }
-                challenge = Some(bytes);
-            }
-        })
-        .await;
-        self.end_operation(result.is_ok());
-        result
-    }
-
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.begin_operation()?;
         let timeout = self.timeout;
@@ -688,47 +598,6 @@ impl HotRodConnection {
         let result = with_timeout(timeout, async {
             let cache_name = self.cache_name.clone();
             self.write_and_read_header(&cache_name, OpCode::Clear, &[])
-                .await?;
-            Ok(())
-        })
-        .await;
-        self.end_operation(result.is_ok());
-        result
-    }
-
-    /// Registers a client listener, `body` already encoded by
-    /// `listener.rs` (listener id, include-current-state flag,
-    /// filter/converter factory names and parameters, raw-data flag,
-    /// event interests). Confirms the server accepted it; the connection
-    /// is expected to be handed to `listener.rs` via `into_transport`
-    /// right after, not reused for further operations here.
-    pub(crate) async fn add_client_listener(&mut self, body: &[u8]) -> Result<()> {
-        self.begin_operation()?;
-        let timeout = self.timeout;
-        let result = with_timeout(timeout, async {
-            let cache_name = self.cache_name.clone();
-            self.write_and_read_header(&cache_name, OpCode::AddClientListener, body)
-                .await?;
-            Ok(())
-        })
-        .await;
-        self.end_operation(result.is_ok());
-        result
-    }
-
-    /// Registers a counter listener, `body` already encoded by
-    /// `counter_listener.rs` (counter name, then listener id; no
-    /// factories or interests, unlike `add_client_listener`'s fuller
-    /// body: the counter listener protocol has no server-side
-    /// filtering concept at all). Same handoff as `add_client_listener`:
-    /// the connection is expected to go to `counter_listener.rs` via
-    /// `into_transport` right after, not reused here.
-    pub(crate) async fn counter_add_listener(&mut self, body: &[u8]) -> Result<()> {
-        self.begin_operation()?;
-        let timeout = self.timeout;
-        let result = with_timeout(timeout, async {
-            let cache_name = self.cache_name.clone();
-            self.write_and_read_header(&cache_name, OpCode::CounterAddListener, body)
                 .await?;
             Ok(())
         })

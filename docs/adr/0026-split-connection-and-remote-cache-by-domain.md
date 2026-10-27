@@ -3,10 +3,11 @@
 ## Status
 
 Accepted. Phase 1 (multimap) implemented alongside this ADR; phases 2
-(counters), 3 (streaming), 4 (iteration), 5 (transactions), 6 (bulk)
-and 7 (query and tasks) implemented as follow-up PRs. Later phases
-are sequenced below but each needs its own confirmation before it
-starts.
+(counters), 3 (streaming), 4 (iteration), 5 (transactions), 6 (bulk),
+7 (query and tasks) and 8 (auth and listeners) implemented as
+follow-up PRs. Only the dispatch/retry core and plain `core_ops`
+remain, sequenced last below; starting that phase still needs its
+own confirmation.
 
 ## Context
 
