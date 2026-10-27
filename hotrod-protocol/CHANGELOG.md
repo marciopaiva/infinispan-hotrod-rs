@@ -17,7 +17,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   every `counter_*` method, into `connection/counters.rs` and
   `remote_cache/counters.rs`. Phase 3 (streaming) does the same for
   `GetStream`/`PutStream`'s wire operations, into `connection/
-  streaming.rs` and `remote_cache/streaming.rs`. Later phases follow
+  streaming.rs` and `remote_cache/streaming.rs`. Phase 4 (iteration)
+  does the same for server-side iteration, into `connection/
+  iteration.rs` and `remote_cache/iteration.rs`. Later phases follow
   one at a time.
 
 ### Fixed
