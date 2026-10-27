@@ -191,3 +191,19 @@ the whole cache," not "iterate a caller-chosen subset of segments."
 * Not implemented, out of scope for #53 as written: a caller-chosen
   segment subset, query projections (depends on #50), and retrying an
   orphaned segment on another node after a mid-iteration failure.
+
+## Addendum: confirming client-side recovery against a real server
+
+`cache_iterator_dropped_mid_scan_poisons_the_connection` only ever ran
+against the fake-server harness. `cache_iterator_dropped_mid_scan_
+does_not_affect_a_later_operation` (`tests/live_server.rs`) ports the
+same scenario to a real server: drop a `CacheIterator` mid-scan, then
+confirm a following operation still completes normally.
+
+Same residual limitation as the streaming addendum in
+`docs/adr/0008-streaming.md`: this confirms the client recovers
+cleanly against a real server, not that the server released the
+cursor any sooner than its own five-minute reaper
+(`DefaultIterationManager`, cited above) would have anyway. The Hot
+Rod protocol gives no counter a client could check to tell the
+difference, so that question stays open.

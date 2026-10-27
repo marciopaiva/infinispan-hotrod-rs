@@ -177,3 +177,21 @@ there was no real reason to ship only one and defer the other two.
 * Not implemented, left for a later, independent, additive change if
   it turns out to matter: `impl AsyncRead`/`AsyncWrite` for
   `GetStream`/`PutStream`.
+
+## Addendum: confirming client-side recovery against a real server
+
+The "rather than find out against a real server" line above was,
+until now, genuinely untested against one: `get_stream_dropped_
+without_finishing_poisons_the_connection` only ever ran against the
+fake-server harness. `get_stream_dropped_mid_transfer_does_not_
+affect_a_later_operation` (`tests/live_server.rs`) ports that same
+scenario to a real server: drop a `GetStream` mid-transfer, then
+confirm a following operation still completes normally.
+
+This narrows, but does not close, the original uncertainty. It
+confirms the client recovers cleanly against Infinispan's actual wire
+responses, not just the fake server's simplified ones. It does not
+confirm the server frees the abandoned stream any sooner than its own
+housekeeping would anyway, since the Hot Rod protocol exposes no
+counter a client could check to tell the difference. That residual
+question stays open, same as before.
