@@ -13,6 +13,18 @@
 //! transactional server-side (`<transaction mode="NON_XA"/>` or
 //! similar); there is no opcode to check this ahead of time, so an
 //! untransactional cache only reveals itself when `commit` fails.
+//!
+//! A `Transaction` is pinned to the cluster active when
+//! `begin_transaction` created it (see the addendum in
+//! `docs/adr/0018-transactions-non-xa-one-phase.md`): every `get` and
+//! the final `commit` target that cluster for the transaction's whole
+//! lifetime, never a different one a multi-cluster failover may have
+//! switched to in the meantime. If that cluster stops responding, the
+//! transaction fails with a connection error instead of silently
+//! continuing against a cluster whose state it never actually read.
+//! If a switch away and back is merely detected after the fact, `get`/
+//! `commit` fail fast with `Error::TransactionClusterChanged`, without
+//! attempting any network call at all.
 
 use std::collections::HashMap;
 
@@ -182,14 +194,19 @@ enum ReadOutcome {
 /// network before `commit`.
 pub struct Transaction {
     cache: RemoteCache,
+    pinned_cluster: String,
+    pinned_generation: u64,
     reads: HashMap<Vec<u8>, ReadOutcome>,
     writes: HashMap<Vec<u8>, ModificationWrite>,
 }
 
 impl Transaction {
     pub(crate) fn new(cache: RemoteCache) -> Self {
+        let (pinned_cluster, pinned_generation) = cache.active_cluster_name_and_generation();
         Self {
             cache,
+            pinned_cluster,
+            pinned_generation,
             reads: HashMap::new(),
             writes: HashMap::new(),
         }
@@ -209,7 +226,11 @@ impl Transaction {
                 ModificationWrite::Remove => None,
             });
         }
-        match self.cache.get_with_version(key).await? {
+        match self
+            .cache
+            .get_with_version_pinned(key, &self.pinned_cluster, self.pinned_generation)
+            .await?
+        {
             Some(VersionedValue { value, version, .. }) => {
                 self.reads
                     .insert(key.to_vec(), ReadOutcome::Existed { version });
@@ -267,7 +288,14 @@ impl Transaction {
                 }
             })
             .collect();
-        self.cache.run_prepare_transaction(xid, modifications).await
+        self.cache
+            .run_prepare_transaction(
+                xid,
+                modifications,
+                &self.pinned_cluster,
+                self.pinned_generation,
+            )
+            .await
     }
 
     /// Discards every recorded read and write. Local only: nothing
