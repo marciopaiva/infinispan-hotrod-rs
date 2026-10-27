@@ -214,3 +214,60 @@ way multi-cluster failover (ADR 0017) did.
   equivalent exists in Rust; a real need to coordinate this cache
   with another transactional resource would be a new proposal, not a
   natural extension of this one).
+
+## Addendum: pinning a transaction to its starting cluster
+
+This ADR never considered multi-cluster failover
+(`docs/adr/0017-multi-cluster-failover.md`), which did not exist yet
+when it was written. Once both features coexisted, a gap surfaced on
+review: `Transaction::get` and `Transaction::commit` each resolved
+`HotRodClient`'s *currently* active cluster fresh, independently, on
+every call. If an automatic failover switched the active cluster
+while a transaction was in flight, `commit` could send the final
+`PREPARE_TX_2`, carrying versions read from the old cluster, to
+whatever cluster happened to be active by the time `commit` ran. That
+request is meaningless against a cluster that never saw the reads it
+claims to validate: it could "succeed" by coincidence, or fail with
+the same generic `Error::TransactionRolledBack`/
+`Error::TransactionCommitFailed` an ordinary optimistic-lock conflict
+produces, with no way for the caller to tell the two apart.
+
+The fix: a `Transaction` now captures the active cluster's name and
+`ClientInner::cluster_generation` together, once, at
+`begin_transaction` time (`HotRodClient::
+active_cluster_name_and_generation`, read under one acquisition of
+the same lock `active_seed_addr_and_generation` already uses for its
+own race-free pairing). Every `get` and the final `commit` check that
+generation again before doing anything else. Unchanged, the
+transaction proceeds exactly as before: this adds no cost to the
+common case, since a transaction's whole lifetime is normally far
+shorter than the interval between failovers. Changed, the operation
+fails immediately with the new `Error::TransactionClusterChanged`,
+without attempting any network call at all.
+
+This alone would not be enough: `RemoteCache::dispatch`'s own retry
+chain can itself cross from the active cluster to a different
+configured one as a last resort
+(`HotRodClient::try_failover_to_live_cluster`), once every candidate
+of the current cluster is exhausted. A transaction whose own pinned
+cluster has genuinely gone down must not let that last resort pull it
+onto a cluster its reads never touched either. `dispatch` gained a
+`cross_cluster_failover` flag; the two new pinned call paths
+(`call_pinned`/`call_seed_pinned`, used only by
+`Transaction::get`/`commit`) pass `false`, so a pinned operation
+exhausts only its own cluster's candidates and surfaces that
+cluster's own connection error instead of silently landing anywhere
+else. `call`/`call_seed`, used by everything other than
+`Transaction`, are unaffected: they keep crossing clusters exactly as
+`docs/adr/0017-multi-cluster-failover.md` already decided.
+
+Additive only: `Error::TransactionClusterChanged { pinned, current }`
+is a new variant; nothing existing changes shape. No live-server test
+was added, since nothing here needs a real server beyond what the new
+fake-server tests already exercise (`remote_cache.rs`:
+`transaction_commit_does_not_fail_over_to_another_cluster_when_pinned`,
+`transaction_get_fails_fast_when_the_active_cluster_already_changed`,
+`transaction_commit_fails_fast_when_the_active_cluster_changed_since_
+begin`), and the existing live
+`transaction_commit_and_rollback_against_a_real_server` test only
+ever runs against a single cluster.

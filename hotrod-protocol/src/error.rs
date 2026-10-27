@@ -125,6 +125,16 @@ pub enum Error {
     #[error("transaction commit failed after a successful prepare")]
     TransactionCommitFailed,
 
+    /// A `Transaction` operation (`get` or `commit`) was about to run
+    /// against a different cluster than the one active when
+    /// `RemoteCache::begin_transaction` created it. A transaction stays
+    /// pinned to that cluster for its whole lifetime: the versions
+    /// `commit` validates against are only meaningful if every read and
+    /// the final write happened against the same cluster. See the
+    /// addendum in `docs/adr/0018-transactions-non-xa-one-phase.md`.
+    #[error("the active cluster changed from {pinned:?} to {current:?} since this transaction began; the transaction cannot continue")]
+    TransactionClusterChanged { pinned: String, current: String },
+
     /// `IterationNext` returned `INVALID_ITERATION`: the server no longer
     /// knows this cursor, most likely because it sat idle past the
     /// server's five-minute reaper. No retry is attempted; see

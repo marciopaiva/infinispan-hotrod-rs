@@ -13,6 +13,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `lifespan`/`max_idle` deadline has passed, instead of serving it
   until an `Expired` invalidation event or LRU pressure happens to
   remove it. See the addendum in `docs/adr/0007-near-caching.md`.
+- `Transaction` is now pinned to the cluster active when
+  `begin_transaction` created it: `get` and `commit` fail with the
+  new `Error::TransactionClusterChanged` if a multi-cluster failover
+  switched the active cluster since, instead of silently sending the
+  final `PREPARE_TX_2` (with versions read from the old cluster) to
+  whichever cluster happens to be active by the time `commit` runs.
+  See the addendum in
+  `docs/adr/0018-transactions-non-xa-one-phase.md`.
 
 ### Tests
 

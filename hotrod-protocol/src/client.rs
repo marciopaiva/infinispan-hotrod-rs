@@ -720,6 +720,26 @@ impl HotRodClient {
             .clone()
     }
 
+    /// `active_cluster_name` and the current value of
+    /// `cluster_generation`, read together under one acquisition of
+    /// `active`'s read lock, the same race-free pairing
+    /// `active_seed_addr_and_generation` already gives the seed address
+    /// and a live subscription: since every switch bumps the generation
+    /// while still holding `active`'s write lock, a read lock held across
+    /// both reads here guarantees the pair always describes the same
+    /// cluster, never a mix of an old name with a new generation or vice
+    /// versa. `Transaction::new` captures both once, at
+    /// `RemoteCache::begin_transaction` time, so a later `get`/`commit`
+    /// can tell whether a cluster switch has happened since (see the
+    /// addendum in `docs/adr/0018-transactions-non-xa-one-phase.md`).
+    pub(crate) fn active_cluster_name_and_generation(&self) -> (String, u64) {
+        let active = self.0.active.read().unwrap_or_else(|p| p.into_inner());
+        (
+            active.name.clone(),
+            *self.0.cluster_generation.subscribe().borrow(),
+        )
+    }
+
     /// `cluster_name`'s own auth/TLS, falling back to this client's
     /// global `auth`/`tls` for whichever field (or both) that
     /// cluster has no override for
