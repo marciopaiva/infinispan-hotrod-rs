@@ -6,8 +6,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-27
+
 ### Changed
 
+- **Breaking:** `Error`, `QueryValue`, `CacheEvent` and `AdminFlag`
+  are now `#[non_exhaustive]`
+  (`docs/adr/0027-api-stability-policy.md`). An exhaustive `match` on
+  any of them from outside this crate needs a wildcard arm from this
+  release on. `Error` gains a new variant roughly once per feature;
+  `QueryValue`'s own doc comment already names scalar kinds a later
+  phase is expected to add; `CacheEvent` and `AdminFlag` each mirror
+  a server-side Java enum this crate does not control. Marking them
+  this way now means the next addition to any of them ships as a
+  patch release instead of forcing another minor bump.
 - Internal only, no behavior change: `connection.rs`/`remote_cache.rs`
   are being split into domain submodules
   (`docs/adr/0026-split-connection-and-remote-cache-by-domain.md`).

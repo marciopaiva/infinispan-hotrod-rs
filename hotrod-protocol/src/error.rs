@@ -8,7 +8,15 @@ use std::io;
 use std::time::Duration;
 
 /// Errors that can occur while talking to a Hot Rod server.
+///
+/// `#[non_exhaustive]` (`docs/adr/0027-api-stability-policy.md`): a
+/// new variant lands here roughly once per feature, and every one so
+/// far has been additive, never a replacement for an existing case.
+/// Marking it this way lets that keep being a non-breaking change
+/// instead of forcing a minor version bump each time a caller's
+/// exhaustive `match` would otherwise stop compiling.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] io::Error),

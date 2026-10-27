@@ -17,7 +17,12 @@ use crate::remote_cache::RemoteCache;
 /// non-persistent across a cluster restart; `Update` lets
 /// `create_cache`/`get_or_create_cache` update an existing cache's
 /// configuration instead of failing because it already exists.
+///
+/// `#[non_exhaustive]` (`docs/adr/0027-api-stability-policy.md`):
+/// mirrors a Java enum this crate does not control, which could gain
+/// a new flag in a future server release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdminFlag {
     Volatile,
     Update,

@@ -33,7 +33,13 @@ use crate::remote_cache::RemoteCache;
 /// (char/short/byte/date/instant/enum/fixed-width/zigzag integers,
 /// containers) are left out of this phase; an entity-typed column,
 /// which this crate cannot interpret itself, surfaces as `Bytes`.
+///
+/// `#[non_exhaustive]` (`docs/adr/0027-api-stability-policy.md`):
+/// the doc comment above already names the scalar kinds a later
+/// phase is expected to add, so adding one of them stays a
+/// non-breaking change instead of forcing a minor version bump.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum QueryValue {
     String(String),
     Int64(i64),

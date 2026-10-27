@@ -112,9 +112,16 @@ clarifies that rule; it does not relax it.
 * The existing "stop and ask before breaking the public API" rule
   now has a shared definition of "breaking" behind it, so a future
   change does not need to re-derive one from scratch.
-* `Error`, and every other public enum that is exhaustive today,
-  stays a real source of friction: adding a new error case remains
-  breaking until a separate, explicitly confirmed follow-up marks it
-  `#[non_exhaustive]`. That follow-up is flagged here, not done here.
+* The follow-up this ADR flagged is done: version 0.8.0 marks
+  `Error`, `QueryValue`, `CacheEvent` and `AdminFlag` as
+  `#[non_exhaustive]`, as its own confirmed, breaking change. The
+  remaining public enums (`MarshallingSide`, `VersionedResult`,
+  `CounterState`, `Storage`, `CounterType`, `QueryRow`,
+  `CacheConfig`, `Expiration`) were weighed and left exhaustive: each
+  is tied to a small, fixed concept (a two-sided choice, a wire
+  encoding with no spare bits, a structural either/or) rather than an
+  open-ended set a future feature is likely to extend. That judgment
+  can be revisited for any one of them later, with its own Propose
+  and Resolve step, the same as this round had.
 * The crate stays on pre-1.0 semver discipline. Nothing here commits
   to a 1.0 date or to the criteria for declaring one.
