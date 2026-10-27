@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Internal only, no behavior change: `connection.rs`/`remote_cache.rs`
+  are being split into domain submodules
+  (`docs/adr/0026-split-connection-and-remote-cache-by-domain.md`).
+  Phase 1 (multimap) moves `HotRodConnection`'s and `RemoteCache`'s
+  multimap methods into `connection/multimap.rs` and
+  `remote_cache/multimap.rs`. Later phases follow one at a time.
+
 ### Fixed
 
 - Near caching: `NearCachedCache::get` now fetches entry metadata
