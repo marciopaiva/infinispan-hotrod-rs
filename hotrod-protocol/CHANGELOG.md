@@ -13,7 +13,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   (`docs/adr/0026-split-connection-and-remote-cache-by-domain.md`).
   Phase 1 (multimap) moves `HotRodConnection`'s and `RemoteCache`'s
   multimap methods into `connection/multimap.rs` and
-  `remote_cache/multimap.rs`. Later phases follow one at a time.
+  `remote_cache/multimap.rs`. Phase 2 (counters) does the same for
+  every `counter_*` method, into `connection/counters.rs` and
+  `remote_cache/counters.rs`. Later phases follow one at a time.
 
 ### Fixed
 
