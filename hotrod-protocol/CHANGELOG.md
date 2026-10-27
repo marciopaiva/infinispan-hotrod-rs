@@ -30,8 +30,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   tasks.rs`. Phase 8 (auth and listeners) does the same for SASL
   authentication and client/counter listener registration, into
   `connection/auth.rs`, `connection/listeners.rs` and `remote_cache/
-  listeners.rs`. The dispatch/retry core and plain `core_ops` are
-  left for a final phase, not yet started.
+  listeners.rs`. Phase 9 (core ops) does the same for the plain
+  per-entry operations (get, put, remove, replace, the versioned
+  variants, contains_key, ping, size, clear, stats), into
+  `connection/core_ops.rs` and `remote_cache/core_ops.rs`, leaving
+  only the struct definitions, connection lifecycle, framing core
+  and dispatch/retry group at each file's root. This was the last
+  phase: the split is complete.
 
 ### Fixed
 
