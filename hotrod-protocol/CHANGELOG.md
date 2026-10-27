@@ -24,7 +24,10 @@ versioning follows [Semantic Versioning](https://semver.org/).
   pinning it depends on, into `connection/transactions.rs` and
   `remote_cache/transactions.rs`. Phase 6 (bulk) does the same for
   `get_all`/`put_all`, into `connection/bulk.rs` and `remote_cache/
-  bulk.rs`. Later phases follow one at a time.
+  bulk.rs`. Phase 7 (query and tasks) does the same for remote query
+  (Ickle) and remote task execution, into `connection/query.rs`,
+  `connection/tasks.rs`, `remote_cache/query.rs` and `remote_cache/
+  tasks.rs`. Later phases follow one at a time.
 
 ### Fixed
 
