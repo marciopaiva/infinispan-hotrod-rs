@@ -2026,6 +2026,77 @@ async fn streaming_put_and_get_roundtrip_a_value_larger_than_one_chunk() {
     cache.remove(b"ci-streaming-key").await.expect("cleanup");
 }
 
+/// Drops a `GetStream` mid-transfer, before reading every chunk or
+/// calling `close`, against a real server: the live counterpart of
+/// `get_stream_dropped_without_finishing_poisons_the_connection`
+/// (`streaming.rs`), confirming the same client-side recovery (poison
+/// the connection, never reuse it, open a fresh one next time) holds
+/// against Infinispan's actual wire responses, not just the
+/// simplified ones a fake server returns.
+///
+/// This cannot, through the Hot Rod protocol, confirm that the server
+/// itself frees the abandoned stream any sooner than its own
+/// housekeeping would anyway: `docs/adr/0008-streaming.md` already
+/// documents that as unverified, and nothing in the protocol exposes
+/// a counter this test could check instead. What it does confirm is
+/// narrower but still real: a later operation is not stuck waiting
+/// on, or corrupted by, the connection the dropped stream left
+/// behind.
+#[tokio::test]
+#[ignore]
+async fn get_stream_dropped_mid_transfer_does_not_affect_a_later_operation() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+
+    cache
+        .remove(b"ci-streaming-drop-key")
+        .await
+        .expect("cleanup");
+
+    // `+ 17`, not an exact multiple of the internal flush size: lands
+    // the same way `streaming_put_and_get_roundtrip_a_value_larger_
+    // than_one_chunk` above does, avoiding a trailing empty chunk that
+    // the server rejects (`RequestParsingException: Retained chunk
+    // requires a chunk length greater than 0`).
+    let value: Vec<u8> = (0..STREAMING_CHUNK_SIZE * 3 + 17)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let mut put = cache
+        .put_stream(
+            b"ci-streaming-drop-key",
+            Expiration::Default,
+            Expiration::Default,
+            STREAMING_CHUNK_SIZE,
+        )
+        .await
+        .expect("put_stream");
+    for chunk in value.chunks(513) {
+        put.write_chunk(chunk).await.expect("write_chunk");
+    }
+    put.finish().await.expect("finish");
+
+    let mut get = cache
+        .get_stream(b"ci-streaming-drop-key", STREAMING_CHUNK_SIZE as u32)
+        .await
+        .expect("get_stream")
+        .expect("entry exists");
+    get.next_chunk()
+        .await
+        .expect("next_chunk")
+        .expect("first chunk");
+    drop(get);
+
+    cache
+        .ping()
+        .await
+        .expect("a later operation must not be affected by the dropped stream");
+
+    cache
+        .remove(b"ci-streaming-drop-key")
+        .await
+        .expect("cleanup");
+}
+
 /// Puts a known set of entries, then reads the whole cache back through
 /// `iter` and confirms every one comes back exactly once. Against a
 /// single node, `nodes_and_owned_segments` returns just the seed with no
@@ -2062,6 +2133,50 @@ async fn iteration_reads_back_every_entry_put_on_a_single_node() {
     seen.sort();
     expected.sort();
     assert_eq!(seen, expected);
+
+    cache.clear().await.expect("cleanup");
+}
+
+/// Drops a `CacheIterator` mid-scan, before it reaches exhaustion or
+/// an explicit close, against a real server: the live counterpart of
+/// `cache_iterator_dropped_mid_scan_poisons_the_connection`
+/// (`iteration.rs`), with the same limitation as the streaming test
+/// above (`get_stream_dropped_mid_transfer_does_not_affect_a_later_
+/// operation`): this confirms the client recovers cleanly, not that
+/// the server released the cursor any sooner than
+/// `docs/adr/0009-server-side-iteration.md`'s own five-minute reaper
+/// would have anyway, which the Hot Rod protocol gives no way to
+/// observe from the client side.
+#[tokio::test]
+#[ignore]
+async fn cache_iterator_dropped_mid_scan_does_not_affect_a_later_operation() {
+    let _guard = lock_live_server();
+    let cache = connect_client().await;
+
+    cache.clear().await.expect("clear");
+    for i in 0..5 {
+        cache
+            .put(
+                format!("ci-iter-drop-key-{i}").as_bytes(),
+                format!("ci-iter-drop-value-{i}").as_bytes(),
+                Expiration::Default,
+                Expiration::Default,
+            )
+            .await
+            .expect("put");
+    }
+
+    let mut iter = cache.iter().await.expect("iter");
+    iter.next_entry()
+        .await
+        .expect("next_entry")
+        .expect("at least one entry");
+    drop(iter);
+
+    cache
+        .ping()
+        .await
+        .expect("a later operation must not be affected by the dropped iterator");
 
     cache.clear().await.expect("cleanup");
 }

@@ -31,6 +31,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   operation's dispatch arm was previously only exercised by
   `connection.rs`'s wire-level tests (which bypass `run_operation`)
   and by the `#[ignore]`d live-server test.
+- Added two `#[ignore]`d live-server tests confirming, against a real
+  server, that dropping a `GetStream` mid-transfer or a
+  `CacheIterator` mid-scan does not affect a later operation on the
+  same cache, porting two existing fake-server scenarios. See the
+  addenda in `docs/adr/0008-streaming.md` and
+  `docs/adr/0009-server-side-iteration.md` for what this does and does
+  not confirm.
 
 ## [0.7.0] - 2026-10-25
 
