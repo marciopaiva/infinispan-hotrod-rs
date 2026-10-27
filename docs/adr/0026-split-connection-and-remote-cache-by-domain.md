@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted. Phase 1 (multimap) implemented alongside this ADR. Later
-phases are sequenced below but each needs its own confirmation before
-it starts.
+Accepted. Phase 1 (multimap) implemented alongside this ADR; phase 2
+(counters) implemented as a follow-up PR. Later phases are sequenced
+below but each needs its own confirmation before it starts.
 
 ## Context
 
