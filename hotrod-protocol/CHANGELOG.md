@@ -19,8 +19,10 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `GetStream`/`PutStream`'s wire operations, into `connection/
   streaming.rs` and `remote_cache/streaming.rs`. Phase 4 (iteration)
   does the same for server-side iteration, into `connection/
-  iteration.rs` and `remote_cache/iteration.rs`. Later phases follow
-  one at a time.
+  iteration.rs` and `remote_cache/iteration.rs`. Phase 5
+  (transactions) does the same for `PREPARE_TX_2` and the cluster
+  pinning it depends on, into `connection/transactions.rs` and
+  `remote_cache/transactions.rs`. Later phases follow one at a time.
 
 ### Fixed
 
