@@ -27,7 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   bulk.rs`. Phase 7 (query and tasks) does the same for remote query
   (Ickle) and remote task execution, into `connection/query.rs`,
   `connection/tasks.rs`, `remote_cache/query.rs` and `remote_cache/
-  tasks.rs`. Later phases follow one at a time.
+  tasks.rs`. Phase 8 (auth and listeners) does the same for SASL
+  authentication and client/counter listener registration, into
+  `connection/auth.rs`, `connection/listeners.rs` and `remote_cache/
+  listeners.rs`. The dispatch/retry core and plain `core_ops` are
+  left for a final phase, not yet started.
 
 ### Fixed
 
