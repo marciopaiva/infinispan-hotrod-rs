@@ -3,9 +3,9 @@
 ## Status
 
 Accepted. Phase 1 (multimap) implemented alongside this ADR; phases 2
-(counters), 3 (streaming) and 4 (iteration) implemented as follow-up
-PRs. Later phases are sequenced below but each needs its own
-confirmation before it starts.
+(counters), 3 (streaming), 4 (iteration) and 5 (transactions)
+implemented as follow-up PRs. Later phases are sequenced below but
+each needs its own confirmation before it starts.
 
 ## Context
 
