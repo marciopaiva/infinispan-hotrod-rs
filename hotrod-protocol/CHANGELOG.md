@@ -22,7 +22,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   iteration.rs` and `remote_cache/iteration.rs`. Phase 5
   (transactions) does the same for `PREPARE_TX_2` and the cluster
   pinning it depends on, into `connection/transactions.rs` and
-  `remote_cache/transactions.rs`. Later phases follow one at a time.
+  `remote_cache/transactions.rs`. Phase 6 (bulk) does the same for
+  `get_all`/`put_all`, into `connection/bulk.rs` and `remote_cache/
+  bulk.rs`. Later phases follow one at a time.
 
 ### Fixed
 
