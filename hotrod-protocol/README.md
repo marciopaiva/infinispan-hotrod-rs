@@ -5,40 +5,19 @@ Pure Rust client for the Hot Rod binary wire protocol used by
 
 ## Status
 
-`hotrod-protocol` mirrors the official Java client's core cache API and
-its cluster-aware routing. Everything else is an open gap, tracked as
-its own issue. See the
+`hotrod-protocol` implements nearly all of the official Java client's
+feature set: the core cache API, cluster-aware routing, TLS, client
+listeners, near caching, transactions, distributed counters, multimap
+caches, remote query, remote task execution and remote
+administration. See the
+[root README's feature matrix](https://github.com/marciopaiva/infinispan-hotrod-rs#feature-matrix)
+for the full comparison against the Java client, including which
+parts are validated against a real server and not just the
+fake-server harness the rest of the unit tests use; the
 [ADRs](https://github.com/marciopaiva/infinispan-hotrod-rs/tree/main/docs/adr)
-for how each phase was scoped and the
+for how each phase was scoped; and the
 [changelog](https://github.com/marciopaiva/infinispan-hotrod-rs/blob/main/hotrod-protocol/CHANGELOG.md)
 for release notes.
-
-| Feature | Java client | `hotrod-protocol` |
-| --- | --- | --- |
-| Core operations (get, put, remove, putIfAbsent, replace, versioned variants) | Yes | Yes |
-| Bulk operations (getAll, putAll) | Yes | Yes |
-| containsKey, ping, size, clear, stats | Yes | Yes |
-| Full entry metadata (creation, last used, lifespan, max idle) | Yes | Yes |
-| Authentication: PLAIN, SCRAM-SHA-512, DIGEST-SHA-256, OAUTHBEARER | Yes | Yes |
-| Authentication: GSSAPI | Yes | No ([#9](https://github.com/marciopaiva/infinispan-hotrod-rs/issues/9)) |
-| TLS and mutual TLS | Yes | Yes |
-| Cluster topology tracking, hash-aware routing | Yes | Yes |
-| Configurable retry policy, per-node circuit breaker | Yes | Yes |
-| Client listeners (cache events) | Yes | Yes |
-| Near caching | Yes | Yes |
-| Transactions | Yes | Yes (`NON_XA`, one-phase commit only; real XA and recovery not yet implemented) |
-| Multimap cache | Yes | Yes |
-| Counters | Yes | Yes (not hash-routed by counter name like the Java client; always goes to the seed; value-change listeners supported) |
-| Typed values (`Marshaller` trait, `TypedCache`) | Yes | Yes (bytes/UTF-8 built in; bring your own format otherwise; also covers remote query and multimap cache) |
-| Remote query (Protobuf / Ickle) | Yes | Yes (entities/projections as bytes or scalars; `execute_statement` for DELETE/UPDATE; `stream` pages through large result sets instead of buffering) |
-| Remote task execution | Yes | Yes (`execute`/`execute_near`; params and result are raw bytes, no typed wrapper yet) |
-| Streaming for large values | Yes | Yes |
-| Server-side iteration | Yes | Yes |
-| Client statistics | Yes | Yes |
-| Tracing: local spans (via the `tracing` crate) | No | Yes |
-| Tracing: trace-context propagation to the server | Yes | No |
-| Remote administration (create/remove/list caches, reindex, index schema, config attribute, alias, templates) | Yes | Yes |
-| Multi-cluster failover | Yes | Yes (plus proactively switching back once an abandoned cluster recovers, and per-cluster auth/TLS overrides, neither of which the Java client does) |
 
 ## Usage
 
