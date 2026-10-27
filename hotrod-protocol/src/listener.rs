@@ -134,7 +134,14 @@ pub struct ListenOptions {
 /// One event pushed by the server to a `CacheListener`. `is_retried` is
 /// `true` when the server is replaying an event it cannot confirm the
 /// client already saw (the server failed over mid-notification).
+///
+/// `#[non_exhaustive]` (`docs/adr/0027-api-stability-policy.md`):
+/// this mirrors Infinispan's own fixed set of cache listener event
+/// types, which the server's own protocol has grown before and can
+/// grow again, so a new variant should be addable without forcing a
+/// minor version bump on every caller's exhaustive `match`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CacheEvent {
     Created {
         key: Vec<u8>,
